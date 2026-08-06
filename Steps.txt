@@ -1,0 +1,62 @@
+python --version
+→ Checks the installed Python version.
+
+ollama --version
+→ Checks the installed Ollama version.
+
+ollama pull qwen2.5:3b
+→ Downloads the Qwen 2.5 3B model for local use.
+
+Get-ChildItem
+→ Lists all files and folders in the current directory.
+
+cd "C:\path\to\Synapse One\core"
+→ Changes the terminal to the project's `core` folder.
+
+.\bootstrap.ps1
+→ Creates the virtual environment and installs all dependencies automatically.
+
+python -m venv .venv
+→ Creates a new Python virtual environment.
+
+.\.venv\Scripts\Activate.ps1
+→ Activates the virtual environment in PowerShell.
+
+.venv\Scripts\activate.bat
+→ Activates the virtual environment in Command Prompt.
+
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+→ Allows local PowerShell scripts to run.
+
+python -m pip install -e ".[dev,server]"
+→ Installs all project dependencies in editable mode.
+
+python scripts\verify.py
+→ Verifies the project setup and checks installed providers.
+
+.\start.ps1
+→ Starts the backend and performs setup if needed.
+
+start.bat
+→ Starts the backend from Command Prompt.
+
+python -m uvicorn synapse.api:app
+→ Starts the FastAPI backend server.
+
+python -m uvicorn synapse.api:app --reload
+→ Starts the backend with automatic reload on code changes.
+
+CTRL + C
+→ Stops the running backend server.
+
+ollama pull qwen2.5-vl:7b
+→ Downloads the vision AI model.
+
+Invoke-RestMethod -Uri "http://localhost:11434/api/tags"
+→ Lists all models currently installed in Ollama.
+
+python -m uvicorn synapse.api:app --port 8001
+→ Starts the backend on port 8001 instead of 8000.
+
+$env:SYNAPSE_LOGGING_LEVEL = "DEBUG"
+→ Enables debug logging for troubleshooting.

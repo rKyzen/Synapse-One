@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Synapse One</title>
+<style>
+:root{--bg:#0f1115;--bg2:#141820;--surface:#1a2030;--surface2:#1e2536;--border:#272f42;--text:#e4e9f2;--text2:#a8b1c4;--muted:#6b7590;--accent:#5b8af5;--accent2:#4170d4;--user:#2a4ea6;--user2:#213d87;--ok:#3ecf8e;--warn:#f0b429;--err:#ef5350;--code:#0d1017;--radius:10px;--sidebar:260px;--fpanel:300px}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);display:flex}
+::-webkit-scrollbar{width:8px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+button{font:inherit;cursor:pointer}
+input,textarea,select{font:inherit;color:var(--text)}
+#sidebar{width:var(--sidebar);flex:0 0 var(--sidebar);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;transition:margin-left .25s,opacity .25s;z-index:20}
+#sidebar.collapsed{margin-left:calc(var(--sidebar)*-1);opacity:0;pointer-events:none}
+.sb-head{padding:14px;border-bottom:1px solid var(--border);display:flex;gap:8px}
+.sb-head .brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px;flex:1}
+.sb-head .logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px}
+.sb-new{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:var(--radius);padding:6px 12px;font-size:12px}
+.sb-new:hover{border-color:var(--accent)}
+#projBar{padding:8px 14px;border-bottom:1px solid var(--border);display:flex;gap:6px;align-items:center}
+#projBar select{flex:1;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px;min-width:0}
+#projBar select:focus{outline:none;border-color:var(--accent)}
+#projBar button{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:6px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 auto}
+#projBar button:hover{border-color:var(--accent);color:var(--accent)}
+#convList{flex:1;overflow-y:auto;padding:8px}
+.conv{padding:10px 12px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--text2);display:flex;gap:8px;align-items:center;position:relative;border:1px solid transparent}
+.conv:hover{background:var(--surface);border-color:var(--border)}
+.conv.active{background:var(--surface2);border-color:var(--accent);color:var(--text)}
+.conv .title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conv .del{opacity:0;background:none;border:none;color:var(--muted);font-size:14px;padding:2px 6px;border-radius:4px}
+.conv:hover .del{opacity:1}
+.conv .del:hover{color:var(--err);background:rgba(239,83,80,.1)}
+#app{flex:1;display:flex;flex-direction:column;min-width:0}
+#topbar{flex:0 0 auto;height:52px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--border);background:var(--bg2)}
+.tb-btn{background:none;border:1px solid transparent;color:var(--muted);width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center}
+.tb-btn:hover{background:var(--surface);color:var(--text);border-color:var(--border)}
+.tb-btn.active{color:var(--accent);border-color:var(--accent);background:rgba(91,138,245,.1)}
+.tb-btn svg{width:18px;height:18px}
+#modelSel{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:5px 10px;font-size:12px;max-width:220px}
+#modelSel:focus{outline:none;border-color:var(--accent)}
+.tb-sep{width:1px;height:24px;background:var(--border);margin:0 4px}
+#statusDot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:0 0 auto}
+#statusDot.off{background:var(--muted);box-shadow:none}
+#statusText{font-size:11px;color:var(--muted);white-space:nowrap}
+#messages{flex:1;overflow-y:auto;padding:24px 20px 140px;scroll-behavior:smooth}
+.msg-wrap{max-width:820px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.msg{display:flex;gap:10px;align-items:flex-start;animation:fadeUp .2s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.msg.user{flex-direction:row-reverse}
+.avatar{width:30px;height:30px;border-radius:9px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;margin-top:2px}
+.msg.assistant .avatar{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+.msg.user .avatar{background:var(--user);color:#fff}
+.msg-body{max-width:78%;min-width:0}
+.bubble{padding:10px 14px;border-radius:14px;line-height:1.62;font-size:14px;word-wrap:break-word;overflow-wrap:break-word;position:relative}
+.msg.user .bubble{background:linear-gradient(135deg,var(--user),var(--user2));color:#fff;border-top-right-radius:4px}
+.msg.assistant .bubble{background:var(--surface);border:1px solid var(--border);border-top-left-radius:4px}
+.msg-actions{display:flex;gap:4px;margin-top:6px;opacity:0;transition:opacity .15s}
+.msg:hover .msg-actions{opacity:1}
+.msg.user .msg-actions{justify-content:flex-end}
+.act-btn{background:none;border:none;color:var(--muted);font-size:11px;padding:3px 8px;border-radius:6px;display:flex;align-items:center;gap:4px}
+.act-btn:hover{background:var(--surface2);color:var(--text)}
+.act-btn svg{width:14px;height:14px}
+.msg-meta{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px;font-size:11px;color:var(--muted)}
+.msg-meta .tag{background:var(--bg2);border:1px solid var(--border);padding:1px 7px;border-radius:999px}
+.trace-box{margin-top:8px}
+.trace-box pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:11px;line-height:1.5;overflow:auto;max-height:220px;font-family:Consolas,monospace;color:var(--text2);display:none}
+.trace-box button{background:none;border:none;color:var(--accent);font-size:11px;padding:0;cursor:pointer;text-decoration:underline dotted}
+.bubble p{margin:0 0 8px}.bubble p:last-child{margin-bottom:0}
+.bubble h1,.bubble h2,.bubble h3{margin:10px 0 5px;line-height:1.3}
+.bubble h1{font-size:16px}.bubble h2{font-size:15px}.bubble h3{font-size:14px}
+.bubble ul,.bubble ol{margin:4px 0 8px 20px}
+.bubble li{margin:2px 0}
+.bubble a{color:var(--accent);text-decoration:none}.bubble a:hover{text-decoration:underline}
+.bubble code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:12.5px;font-family:Consolas,monospace}
+.bubble blockquote{border-left:3px solid var(--accent);margin:6px 0;padding:4px 12px;color:var(--text2);background:var(--bg2);border-radius:0 6px 6px 0}
+.bubble pre{position:relative;background:var(--code);border:1px solid var(--border);border-radius:8px;padding:10px 12px 8px;font-size:12px;line-height:1.5;overflow:auto;max-height:320px;margin:6px 0;font-family:Consolas,monospace}
+.bubble pre code{background:none;padding:0;font-size:12px}
+.bubble pre .lang{position:absolute;top:6px;right:40px;font-size:10px;color:var(--muted);text-transform:uppercase;pointer-events:none}
+.bubble pre .copy-btn{position:absolute;top:4px;right:6px;background:var(--surface);border:1px solid var(--border);color:var(--muted);font-size:10px;padding:2px 8px;border-radius:5px;opacity:0;transition:opacity .15s}
+.bubble pre:hover .copy-btn{opacity:1}
+.bubble pre .copy-btn:hover{color:var(--text);border-color:var(--accent)}
+.bubble pre .copy-btn.copied{color:var(--ok);border-color:var(--ok)}
+.bubble hr{border:none;border-top:1px solid var(--border);margin:8px 0}
+.typing{display:flex;gap:4px;padding:12px 16px;align-items:center}
+.typing span{width:7px;height:7px;border-radius:50%;background:var(--muted);animation:bounce 1.4s infinite}
+.typing span:nth-child(2){animation-delay:.2s}
+.typing span:nth-child(3){animation-delay:.4s}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
+#inputBar{flex:0 0 auto;border-top:1px solid var(--border);background:var(--bg2);padding:12px 16px 16px}
+.input-wrap{max-width:820px;margin:0 auto;position:relative}
+#attachments{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.chip{display:flex;align-items:center;gap:5px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:4px 8px;font-size:11px;color:var(--text2)}
+.chip .st{color:var(--ok);font-size:10px}.chip .st.idx{color:var(--warn)}
+.chip button{background:none;border:none;color:var(--muted);font-size:12px;padding:0 2px}.chip button:hover{color:var(--err)}
+#prompt{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:var(--radius);padding:12px 44px 12px 14px;font-size:14px;line-height:1.5;resize:none;max-height:200px;min-height:44px;outline:none}
+#prompt:focus{border-color:var(--accent)}
+#prompt::placeholder{color:var(--muted)}
+#sendBtn{position:absolute;right:8px;bottom:8px;background:var(--accent);border:none;color:#fff;width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;transition:background .15s}
+#sendBtn:hover{background:var(--accent2)}
+#sendBtn:disabled{background:var(--muted);cursor:not-allowed}
+#sendBtn svg{width:16px;height:16px}
+#attachBtn{position:absolute;right:44px;bottom:8px;background:none;border:1px solid var(--border);color:var(--muted);width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center}
+#attachBtn:hover{color:var(--text);border-color:var(--accent)}
+#attachBtn svg{width:16px;height:16px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:60px 20px;color:var(--muted);text-align:center}
+.empty .orb{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-size:20px;font-weight:700;display:flex;align-items:center;justify-content:center;margin-bottom:4px}
+.empty h2{color:var(--text);font-size:20px;font-weight:600}
+.empty p{font-size:13px;max-width:440px;line-height:1.5}
+.sugg-wrap{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;justify-content:center}
+.sugg{background:var(--surface);border:1px solid var(--border);color:var(--text2);border-radius:var(--radius);padding:8px 14px;font-size:12px;transition:border-color .15s,color .15s}
+.sugg:hover{border-color:var(--accent);color:var(--text)}
+#fpanel{width:var(--fpanel);flex:0 0 var(--fpanel);background:var(--bg2);border-left:1px solid var(--border);display:flex;flex-direction:column;transition:margin-right .25s,opacity .25s;z-index:15}
+#fpanel.collapsed{margin-right:calc(var(--fpanel)*-1);opacity:0;pointer-events:none}
+.fp-head{padding:12px 14px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center}
+.fp-head span{font-weight:600;font-size:13px;flex:1}
+.fp-head button{background:none;border:none;color:var(--muted);font-size:18px}.fp-head button:hover{color:var(--text)}
+#fpList{flex:1;overflow-y:auto;padding:8px}
+.fp-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;font-size:12px;color:var(--text2);border:1px solid transparent}
+.fp-item:hover{background:var(--surface);border-color:var(--border)}
+.fp-item input[type=checkbox]{accent-color:var(--accent);flex:0 0 auto}
+.fp-item .dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+.fp-item .dot.ok{background:var(--ok)}.fp-item .dot.err{background:var(--err)}.fp-item .dot.idx{background:var(--warn)}
+.fp-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fp-item .info{color:var(--muted);font-size:10px;flex:0 0 auto}
+#fpDrop{margin:8px;padding:24px;border:2px dashed var(--border);border-radius:var(--radius);text-align:center;color:var(--muted);font-size:12px;transition:border-color .15s}
+#fpDrop.over{border-color:var(--accent);color:var(--accent)}
+#fpUpload{display:none}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;display:none;align-items:center;justify-content:center}
+.overlay.open{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:80vh;overflow-y:auto}
+.modal h3{font-size:16px;margin-bottom:14px}
+.modal label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;margin-top:10px}
+.modal input[type=number],.modal input[type=text],.modal textarea{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:13px}
+.modal input:focus,.modal textarea:focus{outline:none;border-color:var(--accent)}
+.modal textarea{min-height:60px;resize:vertical}
+.modal .actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end}
+.modal .btn{padding:7px 16px;border-radius:8px;font-size:13px;border:1px solid var(--border);background:var(--surface);color:var(--text)}
+.modal .btn:hover{border-color:var(--accent)}
+.modal .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.modal .btn.primary:hover{background:var(--accent2)}
+#searchBar{position:fixed;top:52px;right:0;left:0;height:44px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:0 16px;z-index:90;transform:translateY(-100%);transition:transform .2s}
+#searchBar.open{transform:translateY(0)}
+#searchInput{flex:1;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 12px;font-size:13px;max-width:320px}
+#searchInput:focus{outline:none;border-color:var(--accent)}
+#searchCount{font-size:11px;color:var(--muted)}
+.sb-sbtn{background:none;border:1px solid var(--border);color:var(--muted);width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center}
+.sb-sbtn:hover{color:var(--text);border-color:var(--accent)}
+.sb-sbtn svg{width:14px;height:14px}
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div class="sb-head">
+    <div class="brand"><div class="logo">S</div>Synapse One</div>
+    <button id="newChat" class="sb-new" title="New chat">+ New</button>
+  </div>
+  <div id="projBar">
+    <select id="projSel"></select>
+    <button id="projNew" title="New project">+</button>
+  </div>
+  <div id="convList"></div>
+</div>
+<div id="app">
+  <div id="topbar">
+    <button id="toggleSidebar" class="tb-btn" title="Toggle sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+    <select id="modelSel"><option value="">auto-route</option></select>
+    <div class="tb-sep"></div>
+    <button id="searchBtn" class="tb-btn" title="Search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg></button>
+    <button id="shortcutsBtn" class="tb-btn" title="Keyboard shortcuts">?</button>
+    <button id="settingsBtn" class="tb-btn" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    <div class="tb-sep"></div>
+    <div id="statusDot"></div>
+    <span id="statusText">loading...</span>
+    <button id="toggleFiles" class="tb-btn" title="Workspace files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+  </div>
+  <div id="messages"><div class="msg-wrap" id="msgWrap"></div></div>
+  <div id="inputBar">
+    <div class="input-wrap">
+      <div id="attachments"></div>
+      <textarea id="prompt" rows="1" placeholder="Message Synapse One..."></textarea>
+      <button id="sendBtn" disabled title="Send"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+      <button id="attachBtn" title="Attach file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
+    </div>
+  </div>
+</div>
+<div id="fpanel" class="collapsed">
+  <div class="fp-head"><span>Workspace Files</span><button id="fpClose">&times;</button></div>
+  <div id="fpList"></div>
+  <div id="fpDrop">Drop files here<input id="fpUpload" type="file" multiple></div>
+</div>
+<input id="pickInput" type="file" multiple hidden>
+<div id="settingsOverlay" class="overlay">
+  <div class="modal">
+    <h3>Settings</h3>
+    <label>Temperature <span id="setTempVal">0.7</span></label>
+    <input id="setTemp" type="range" min="0" max="2" step="0.1" value="0.7">
+    <label>Max tokens (empty = default)</label>
+    <input id="setMaxTok" type="number" placeholder="e.g. 4096" min="0">
+    <label>System prompt</label>
+    <textarea id="setSysPrompt" placeholder="Optional custom instructions..."></textarea>
+    <div class="actions">
+      <button id="settingsCancel" class="btn">Cancel</button>
+      <button id="settingsSave" class="btn primary">Save</button>
+    </div>
+  </div>
+</div>
+<div id="shortcutsOverlay" class="overlay">
+  <div class="modal">
+    <h3>Keyboard Shortcuts</h3>
+    <div style="font-size:13px;line-height:2;color:var(--text2)">
+      <div><kbd>Enter</kbd> &mdash; Send message</div>
+      <div><kbd>Shift+Enter</kbd> &mdash; New line</div>
+      <div><kbd>Ctrl+N</kbd> &mdash; New chat</div>
+      <div><kbd>Ctrl+B</kbd> &mdash; Toggle sidebar</div>
+      <div><kbd>Ctrl+F</kbd> &mdash; Search</div>
+      <div><kbd>Ctrl+/</kbd> &mdash; Shortcuts</div>
+      <div><kbd>Ctrl+Shift+O</kbd> &mdash; Toggle files</div>
+      <div><kbd>Esc</kbd> &mdash; Close overlay</div>
+    </div>
+    <div class="actions"><button id="scClose" class="btn primary">Close</button></div>
+  </div>
+</div>
+<div id="searchBar">
+  <input id="searchInput" placeholder="Search messages...">
+  <span id="searchCount"></span>
+  <button id="searchPrev" class="sb-sbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg></button>
+  <button id="searchNext" class="sb-sbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></button>
+  <button id="searchClose" class="sb-sbtn">&times;</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const LS_SETTINGS = 'synapse_settings';
+let settings = loadSettings();
+let activeProjectId = null;
+let activeChatId = null;
+let projects = [];
+let chats = [];
+let messages = [];
+let busy = false;
+let attachedFiles = new Map();
+function loadSettings() {
+  try { return JSON.parse(localStorage.getItem(LS_SETTINGS)) || { temperature: 0.7, maxTokens: '', sysPrompt: '' }; }
+  catch { return { temperature: 0.7, maxTokens: '', sysPrompt: '' }; }
+}
+function saveSettings() { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); }
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+async function loadProjects() {
+  projects = await api('/projects');
+  renderProjectSelector();
+}
+function renderProjectSelector() {
+  const sel = $('projSel');
+  const cur = activeProjectId;
+  sel.innerHTML = '';
+  projects.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.name + (p.archived ? ' (archived)' : '');
+    sel.appendChild(opt);
+  });
+  if (cur) sel.value = cur;
+}
+$('projSel').addEventListener('change', async () => { await switchProject($('projSel').value); });
+$('projNew').addEventListener('click', async () => {
+  const name = prompt('New project name:');
+  if (!name || !name.trim()) return;
+  const info = await api('/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() }) });
+  await loadProjects();
+  await switchProject(info.id);
+});
+async function switchProject(pid) {
+  activeProjectId = pid;
+  activeChatId = null;
+  await api('/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: pid }) });
+  await loadChats();
+  if (chats.length) await switchChat(chats[0].id);
+  else { activeChatId = null; messages = []; renderMessages(); }
+  refreshFiles();
+}
+async function loadChats() {
+  if (!activeProjectId) { chats = []; renderSidebar(); return; }
+  chats = await api('/projects/' + activeProjectId + '/chats');
+  renderSidebar();
+}
+async function switchChat(cid) {
+  activeChatId = cid;
+  messages = await api('/projects/' + activeProjectId + '/chats/' + cid + '/messages');
+  await api('/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: activeProjectId, chat_id: cid }) });
+  renderSidebar();
+  renderMessages();
+}
+async function createChat() {
+  if (!activeProjectId) return;
+  const info = await api('/projects/' + activeProjectId + '/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'New chat' }) });
+  await loadChats();
+  await switchChat(info.id);
+}
+async function deleteChat(cid) {
+  if (!activeProjectId) return;
+  await api('/projects/' + activeProjectId + '/chats/' + cid, { method: 'DELETE' });
+  if (activeChatId === cid) {
+    activeChatId = null;
+    await loadChats();
+    if (chats.length) await switchChat(chats[0].id);
+    else { messages = []; renderMessages(); }
+  } else await loadChats();
+}
+function renderSidebar() {
+  const list = $('convList');
+  list.innerHTML = '';
+  chats.forEach(c => {
+    const el = document.createElement('div');
+    el.className = 'conv' + (c.id === activeChatId ? ' active' : '');
+    el.innerHTML = '<span class="title">' + esc(c.title) + '</span><button class="del" title="Delete">&times;</button>';
+    el.querySelector('.title').addEventListener('click', () => switchChat(c.id));
+    el.querySelector('.del').addEventListener('click', e => { e.stopPropagation(); deleteChat(c.id); });
+    list.appendChild(el);
+  });
+}
+$('newChat').addEventListener('click', createChat);
+$('toggleSidebar').addEventListener('click', () => $('sidebar').classList.toggle('collapsed'));
+function esc(s) { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; }
+function mdInline(s) {
+  return s.replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function renderMd(src) {
+  const blocks = []; let s = esc(src);
+  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => { const idx = blocks.length; blocks.push({ lang, code }); return '\x00B' + idx + '\x00'; });
+  const out = []; const lines = s.split('\n'); let list = null, buf = [], inBlock = null;
+  const flush = () => {
+    if (list === 'ul') out.push('<ul>' + buf.map(x => '<li>' + mdInline(x) + '</li>').join('') + '</ul>');
+    else if (list === 'ol') out.push('<ol>' + buf.map(x => '<li>' + mdInline(x) + '</li>').join('') + '</ol>');
+    else if (inBlock === 'bq') out.push('<blockquote>' + buf.join('<br>') + '</blockquote>');
+    else if (inBlock) out.push('<' + inBlock + '>' + buf.join('<br>') + '</' + inBlock + '>');
+    else if (buf.length) out.push('<p>' + buf.join('<br>') + '</p>');
+    buf = []; list = null; inBlock = null;
+  };
+  for (const raw of lines) {
+    const hm = raw.match(/^(#{1,3})\s+(.*)$/); const ulm = raw.match(/^[-*]\s+(.*)$/);
+    const olm = raw.match(/^\d+[.)]\s+(.*)$/); const qm = raw.match(/^>\s?(.*)$/);
+    if (hm) { flush(); out.push('<h' + hm[1].length + '>' + mdInline(hm[2]) + '</h' + hm[1].length + '>'); }
+    else if (ulm) { if (inBlock) flush(); if (list !== 'ul') { if (list) flush(); list = 'ul'; } buf.push(ulm[1]); }
+    else if (olm) { if (inBlock) flush(); if (list !== 'ol') { if (list) flush(); list = 'ol'; } buf.push(olm[1]); }
+    else if (qm) { if (list) flush(); if (inBlock !== 'bq') { if (inBlock) flush(); inBlock = 'bq'; } buf.push(qm[1]); }
+    else if (/^\s*$/.test(raw)) flush();
+    else if (/^---+$/.test(raw)) { flush(); out.push('<hr>'); }
+    else { if (list) flush(); if (!inBlock) inBlock = 'p'; buf.push(raw); }
+  }
+  flush();
+  return out.join('').replace(/\x00B(\d+)\x00/g, (_, i) => {
+    const b = blocks[+i]; const langLabel = b.lang ? '<span class="lang">' + esc(b.lang) + '</span>' : '';
+    return '<pre>' + langLabel + '<button class="copy-btn" onclick="copyCode(this)">Copy</button><code>' + b.code + '</code></pre>';
+  });
+}
+function copyCode(btn) {
+  const code = btn.parentElement.querySelector('code');
+  navigator.clipboard.writeText(code.textContent).then(() => {
+    btn.textContent = 'Copied!'; btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+  });
+}
+function renderMessages() {
+  const wrap = $('msgWrap'); wrap.innerHTML = '';
+  if (!messages.length) {
+    wrap.innerHTML = '<div class="empty" id="emptyState"><div class="orb">S</div><h2>How can I help?</h2><p>Ask anything. Drop files onto the chat to give context &mdash; they are indexed and retrieved automatically.</p><div class="sugg-wrap"><button class="sugg">Summarize the workspace</button><button class="sugg">Find every TODO</button><button class="sugg">Explain the architecture</button></div></div>';
+    return;
+  }
+  messages.forEach((m, i) => appendMsgEl(m, i)); scrollToBottom();
+}
+function appendMsgEl(m, idx) {
+  const wrap = $('msgWrap'); const emptyEl = $('emptyState'); if (emptyEl) emptyEl.remove();
+  const el = document.createElement('div'); el.className = 'msg ' + m.role;
+  const av = m.role === 'assistant' ? '<div class="avatar">S</div>' : '<div class="avatar">U</div>';
+  const body = document.createElement('div'); body.className = 'msg-body';
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+  if (m.role === 'assistant') bubble.innerHTML = renderMd(m.content); else bubble.textContent = m.content;
+  body.appendChild(bubble);
+  if (m.meta && m.meta.length) { const meta = document.createElement('div'); meta.className = 'msg-meta'; m.meta.forEach(t => { const s = document.createElement('span'); s.className = 'tag'; s.textContent = t; meta.appendChild(s); }); body.appendChild(meta); }
+  if (m.trace) { const tb = document.createElement('div'); tb.className = 'trace-box'; tb.innerHTML = '<button>show trace</button><pre>' + esc(JSON.stringify(m.trace, null, 2)) + '</pre>'; tb.querySelector('button').addEventListener('click', () => { const pre = tb.querySelector('pre'); const show = pre.style.display === 'none'; pre.style.display = show ? 'block' : 'none'; tb.querySelector('button').textContent = show ? 'hide trace' : 'show trace'; }); body.appendChild(tb); }
+  if (m.role === 'user') { const actions = document.createElement('div'); actions.className = 'msg-actions'; actions.innerHTML = '<button class="act-btn" title="Edit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit</button>'; actions.querySelector('.act-btn').addEventListener('click', () => editMessage(idx)); body.appendChild(actions); }
+  if (m.role === 'assistant') { const actions = document.createElement('div'); actions.className = 'msg-actions'; actions.innerHTML = '<button class="act-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy</button><button class="act-btn" title="Regenerate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Regenerate</button>'; actions.querySelectorAll('.act-btn').forEach(b => { b.addEventListener('click', () => { if (b.title === 'Copy') { navigator.clipboard.writeText(m.content); b.textContent = 'Copied!'; setTimeout(() => { b.textContent = 'Copy'; }, 1500); } else regenerateFrom(idx); }); }); body.appendChild(actions); }
+  el.appendChild(av); el.appendChild(body); wrap.appendChild(el); return el;
+}
+function scrollToBottom() { const m = $('messages'); m.scrollTop = m.scrollHeight; }
+function showTyping() { const wrap = $('msgWrap'); const el = document.createElement('div'); el.className = 'msg assistant'; el.id = 'typingIndicator'; el.innerHTML = '<div class="avatar">S</div><div class="msg-body"><div class="typing"><span></span><span></span><span></span></div></div>'; wrap.appendChild(el); scrollToBottom(); return el; }
+function removeTyping() { $('typingIndicator')?.remove(); }
+async function streamResponse(fullText, meta, trace) {
+  removeTyping();
+  return new Promise(resolve => {
+    const wrap = $('msgWrap'); const idx = messages.length;
+    const msg = { role: 'assistant', content: '', meta, trace }; messages.push(msg);
+    const el = appendMsgEl(msg, idx); const bubble = el.querySelector('.bubble');
+    let pos = 0;
+    const cursor = document.createElement('span');
+    cursor.style.cssText = 'display:inline-block;width:2px;height:1em;background:var(--accent);margin-left:1px;animation:blink .8s infinite;vertical-align:text-bottom';
+    bubble.appendChild(cursor);
+    const speed = Math.max(4, Math.min(18, Math.ceil(fullText.length / 200)));
+    function tick() {
+      if (pos < fullText.length) { pos += speed; bubble.textContent = fullText.slice(0, pos); bubble.appendChild(cursor); scrollToBottom(); requestAnimationFrame(tick); }
+      else { cursor.remove(); bubble.innerHTML = renderMd(fullText); resolve(); }
+    }
+    requestAnimationFrame(tick);
+  });
+}
+const ta = $('prompt');
+function autosize() { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'; }
+function updateSend() { $('sendBtn').disabled = busy || !ta.value.trim(); }
+ta.addEventListener('input', () => { autosize(); updateSend(); });
+ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$('sendBtn').addEventListener('click', send);
+document.addEventListener('click', e => { const b = e.target.closest('.sugg'); if (!b) return; ta.value = b.textContent.trim(); autosize(); updateSend(); send(); });
+async function send() {
+  const prompt = ta.value.trim(); if (!prompt || busy) return;
+  if (!activeChatId) await createChat();
+  const userMsg = { role: 'user', content: prompt, created_at: new Date().toISOString(), meta: [], trace: null, files: [] };
+  messages.push(userMsg); appendMsgEl(userMsg, messages.length - 1);
+  $('emptyState')?.remove(); ta.value = ''; autosize(); updateSend();
+  busy = true; updateSend(); showTyping();
+  try {
+    const body = { prompt, files: [...attachedFiles.keys()], temperature: settings.temperature, project_id: activeProjectId, chat_id: activeChatId };
+    if (settings.maxTokens) body.max_tokens = parseInt(settings.maxTokens) || undefined;
+    const model = $('modelSel').value; if (model) body.model = model;
+    const res = await fetch('/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+    const meta = [];
+    if (res.provider) meta.push(res.provider); if (res.model) meta.push(res.model);
+    if (res.latency_ms != null) meta.push((res.latency_ms / 1000).toFixed(1) + 's');
+    if (res.intent) meta.push(String(res.intent).charAt(0).toUpperCase() + String(res.intent).slice(1).toLowerCase().replace(/_/g, ' '));
+    const ws = res.workspace; if (ws) { const p = []; if (ws.files_used?.length) p.push(ws.files_used.length + ' file' + (ws.files_used.length > 1 ? 's' : '')); if (ws.retrieval?.length) p.push(ws.retrieval.length + ' chunks'); if (ws.local_only) p.push('local'); if (p.length) meta.push(p.join(' \u00b7 ')); }
+    await streamResponse(res.response || '(no response)', meta, res.decision_trace);
+  } catch (e) { removeTyping(); const errMsg = { role: 'assistant', content: 'Error: ' + e.message + '. Is Ollama running?', created_at: new Date().toISOString(), meta: [], trace: null, files: [] }; messages.push(errMsg); appendMsgEl(errMsg, messages.length - 1); }
+  finally { busy = false; updateSend(); loadChats(); }
+}
+function regenerateFrom(msgIdx) { if (busy) return; messages.splice(msgIdx); renderMessages(); const lastUser = [...messages].reverse().find(m => m.role === 'user'); if (lastUser) { ta.value = lastUser.content; autosize(); updateSend(); } }
+function editMessage(idx) { const m = messages[idx]; if (m.role !== 'user') return; const newText = prompt('Edit message:', m.content); if (newText !== null && newText.trim()) { messages.splice(idx); renderMessages(); ta.value = newText.trim(); autosize(); updateSend(); } }
+function refreshModels() {
+  fetch('/models').then(r => r.json()).then(models => {
+    const sel = $('modelSel'); const cur = sel.value; sel.innerHTML = '<option value="">auto-route</option>';
+    models.forEach(m => { const opt = document.createElement('option'); opt.value = m.id; opt.textContent = m.id + (m.available ? '' : ' (unavailable)'); opt.disabled = !m.available; sel.appendChild(opt); }); sel.value = cur;
+  }).catch(() => {});
+}
+$('toggleFiles').addEventListener('click', () => { const p = $('fpanel'); p.classList.toggle('collapsed'); $('toggleFiles').classList.toggle('active', !p.classList.contains('collapsed')); });
+$('fpClose').addEventListener('click', () => { $('fpanel').classList.add('collapsed'); $('toggleFiles').classList.remove('active'); });
+function refreshFiles() {
+  const qs = activeProjectId ? '?project_id=' + encodeURIComponent(activeProjectId) : '';
+  fetch('/workspace' + qs).then(r => r.json()).then(w => {
+    const list = $('fpList');
+    if (!w.files.length) { list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No files uploaded</div>'; return; }
+    list.innerHTML = '';
+    w.files.forEach(f => { const el = document.createElement('div'); el.className = 'fp-item'; const checked = attachedFiles.has(f.id) ? 'checked' : ''; const dotClass = f.status === 'indexed' ? 'ok' : f.status === 'failed' ? 'err' : 'idx'; el.innerHTML = '<input type="checkbox" ' + checked + ' data-fid="' + f.id + '"><span class="dot ' + dotClass + '"></span><span class="name">' + esc(f.name) + '</span><span class="info">' + f.indexed_chunks + ' ch</span>'; el.querySelector('input').addEventListener('change', e => { if (e.target.checked) attachedFiles.set(f.id, { name: f.name, status: f.status }); else attachedFiles.delete(f.id); renderChips(); }); list.appendChild(el); });
+    renderChips();
+  }).catch(() => {});
+}
+function renderChips() {
+  const box = $('attachments'); box.innerHTML = '';
+  attachedFiles.forEach((info, id) => { const chip = document.createElement('div'); chip.className = 'chip'; const stCls = info.status === 'indexed' ? ' ok' : ''; chip.innerHTML = '<span>' + esc(info.name) + '</span><span class="st' + stCls + '">' + info.status + '</span><button title="Detach">&times;</button>'; chip.querySelector('button').addEventListener('click', () => { attachedFiles.delete(id); renderChips(); refreshFiles(); }); box.appendChild(chip); });
+}
+function uploadFile(file) {
+  const fd = new FormData(); fd.append('file', file);
+  const qs = activeProjectId ? '?project_id=' + encodeURIComponent(activeProjectId) : '';
+  fetch('/files' + qs, { method: 'POST', body: fd }).then(r => r.json()).then(res => { attachedFiles.set(res.file.id, { name: res.file.name, status: res.file.status }); renderChips(); refreshFiles(); $('fpanel').classList.remove('collapsed'); $('toggleFiles').classList.add('active'); }).catch(() => {});
+}
+$('attachBtn').addEventListener('click', () => $('pickInput').click());
+$('pickInput').addEventListener('change', e => { [...e.target.files].forEach(uploadFile); e.target.value = ''; });
+$('fpDrop').addEventListener('dragover', e => { e.preventDefault(); $('fpDrop').classList.add('over'); });
+$('fpDrop').addEventListener('dragleave', () => $('fpDrop').classList.remove('over'));
+$('fpDrop').addEventListener('drop', e => { e.preventDefault(); $('fpDrop').classList.remove('over'); [...(e.dataTransfer?.files || [])].forEach(uploadFile); });
+$('fpUpload').addEventListener('change', e => { [...e.target.files].forEach(uploadFile); e.target.value = ''; });
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => { e.preventDefault(); [...(e.dataTransfer?.files || [])].forEach(uploadFile); });
+$('settingsBtn').addEventListener('click', () => { $('setTemp').value = settings.temperature; $('setTempVal').textContent = settings.temperature; $('setMaxTok').value = settings.maxTokens || ''; $('setSysPrompt').value = settings.sysPrompt || ''; $('settingsOverlay').classList.add('open'); });
+$('setTemp').addEventListener('input', () => { $('setTempVal').textContent = $('setTemp').value; });
+$('settingsCancel').addEventListener('click', () => $('settingsOverlay').classList.remove('open'));
+$('settingsSave').addEventListener('click', () => { settings.temperature = parseFloat($('setTemp').value) || 0.7; settings.maxTokens = $('setMaxTok').value; settings.sysPrompt = $('setSysPrompt').value; saveSettings(); $('settingsOverlay').classList.remove('open'); });
+let searchIdx = -1;
+function openSearch() { $('searchBar').classList.add('open'); $('searchInput').focus(); }
+function closeSearch() { $('searchBar').classList.remove('open'); clearHighlights(); searchIdx = -1; }
+function clearHighlights() { document.querySelectorAll('mark.search-hl').forEach(m => { m.replaceWith(document.createTextNode(m.textContent)); }); }
+function doSearch() { clearHighlights(); const q = $('searchInput').value.trim(); if (!q) { $('searchCount').textContent = ''; return; } const walker = document.createTreeWalker($('msgWrap'), NodeFilter.SHOW_TEXT); const matches = []; while (walker.nextNode()) { const node = walker.currentNode; const idx = node.textContent.toLowerCase().indexOf(q.toLowerCase()); if (idx >= 0) matches.push({ node, idx }); } $('searchCount').textContent = matches.length ? matches.length + ' found' : '0 found'; if (matches.length) { searchIdx = 0; highlightMatch(matches[searchIdx]); } }
+function highlightMatch(m) { document.querySelectorAll('mark.current').forEach(el => el.classList.remove('current')); const range = document.createRange(); range.setStart(m.node, m.idx); range.setEnd(m.node, m.idx + $('searchInput').value.length); const mark = document.createElement('mark'); mark.className = 'search-hl current'; range.surroundContents(mark); mark.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+$('searchBtn').addEventListener('click', openSearch); $('searchClose').addEventListener('click', closeSearch); $('searchInput').addEventListener('input', doSearch); $('searchNext').addEventListener('click', doSearch); $('searchPrev').addEventListener('click', doSearch);
+$('shortcutsBtn').addEventListener('click', () => $('shortcutsOverlay').classList.add('open'));
+$('scClose').addEventListener('click', () => $('shortcutsOverlay').classList.remove('open'));
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { if ($('searchBar').classList.contains('open')) closeSearch(); else if ($('settingsOverlay').classList.contains('open')) $('settingsOverlay').classList.remove('open'); else if ($('shortcutsOverlay').classList.contains('open')) $('shortcutsOverlay').classList.remove('open'); }
+  if (e.ctrlKey && e.key === 'n') { e.preventDefault(); createChat(); }
+  if (e.ctrlKey && e.key === 'b') { e.preventDefault(); $('sidebar').classList.toggle('collapsed'); }
+  if (e.ctrlKey && e.key === 'f') { e.preventDefault(); openSearch(); }
+  if (e.ctrlKey && e.key === '/') { e.preventDefault(); $('shortcutsOverlay').classList.toggle('open'); }
+  if (e.ctrlKey && e.shiftKey && e.key === 'O') { e.preventDefault(); $('fpanel').classList.toggle('collapsed'); $('toggleFiles').classList.toggle('active', !$('fpanel').classList.contains('collapsed')); }
+});
+function refreshStatus() {
+  fetch('/status').then(r => r.json()).then(st => {
+    const ready = st.providers.some(p => p.ready); $('statusDot').className = ready ? '' : 'off';
+    const names = st.providers.map(p => p.provider_id).join(', ');
+    $('statusText').textContent = (names || 'no providers') + ' \u00b7 ' + st.registry_count + ' models';
+  }).catch(() => { $('statusDot').className = 'off'; $('statusText').textContent = 'API unavailable'; });
+}
+async function boot() {
+  try {
+    const session = await api('/session');
+    if (session.project_id) activeProjectId = session.project_id;
+    if (session.chat_id) activeChatId = session.chat_id;
+  } catch {}
+  await loadProjects();
+  if (!activeProjectId && projects.length) activeProjectId = projects[0].id;
+  if (activeProjectId) { $('projSel').value = activeProjectId; await loadChats(); }
+  if (activeChatId && chats.some(c => c.id === activeChatId)) await switchChat(activeChatId);
+  else if (chats.length) await switchChat(chats[0].id);
+  else { messages = []; renderMessages(); }
+  refreshModels(); refreshStatus(); refreshFiles();
+  setInterval(refreshStatus, 15000); setInterval(refreshFiles, 5000);
+}
+boot();
+</script>
+</body>
+</html>

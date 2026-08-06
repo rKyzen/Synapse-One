@@ -1,0 +1,240 @@
+# Synapse One — default configuration
+# Layered with env vars and secret files. Never commit real keys here.
+
+[logging]
+level = "INFO"
+json = false
+
+# Model lifecycle — RAM-resident model management.
+#   idle_timeout_small  : unload idle models after N seconds (fast/small models)
+#   idle_timeout_large  : unload idle LARGE models sooner (they waste more RAM)
+#   idle_timeout_embedding : never auto-unload the embedding model
+#   cleanup_interval    : background cleanup runs every N seconds
+#   keep_embedding_loaded : keep nomic-embed-text resident
+#   low_memory_threshold: GB of free RAM that triggers immediate idle unload
+#   max_loaded_models   : soft ceiling on concurrently loaded models
+[lifecycle]
+idle_timeout_small = 60
+idle_timeout_large = 30
+idle_timeout_embedding = 1e18
+cleanup_interval = 15
+keep_embedding_loaded = true
+low_memory_threshold = 4
+large_model_min_ram_gb = 8
+max_loaded_models = 4
+
+# Task Planner — decomposes large prompts into a task DAG.
+#   enabled             : set false to always treat the whole prompt as one task
+#   min_split_complexity: below this complexity score, no decomposition
+#   max_tasks           : ceiling on the number of execution tasks
+# Phase 6:
+#   file_output_enabled : detect "create/write/generate/refactor" prompts and
+#                         expect a structured file manifest from the model
+#   add_review          : append a REVIEW task routed to the strongest
+#                         available reasoning model after file tasks
+#   model_hints         : kind -> preferred model id, e.g.
+#                         { coding = "qwen2.5-coder", writing = "llama3.1" }
+[planner]
+enabled = true
+min_split_complexity = 40
+max_tasks = 6
+file_output_enabled = true
+add_review = true
+model_hints = {}
+
+# Workspace Memory — scoped (conversation/project/global) semantic memory.
+#   embedding_model : model used for embeddings (must be installed in Ollama)
+#   top_k           : results returned per search
+#   min_similarity  : cosine threshold; below it, entries are dropped
+[memory]
+enabled = true
+embedding_model = "nomic-embed-text"
+top_k = 3
+min_similarity = 0.35
+
+# Workspace (Phase 4) — multimodal file intake + RAG.
+#   storage_dir          : relative to the data dir
+#   chunk_size/overlap   : document chunking (characters)
+#   code_chunk_lines     : code chunking (lines)
+#   embedding_model      : embeddings for RAG (must be installed in Ollama)
+#   vision_model         : local vision model for images (must be pulled)
+#   top_k                : retrieved chunks per question
+#   min_similarity       : retrieval cosine threshold
+#   embed_batch_size     : vectors per API call
+#   allow_cloud_forwarding : false = document content NEVER leaves the device
+#   auto_retrieve        : answer follow-ups from prior uploads automatically
+[workspace]
+enabled = true
+storage_dir = "workspace"
+chunk_size = 1200
+chunk_overlap = 200
+code_chunk_lines = 200
+code_chunk_overlap = 20
+embedding_model = "nomic-embed-text"
+vision_model = "qwen2.5vl:7b"
+top_k = 4
+min_similarity = 0.25
+embed_batch_size = 16
+allow_cloud_forwarding = false
+auto_retrieve = true
+code_scan_patterns = ["TODO", "FIXME", "HACK", "XXX"]
+code_scan_triggers = ["todo", "fixme", "hack"]
+
+# file-type → pipeline mapping (image | document | code)
+[workspace.pipelines]
+image = ["png", "jpg", "jpeg", "webp", "gif", "bmp"]
+document = ["pdf", "docx", "txt", "md", "markdown", "rtf"]
+code = ["py", "js", "ts", "dart", "rs", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb", "php", "sh", "bash", "ps1", "sql", "html", "css", "scss", "json", "jsonc", "yaml", "yml", "toml", "xml", "proto", "kt", "swift"]
+
+# Local vector database backend: "faiss" (default) or "local" (numpy).
+[vector_store]
+provider = "faiss"
+
+# Phase 2.5 — performance learning loop. Per-model execution stats are
+# recorded after every request and fed back into routing (latency prediction).
+[performance]
+enabled = true
+max_entries = 500
+
+# Phase 4 — answer quality & reliability.
+#   refuse_threshold   : confidence below this -> refuse/hedge instead of guessing
+#   verify_threshold   : confidence below this -> run multi-step verification
+#   escalate_threshold : confidence below this -> retry with a stronger model
+[confidence]
+refuse_threshold = 0.3
+verify_threshold = 0.7
+escalate_threshold = 0.6
+
+# Phase 4 — context builder budget (characters for the final prompt bundle).
+[context]
+max_chars = 8000
+
+[providers.ollama]
+enabled = true
+base_url = "http://localhost:11434"
+default_model = "qwen2.5:3b"
+
+# Timeouts (seconds). Local CPU inference is slow — generous defaults.
+#   connect    : time to establish the TCP connection
+#   read       : max idle gap between streamed chunks (model "thinking" time)
+#   generation : total wall-clock budget; exceeded mid-stream, partial output is returned
+[providers.ollama.timeouts]
+connect = 10
+read = 180
+generation = 180
+
+[providers.openai]
+enabled = false
+base_url = "https://api.openai.com/v1"
+# Supply via env: SYNAPSE_PROVIDERS_OPENAI_API_KEY or a secret file:
+# api_key_file = "C:/path/to/openai.key"
+api_key_env = "OPENAI_API_KEY"
+default_model = "gpt-4o-mini"
+
+[providers.gemini]
+enabled = false
+# api_key_env = "GEMINI_API_KEY"
+default_model = "gemini-1.5-flash"
+
+# ---------------------------------------------------------------------------
+# Model catalog — weighted capability profiles (0.0..1.0) per model.
+# The router treats these as SPECIALISTS: it matches the task's required and
+# preferred capabilities against every profile and picks the best fit.
+# All values are configurable; nothing is hardcoded in code.
+# ---------------------------------------------------------------------------
+
+# General chat specialist — the everyday model.
+[models."qwen2.5:3b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 3B (general chat)"
+context_window = 32768
+required_ram_gb = 4
+latency = "fast"
+privacy_score = 1.0
+priority = 90
+preferred_tasks = ["chat", "writing", "translation", "summaries", "light reasoning"]
+capabilities = { chat = 1.0, writing = 0.95, translation = 0.9, planning = 0.75, reasoning = 0.7, coding = 0.4, math = 0.6, vision = false, tools = false }
+
+# Coding specialist.
+[models."qwen2.5-coder:7b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 Coder 7B"
+context_window = 32768
+required_ram_gb = 8
+latency = "medium"
+privacy_score = 1.0
+priority = 95
+preferred_tasks = ["coding", "debugging", "algorithms", "architecture", "terminal", "json", "function calling"]
+capabilities = { coding = 1.0, debugging = 1.0, architecture = 0.95, reasoning = 0.8, writing = 0.4, math = 0.6, json_capability = 1.0, terminal = 0.7, chat = 0.5, vision = false, tools = true }
+
+# Long reasoning / research specialist.
+[models."llama3.1:8b"]
+provider = "ollama"
+kind = "local"
+display_name = "Llama 3.1 8B (reasoning)"
+context_window = 131072
+required_ram_gb = 8
+latency = "medium"
+privacy_score = 1.0
+priority = 85
+preferred_tasks = ["planning", "reasoning", "research", "math", "long-form analysis"]
+capabilities = { reasoning = 1.0, planning = 1.0, math = 0.9, coding = 0.7, writing = 0.75, chat = 0.6, translation = 0.6, vision = false, tools = false }
+
+# Vision specialist — excluded (zero score) for text-only tasks.
+[models."qwen2.5vl:7b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 VL 7B (vision)"
+context_window = 32768
+required_ram_gb = 8
+latency = "medium"
+privacy_score = 1.0
+priority = 80
+preferred_tasks = ["vision", "ocr", "pdfs", "screenshots", "image analysis"]
+capabilities = { vision = true, ocr = 1.0, pdf = 1.0, chat = 0.6, coding = 0.25, reasoning = 0.5, writing = 0.5, math = 0.4, tools = false }
+
+# Embeddings specialist — can never serve text generation (chat = 0).
+[models."nomic-embed-text"]
+provider = "ollama"
+kind = "local"
+display_name = "Nomic Embed Text"
+context_window = 8192
+required_ram_gb = 1
+latency = "fast"
+privacy_score = 1.0
+priority = 10
+preferred_tasks = ["embeddings", "semantic search", "memory retrieval"]
+capabilities = { embeddings = 1.0, chat = 0.0, writing = 0.0, coding = 0.0, reasoning = 0.0, math = 0.0, vision = false, tools = false }
+
+# Legacy catalog entries (kept for reference; discover-based sync adds more).
+[models."llama3.2"]
+provider = "ollama"
+kind = "local"
+display_name = "Meta Llama 3.2 3B"
+context_window = 131072
+required_ram_gb = 4
+latency = "fast"
+privacy_score = 1.0
+capabilities = { chat = 0.8, reasoning = 0.5, coding = 0.5, writing = 0.6, math = 0.5, vision = false }
+
+[models."gpt-4o-mini"]
+provider = "openai"
+kind = "cloud"
+display_name = "GPT-4o mini"
+context_window = 128000
+estimated_cost_per_1k = 0.00015
+latency = "fast"
+privacy_score = 0.0
+capabilities = { chat = 1.0, reasoning = 0.85, coding = 0.85, writing = 0.9, math = 0.8, translation = 0.9, planning = 0.8, vision = true, tools = true }
+
+[models."gemini-1.5-flash"]
+provider = "gemini"
+kind = "cloud"
+display_name = "Gemini 1.5 Flash"
+context_window = 1000000
+estimated_cost_per_1k = 0.000075
+latency = "fast"
+privacy_score = 0.0
+capabilities = { chat = 1.0, reasoning = 0.8, coding = 0.8, writing = 0.85, math = 0.8, translation = 0.85, planning = 0.75, vision = true, tools = true }

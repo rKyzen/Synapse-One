@@ -1,0 +1,9 @@
+[logging]
+level = "INFO"
+[providers.ollama]
+enabled = true
+base_url = "http://localhost:11434"
+[models."llama3.2"]
+provider = "ollama"
+kind = "local"
+capabilities = { coding = 0.5 }
