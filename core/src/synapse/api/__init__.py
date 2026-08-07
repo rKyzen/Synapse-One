@@ -15,10 +15,11 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 import synapse
+from synapse.api.timeline import TimelineHub
 from synapse.bootstrap import Boot, create_container
 from synapse.domain import AgentRequest, AgentResponse
 from synapse.domain.workspace import WorkspaceFileInfo
@@ -54,6 +55,7 @@ def build_app(boot: Boot | None = None) -> FastAPI:
     boot.start()
     log = get_logger("synapse.api")
     system: WorkspaceSystem = boot.projects  # workspace system facade
+    timeline = TimelineHub(boot.events)
 
     app = FastAPI(
         title="Synapse One — AI Core",
@@ -114,36 +116,34 @@ def build_app(boot: Boot | None = None) -> FastAPI:
         )
 
     # -- /request (chat recording + per-project scoping) --------------------
+    # A shared runner powers both the plain POST (JSON in, JSON out) and the
+    # SSE variant that streams live execution-timeline steps while the agent
+    # works, ending with the same AgentResponse payload.
 
-    @app.post("/request", response_model=AgentResponse)
-    def request(body: AgentRequest) -> AgentResponse:
-        """The Master Agent's public entry point.
-
-        When ``project_id`` is supplied (or the active session project is used),
-        user and assistant messages are recorded to the project's chat store.
-        """
+    def _perform_request(body: AgentRequest) -> tuple[AgentResponse, list[str]]:
         pid = body.project_id or system.session().get("project_id") or "general"
         chat = system.ensure_chat(pid, body.chat_id)
         chat_store = system.chat_store(pid)
         chat_store.append(chat.id, role="user", content=body.prompt, files=body.files)
-        try:
-            resp = boot.master.process(
-                body.prompt,
-                files=body.files or None,
-                model=body.model,
-                temperature=body.temperature,
-                max_tokens=body.max_tokens,
-                workspace=system.workspace_for(pid),
-                memory=system.memory_for(pid),
-                # Phase 6 — per-project safe filesystem tool + audit trail.
-                file_operator=system.file_operator(pid),
-                action_log=system.action_log(pid),
-                project_id=pid,
-            )
-        except ProviderUnavailable as exc:
-            chat_store.append(chat.id, role="assistant", content=f"Error: {exc}")
-            log.warning("request_failed", error=str(exc)[:200])
-            raise HTTPException(status_code=503, detail=str(exc))
+        info = system.get_project(pid)
+        resp = boot.master.process(
+            body.prompt,
+            files=body.files or None,
+            model=body.model,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            workspace=system.workspace_for(pid),
+            memory=system.memory_for(pid),
+            # Phase 6 — per-project safe filesystem tool + audit trail.
+            file_operator=system.file_operator(pid),
+            action_log=system.action_log(pid),
+            project_id=pid,
+            conversation_id=chat.id,
+            # Phase XIII — surface the opened project's identity (name, folder)
+            # inside every model prompt via the workspace brief.
+            project_name=info.name if info else None,
+            project_path=info.workspace_path if info else None,
+        )
         meta = []
         if resp.provider:
             meta.append(resp.provider)
@@ -151,6 +151,8 @@ def build_app(boot: Boot | None = None) -> FastAPI:
             meta.append(resp.model)
         if resp.latency_ms:
             meta.append(f"{resp.latency_ms/1000:.1f}s")
+        if resp.intent:
+            meta.append(str(resp.intent))
         if resp.actions:
             created = [a.path for a in resp.actions if a.action == "created" and a.status == "ok"]
             if created:
@@ -174,7 +176,31 @@ def build_app(boot: Boot | None = None) -> FastAPI:
             trace=resp.decision_trace.model_dump() if resp.decision_trace else None,
         )
         system.save_session(pid, chat.id)
+        return resp, meta
+
+    @app.post("/request", response_model=AgentResponse)
+    def request(body: AgentRequest) -> AgentResponse:
+        """The Master Agent's public entry point.
+
+        When ``project_id`` is supplied (or the active session project is used),
+        user and assistant messages are recorded to the project's chat store.
+        """
+        try:
+            resp, _ = _perform_request(body)
+        except ProviderUnavailable as exc:
+            pid = body.project_id or system.session().get("project_id") or "general"
+            chat = system.ensure_chat(pid, body.chat_id)
+            chat_store = system.chat_store(pid)
+            chat_store.append(chat.id, role="assistant", content=f"Error: {exc}")
+            log.warning("request_failed", error=str(exc)[:200])
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         return resp
+
+    @app.post("/request/stream")
+    def request_stream(body: AgentRequest) -> StreamingResponse:
+        """SSE variant of ``/request``: streams live execution-timeline steps,
+        then a final ``done`` event carrying the same AgentResponse payload."""
+        return timeline.stream(lambda: _perform_request(body))
 
     # -- /projects (CRUD) ----------------------------------------------------
     #

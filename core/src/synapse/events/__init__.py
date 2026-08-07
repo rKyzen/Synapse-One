@@ -112,6 +112,7 @@ class Events:
     MEMORY_WRITTEN = "memory.written"
 
     # Phase 4 — workspace / multimodal
+    TIMELINE = "timeline.step"
     FILE_UPLOADED = "file.uploaded"
     FILE_INDEXING_STARTED = "file.indexing.started"
     FILE_INDEXED = "file.indexed"

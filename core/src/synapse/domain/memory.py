@@ -17,5 +17,8 @@ class MemoryEntry(BaseModel):
     created_at: str = ""
     source: str = ""
     metadata: dict = Field(default_factory=dict)
+    #: chat/conversation id that owns this entry — conversation-scoped entries
+    #: are only ever retrieved from the same conversation (per-chat isolation).
+    conversation: str | None = None
     #: similarity of this entry to the query that returned it (0..1).
     similarity: float | None = None

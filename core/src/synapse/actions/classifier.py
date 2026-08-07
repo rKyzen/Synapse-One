@@ -179,3 +179,51 @@ def extract_workspace_ops(prompt: str) -> list[dict]:
         seen.add(key)
         deduped.append(op)
     return deduped
+
+
+# -- Phase XIII: the workspace-access gate ----------------------------------
+# The planner instantiation decision pipeline starts with "does this request
+# operate on the workspace?" before any model call. The gate is deterministic:
+# explicit file verbs (build/create/modify/refactor/...), explicit destinations
+# (``save ... to file.py``), explicit filesystem paths, or project/code coverage
+# words all answer YES; pure greetings and chat-only opinions answer NO.
+
+_WORKSPACE_GATE_RE = re.compile(
+    r"\b(create|build|write|generate|scaffold|design|develop|make|modify|refactor|"
+    r"rewrite|edit|update|change|fix|debug|delete|remove|rename|move|export|save|"
+    r"dump|search|find|read|open|list)\b",
+    re.IGNORECASE,
+)
+_FILE_OPERAND_RE = re.compile(r"(?:[\w\-/]+\.)[a-z0-9]+", re.IGNORECASE)
+_PROJECT_WORDS_RE = re.compile(
+    r"\b(file|files|folder|folders|directory|code|script|function|class|method|api|"
+    r"endpoint|website|web\s*app|app|workspace|project|codebase|readme|documentation|"
+    r"docs|test|tests|bug)\b",
+    re.IGNORECASE,
+)
+_CHAT_ONLY_GREETING_RE = re.compile(
+    r"^(hi|hello|hey|yo|thanks|thank\s+you|thank\s+u|how\s+are\s+you|"
+    r"what\s+can\s+you\s+do|who\s+are\s+you|what\s+is\s+this)\b",
+    re.IGNORECASE,
+)
+
+
+def requires_workspace_access(prompt: str) -> bool:
+    """Deterministic planner gate — would this request operate on the opened
+    workspace rather than only answer in chat?
+
+    True for build/create/modify/refactor/generate/fix/design-type requests,
+    requests naming real files, or requests about project code/artifacts. False
+    only for pure greetings and chat-only opinions; everything else tends to
+    touch the workspace and is flagged YES so context and file tools are used.
+    """
+    text = (prompt or "").strip().lower()
+    if not text:
+        return False
+    if _CHAT_ONLY_GREETING_RE.match(text):
+        return False
+    if _WORKSPACE_GATE_RE.search(text):
+        return True
+    if _FILE_OPERAND_RE.search(prompt or ""):
+        return True
+    return bool(_PROJECT_WORDS_RE.search(text))

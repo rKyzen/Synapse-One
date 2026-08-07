@@ -15,7 +15,11 @@ workspace folder — then reports a short summary.
 
 from __future__ import annotations
 
-from synapse.actions.classifier import classify_request, extract_workspace_ops
+from synapse.actions.classifier import (
+    classify_request,
+    extract_workspace_ops,
+    requires_workspace_access,
+)
 from synapse.actions.engine import ActionEngine
 from synapse.domain.enums import RequestKind
 
@@ -24,4 +28,5 @@ __all__ = [
     "RequestKind",
     "classify_request",
     "extract_workspace_ops",
+    "requires_workspace_access",
 ]

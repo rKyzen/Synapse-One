@@ -100,6 +100,14 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .typing span:nth-child(2) { animation-delay: .15s; }
 .typing span:nth-child(3) { animation-delay: .3s; }
 @keyframes typBounce { 0%,80%,100%{opacity:.2;transform:translateY(0)} 40%{opacity:1;transform:translateY(-4px)} }
+.tl-bubble { font-family: var(--mono); font-size: 11.5px; line-height: 1.8; color: var(--text2); padding: 2px 12px 4px; }
+.tl-line { display: flex; gap: 7px; align-items: baseline; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl-line .tl-ico { flex: 0 0 auto; }
+.tl-line.done { color: var(--muted); }
+.tl-line.error { color: #f68; }
+.tl-line.finished { color: #7bd88f; }
+.tl-line.live .tl-ico { animation: tlPulse 1s infinite; }
+@keyframes tlPulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
 .status-banner { background: rgba(255,255,255,0.08); border: 1px solid var(--border2); padding: 8px 12px; font-size: 11px; font-family: var(--mono); color: var(--text2); margin: 8px auto; max-width: 760px; text-align: center; }
 #inputBar { flex: 0 0 auto; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); padding: 10px 16px 14px; }
 .input-wrap { max-width: 760px; margin: 0 auto; position: relative; }
@@ -267,9 +275,6 @@ HTML_BODY = r"""
     <div class="actions"><button id="scClose" class="btn primary">close</button></div>
   </div>
 </div>
-    <div class="actions"><button id="scClose" class="btn primary">close</button></div>
-  </div>
-</div>
 <div id="searchBar">
   <input id="searchInput" placeholder="search...">
   <span id="searchCount"></span>
@@ -292,6 +297,7 @@ let chats = [];
 let messages = [];
 let busy = false;
 let attachedFiles = new Map();
+const TL_ICON = { understand:'🧠', analyze:'🧭', read_workspace:'📂', read:'📄', list:'📂', search:'🔎', model:'🤖', generate:'✍', write:'💾', edit:'🔄', create_folder:'📁', rename:'🔀', delete:'🗑', verified:'🛡️', index:'🗂️', finished:'✅', error:'❌' };
 function loadSettings() {
   try { return JSON.parse(localStorage.getItem(LS_SETTINGS)) || { temperature: 0.7, maxTokens: '', sysPrompt: '' }; }
   catch { return { temperature: 0.7, maxTokens: '', sysPrompt: '' }; }
@@ -556,14 +562,29 @@ function showTyping() {
   const wrap = $('msgWrap');
   const el = document.createElement('div');
   el.className = 'msg assistant';
-  el.id = 'typingIndicator';
-  el.innerHTML = '<div class="avatar">S</div><div class="msg-body"><div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div></div>';
+  el.id = 'timelineBox';
+  el.innerHTML = '<div class="avatar">S</div><div class="msg-body"><div class="bubble tl-bubble"></div></div>';
   wrap.appendChild(el);
+  tlLastKey = '';
   scrollToBottom();
-  log('typing indicator shown');
+  log('timeline shown');
   return el;
 }
-function removeTyping() { const el = $('typingIndicator'); if (el) el.remove(); }
+function removeTyping() { const el = $('timelineBox'); if (el) el.remove(); }
+let tlLastKey = '';
+function tlAdd(kind, text) {
+  const box = $('timelineBox'); if (!box) return;
+  const key = kind + '|' + text;
+  if (tlLastKey === key) return;
+  tlLastKey = key;
+  const bubble = box.querySelector('.tl-bubble');
+  const line = document.createElement('div');
+  line.className = 'tl-line live ' + (kind === 'error' ? 'error' : kind === 'finished' ? 'finished' : '');
+  line.innerHTML = '<span class="tl-ico">' + (TL_ICON[kind] || '·') + '</span><span>' + esc(text || kind) + '</span>';
+  bubble.appendChild(line);
+  bubble.querySelectorAll('.tl-line.live').forEach(l => { if (l !== line) l.classList.remove('live'); });
+  scrollToBottom();
+}
 function showError(msg) {
   err('UI error:', msg);
   const wrap = $('msgWrap');
@@ -573,6 +594,15 @@ function showError(msg) {
   wrap.appendChild(el);
   scrollToBottom();
   setTimeout(() => el.remove(), 8000);
+}
+function tlFinish() {
+  const box = $('timelineBox'); if (!box) return;
+  const bubble = box.querySelector('.tl-bubble');
+  const live = bubble.querySelector('.tl-line.live');
+  if (!live) return;
+  live.classList.remove('live');
+  live.classList.add('finished');
+  live.querySelector('.tl-ico').textContent = TL_ICON.finished || '✅';
 }
 async function streamResponse(fullText, meta, trace) {
   removeTyping();
@@ -608,7 +638,7 @@ function setLoading(on) {
     btn.disabled = true;
     btn.classList.add('active-loading');
     dot.className = 'loading';
-    $('statusText').textContent = 'thinking...';
+    $('statusText').textContent = 'working...';
   } else {
     btn.classList.remove('active-loading');
     dot.className = '';
@@ -636,19 +666,35 @@ async function send() {
     const body = { prompt, files: [...attachedFiles.keys()], temperature: settings.temperature, project_id: activeProjectId, chat_id: activeChatId };
     if (settings.maxTokens) body.max_tokens = parseInt(settings.maxTokens) || undefined;
     const model = $('modelSel').value; if (model) body.model = model;
-    log('sending request to /request', body);
-    const res = await fetch('/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    log('response status:', res.status);
+    log('sending request to /request/stream', body);
+    const res = await fetch('/request/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (!res.ok) { const t = await res.text().catch(()=>''); throw new Error('HTTP ' + res.status + ': ' + t); }
-    const data = await res.json();
-    log('response data keys:', Object.keys(data));
-    const meta = [];
-    if (data.provider) meta.push(data.provider); if (data.model) meta.push(data.model);
-    if (data.latency_ms != null) meta.push((data.latency_ms / 1000).toFixed(1) + 's');
-    if (data.intent) meta.push(String(data.intent));
-    const ws = data.workspace; if (ws) { const p = []; if (ws.files_used?.length) p.push(ws.files_used.length + ' files'); if (ws.retrieval?.length) p.push(ws.retrieval.length + ' chunks'); if (ws.local_only) p.push('local'); if (p.length) meta.push(p.join(' / ')); }
+    let final = null;
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let done = false;
+    while (!done) {
+      const rd = await reader.read();
+      if (rd.done) break;
+      buf += dec.decode(rd.value, { stream: true });
+      let sep;
+      while ((sep = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, sep); buf = buf.slice(sep + 2);
+        const dl = chunk.split('\n').find(l => l.startsWith('data: '));
+        if (!dl) continue;
+        const ev = JSON.parse(dl.slice(6));
+        if (ev.kind === 'done') { final = ev; done = true; break; }
+        if (ev.kind === 'stream_error') throw new Error(ev.detail || 'request failed');
+        tlAdd(ev.kind, ev.text);
+      }
+    }
+    if (!final) throw new Error('stream closed without a response');
+    tlFinish();
+    const data = final.response;
+    log('stream done, response keys:', Object.keys(data));
     setLoading(false);
-    await streamResponse(data.response || '(no response)', meta, data.decision_trace);
+    await streamResponse(data.response || '(no response)', final.meta || [], data.decision_trace);
   } catch (e) {
     removeTyping(); setLoading(false);
     showError('error: ' + e.message);

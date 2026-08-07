@@ -68,6 +68,7 @@ class WorkspaceMemory(MemoryStore):
         embedding: list[float] | None = None,
         source: str = "",
         metadata: dict | None = None,
+        conversation: str | None = None,
     ) -> MemoryEntry:
         if embedding is None:
             vectors = self._embed([text])
@@ -80,12 +81,18 @@ class WorkspaceMemory(MemoryStore):
             created_at=_now_iso(),
             source=source,
             metadata=metadata or {},
+            conversation=conversation if scope is MemoryScope.CONVERSATION else None,
         )
         with self._lock:
             self._entries[scope].append(entry)
             self._save_scope(scope)
         log.info("memory_saved", scope=scope.value, source=source or "unknown", chars=len(text))
         return entry
+
+    def _scoped(self, entries: list[MemoryEntry], conversation: str | None) -> list[MemoryEntry]:
+        if conversation is None:
+            return entries
+        return [e for e in entries if e.conversation == conversation]
 
     def search(
         self,
@@ -94,6 +101,7 @@ class WorkspaceMemory(MemoryStore):
         *,
         k: int | None = None,
         min_similarity: float | None = None,
+        conversation: str | None = None,
     ) -> list[MemoryEntry]:
         k = k or self._top_k
         threshold = min_similarity if min_similarity is not None else self._min_similarity
@@ -102,7 +110,10 @@ class WorkspaceMemory(MemoryStore):
 
         query_embedding = self._embed([query])
         with self._lock:
-            entries = list(self._entries[scope])
+            entries = self._scoped(list(self._entries[scope]), conversation)
+
+        if not entries:
+            return []
 
         if query_embedding and query_embedding[0]:
             scored = [
@@ -136,9 +147,9 @@ class WorkspaceMemory(MemoryStore):
             log.info("memory_search", scope=scope.value, hits=len(results), query_len=len(query))
         return results
 
-    def recent(self, scope: MemoryScope, limit: int = 10) -> list[MemoryEntry]:
+    def recent(self, scope: MemoryScope, limit: int = 10, conversation: str | None = None) -> list[MemoryEntry]:
         with self._lock:
-            entries = list(self._entries[scope])
+            entries = self._scoped(list(self._entries[scope]), conversation)
         return entries[-limit:][::-1]
 
     def clear(self, scope: MemoryScope | None = None) -> int:

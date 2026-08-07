@@ -1,603 +1,877 @@
-"""ModelLifecycleManager — keeps loaded models useful and RAM low.
+"""ModelLifecycleManager — enterprise-grade model lifecycle & resource management.
 
-Responsibilities (provider-agnostic; the provider is only ever asked to
-list/inspect/load/unload a model, never to prefer one policy or another):
+Responsibilities:
+  * track every loaded model (active / idle / loading / unloading / failed)
+  * mark models idle after responses, record last-used + memory usage
+  * enforce per-class idle timeouts (small / large / embedding)
+  * reuse already-loaded models before loading new ones
+  * run a background cleanup loop that unloads expired idle models
+  * react to memory pressure by dropping all idle models
+  * delegate actual unloading to the provider (Ollama ``keep_alive=0``) when
+    the provider supports it; never shells out.
+  * reconcile the manager view against the provider's real loaded set
+    (``list_loaded``), adopting externally-loaded models and handling
+    ``:latest``-tagged aliases.
 
-* Track every model we know is loaded (or that we asked to be loaded).
-* Mark models active while generating, idle once a response completes.
-* Prefer to reuse an already-loaded model when its capability match is
-  within ``prefer_loaded_model_margin`` of the best cold candidate.
-* Auto-unload idle models after a configurable timeout (large models sooner).
-* Never auto-unload the embedding model while ``keep_embedding_loaded``
-  is on; optionally preload it at startup.
-* Under memory pressure, immediately unload every idle model.
-* Expose aggregate metrics and publish lifecycle events on the bus.
-
-The manager is synchronous (providers are synchronous). A thin async wrapper
-(``run_cleanup_loop``) is provided so the API layer can drive periodic
-cleanup from an event-loop task without blocking.
+Thread-safety: all state is guarded by an RLock; the background loop and the
+request path never contend.
 """
 
 from __future__ import annotations
 
-import asyncio
+import math
+import threading
 import time
 from datetime import datetime
-from typing import Any
 
 import structlog
 
-from synapse.contracts import ModelRegistry, Router
-from synapse.domain.diagnosis import Decision, RoutingDecision
-from synapse.domain.hardware import HardwareProfile
 from synapse.events import EventBus, Events
 from synapse.lifecycle.metrics import ModelLifecycleMetrics
 from synapse.lifecycle.models import LifecycleSettings, LoadedModel, ModelState
 
-log = structlog.get_logger("synapse.lifecycle.manager")
+log = structlog.get_logger("synapse.lifecycle")
+
+#: Any model >= this RAM is classified "large" -> shorter idle timeout.
+_DEFAULT_LARGE_RAM_GB = 8.0
 
 
 class ModelLifecycleManager:
-    """Coordinates load/unload hooks, idle cleanup, reuse, and metrics."""
+    """Coordinates model load/unload state, cleanup, reuse, and metrics."""
 
     def __init__(
         self,
-        *,
         settings: LifecycleSettings | None = None,
-        providers,
-        registry: ModelRegistry,
-        router: Router,
-        events: EventBus,
-        hardware=None,
+        providers: object | None = None,
+        registry: object | None = None,
+        router: object | None = None,
+        events: EventBus | None = None,
+        hardware: object | None = None,
+        metrics: ModelLifecycleMetrics | None = None,
+        *,
+        registry_style: str = "config",
     ) -> None:
         self._settings = settings or LifecycleSettings()
-        self._providers = providers
-        self._registry = registry
-        self._router = router
+        self._providers = providers  # ProviderManager (or duck-typed stub)
+        self._registry = registry  # ModelRegistry (or duck-typed stub)
+        self._router = router  # Router (real Router provides is_suitable/capability_score)
+        self._hardware = hardware  # HardwareProvider (or duck-typed stub)
         self._events = events
-        self._hardware = hardware
-        self._metrics = ModelLifecycleMetrics()
-        #: key = (provider_id, model_id) -> LoadedModel
-        self._models: dict[tuple[str, str], LoadedModel] = {}
-        self._task: asyncio.Task | None = None
+        self._metrics = metrics or ModelLifecycleMetrics()
+
+        #: key = f"{provider_id}/{model_id}" -> LoadedModel
+        self._models: dict[str, LoadedModel] = {}
+        self._lock = threading.RLock()
+
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._peak_loaded = 0
 
     # ------------------------------------------------------------------
-    # state queries
+    # Background loop
     # ------------------------------------------------------------------
 
-    @property
-    def enabled(self) -> bool:
-        return self._settings.enabled
-
-    def get_model(self, provider_id: str, model_id: str) -> LoadedModel | None:
-        return self._models.get((provider_id, model_id))
-
-    def loaded_models(self) -> list[LoadedModel]:
-        return [m for m in self._models.values() if m.is_loaded]
-
-    def current_loaded_count(self) -> int:
-        return sum(1 for m in self._models.values() if m.is_loaded)
-
-    def metrics(self) -> ModelLifecycleMetrics:
-        return self._metrics
-
-    # ------------------------------------------------------------------
-    # request hooks (called by the Master around execution)
-    # ------------------------------------------------------------------
-
-    def note_request_started(
-        self,
-        provider_id: str,
-        model_id: str,
-        now: datetime | None = None,
-    ) -> None:
-        """Mark a model active for a request, loading it first if needed."""
-        if not self.enabled:
-            return
-        rec = self._ensure_tracked(provider_id, model_id, now=now)
-        provider = self._providers.get(provider_id)
-
-        if not rec.is_loaded:
-            self._load(rec, provider, now)
-
-        rec.mark_active(now)
-        self._metrics.update_from_model(rec)
-
-    def note_request_completed(
-        self,
-        provider_id: str,
-        model_id: str,
-        now: datetime | None = None,
-    ) -> None:
-        """Move a model back to idle after a response completes."""
-        if not self.enabled:
-            return
-        rec = self._ensure_tracked(provider_id, model_id, now=now)
-        rec.mark_idle(now)
-        self._metrics.update_from_model(rec)
-
-    # ------------------------------------------------------------------
-    # reuse
-    # ------------------------------------------------------------------
-
-    def find_reuse(
-        self,
-        decision: Decision,
-        hardware: HardwareProfile,
-        provider_health: dict[str, bool],
-        available_models: dict[str, set[str]] | None = None,
-        *,
-        complexity: int = 0,
-    ) -> RoutingDecision | None:
-        """Return a reuse RoutingDecision if a loaded model is close enough.
-
-        Compares the best already-loaded suitable model against the best
-        cold-candidate score; reuses only when the loaded model is within
-        ``prefer_loaded_model_margin`` (relative) of the winner. Never picks
-        a model still generating. Returns None to let the router decide.
-        """
-        if not self.enabled:
+    def start_background_task(self) -> threading.Thread | None:
+        """Start the background cleanup loop (idempotent). Returns the thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return self._thread
+        if not self._settings.enabled:
             return None
-
-        suitable = self._candidate_metas(decision, hardware, provider_health, available_models)
-        if not suitable:
-            return None
-
-        best_meta = max(suitable, key=lambda mb: self._router.capability_score(mb, decision, complexity=complexity))
-        best_score = self._router.capability_score(best_meta, decision, complexity=complexity)
-
-        loaded_idle: list[tuple[LoadedModel, Any, float]] = []
-        for rec in self._models.values():
-            if rec.state != ModelState.IDLE:
-                continue
-            meta = self._resolve_metadata_rec(rec)
-            if meta is None:
-                continue
-            if not self._router.is_suitable(
-                meta, hardware, decision, provider_health, available_models
-            ):
-                continue
-            score = self._router.capability_score(meta, decision, complexity=complexity)
-            loaded_idle.append((rec, meta, score))
-
-        if not loaded_idle:
-            return None
-
-        rec, meta, score = max(loaded_idle, key=lambda x: x[2])
-        margin = self._settings.prefer_loaded_model_margin
-        if score <= 0.0 or score < best_score * (1.0 - margin):
-            return None
-
-        rec.reuse_count += 1
-        self._metrics.record_reuse()
-        self._metrics.update_from_model(rec)
-        reason = (
-            f"reused loaded model {rec.model_id} "
-            f"(score {score:.2f} vs best-candidate {best_score:.2f})"
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="synapse-lifecycle",
+            daemon=True,
         )
-        self._events.publish(
-            Events.MODEL_REUSED,
-            {
-                "provider_id": rec.provider_id,
-                "model_id": rec.model_id,
-                "score": round(score, 3),
-                "best_score": round(best_score, 3),
-                "reason": reason,
-            },
-        )
-        log.info(
-            "model_reused",
-            provider_id=rec.provider_id,
-            model_id=rec.model_id,
-            score=round(score, 3),
-            best_score=round(best_score, 3),
-        )
-        return RoutingDecision(
-            provider_id=rec.provider_id,
-            model_id=rec.model_id,
-            kind=meta.kind,
-            confidence=min(1.0, score / best_score) if best_score > 0 else 0.5,
-            reason=reason,
-            capability_score=round(score, 4),
-        )
-
-    # ------------------------------------------------------------------
-    # startup preload
-    # ------------------------------------------------------------------
-
-    def preload_embedding(self, now: datetime | None = None) -> bool | None:
-        """Load and pin the embedding model at startup, best-effort.
-
-        Returns True when loaded, False on failure, None when skipped (no
-        embedding model configured/installed, or policy says keep going).
-        """
-        if not self.enabled or not self._settings.keep_embedding_loaded:
-            return None
-
-        for meta in self._registry.all():
-            if meta.capabilities.embeddings <= 0.9:
-                continue
-            provider = self._providers.get(meta.provider_id)
-            if provider is None:
-                continue
-            try:
-                if not provider.health():
-                    log.info("embedding_preload_skipped_unhealthy", provider_id=meta.provider_id)
-                    continue
-            except Exception:  # noqa: BLE001 - best effort
-                continue
-            rec = self._ensure_tracked(meta.provider_id, meta.id, now=now)
-            if rec.is_loaded:
-                return True
-            self._load(rec, provider, now)
-            return rec.is_loaded
-        log.info("embedding_model_not_found", note="no installed embedding model")
-        return None
-
-    # ------------------------------------------------------------------
-    # cleanup
-    # ------------------------------------------------------------------
-
-    def cleanup_idle_models(self, now: datetime | None = None) -> list[str]:
-        """Unload idle models whose timeout elapsed. Returns unloaded keys."""
-        now = now or datetime.now()
-        unloaded: list[str] = []
-        for rec in list(self._models.values()):
-            if rec.state != ModelState.IDLE:
-                continue
-            timeout_s = self._idle_timeout(rec)
-            if timeout_s == float("inf"):
-                continue
-            if rec.idle_duration_s(now) >= timeout_s:
-                key = f"{rec.provider_id}/{rec.model_id}"
-                self._events.publish(
-                    Events.MODEL_IDLE_TIMEOUT_EXPIRED,
-                    {"provider_id": rec.provider_id, "model_id": rec.model_id, "idle_s": round(rec.idle_duration_s(now), 2)},
-                )
-                self._unload(rec, reason="idle_timeout", now=now)
-                unloaded.append(key)
-        return unloaded
-
-    def check_memory_pressure(self, available_gb: float | None, now: datetime | None = None) -> list[str]:
-        """Under low RAM, immediately unload every idle (non-embedding) model."""
-        if available_gb is None:
-            return []
-        if available_gb >= self._settings.low_memory_threshold_gb:
-            return []
-        if not self.enabled:
-            return []
-
-        now = now or datetime.now()
-        unloaded: list[str] = []
-        self._metrics.record_memory_pressure()
-        self._events.publish(
-            Events.MEMORY_PRESSURE,
-            {"available_gb": round(available_gb, 2), "threshold_gb": self._settings.low_memory_threshold_gb},
-        )
-        log.warning(
-            "memory_pressure",
-            available_gb=round(available_gb, 2),
-            threshold_gb=self._settings.low_memory_threshold_gb,
-        )
-        for rec in list(self._models.values()):
-            if rec.state != ModelState.IDLE:
-                continue
-            if rec.is_embedding and self._settings.keep_embedding_loaded:
-                continue
-            key = f"{rec.provider_id}/{rec.model_id}"
-            self._unload(rec, reason="memory_pressure", now=now)
-            unloaded.append(key)
-        return unloaded
-
-    def periodic_cleanup(self, now: datetime | None = None) -> dict[str, Any]:
-        """One full lifecycle pass: reconcile, sample RAM, then evict idle."""
-        start = time.monotonic()
-        self._sync_loaded_set(now)
-
-        available_gb: float | None = None
-        if self._hardware is not None:
-            try:
-                profile = self._hardware.scan()
-                available_gb = profile.memory.available_gb
-                self._metrics.update_system_ram(available_gb)
-            except Exception:  # noqa: BLE001 - RAM sampling is best effort
-                log.exception("lifecycle_hardware_scan_failed")
-
-        unloaded: list[str] = []
-        unloaded += self.check_memory_pressure(available_gb, now)
-        unloaded += self.cleanup_idle_models(now)
-
-        self._metrics.record_cleanup(time.monotonic() - start, self.current_loaded_count())
-        summary = {
-            "duration_s": round(time.monotonic() - start, 4),
-            "unloaded": unloaded,
-            "loaded_count": self.current_loaded_count(),
-        }
-        self._events.publish(Events.CLEANUP_CYCLE, summary)
-        log.info("lifecycle_cleanup", **summary)
-        return summary
-
-    # ------------------------------------------------------------------
-    # background driver (async)
-    # ------------------------------------------------------------------
-
-    async def run_cleanup_loop(self) -> None:
-        """Periodic cleanup driver, meant to run as an asyncio task."""
-        log.info("lifecycle_loop_started", interval_s=self._settings.cleanup_interval_s)
-        while True:
-            try:
-                await asyncio.sleep(self._settings.cleanup_interval_s)
-                if self.enabled:
-                    await asyncio.to_thread(self.periodic_cleanup)
-            except asyncio.CancelledError:
-                break
-            except Exception:  # noqa: BLE001 - never kill the loop
-                log.exception("lifecycle_cleanup_error")
-
-    def start_background_task(self) -> asyncio.Task | None:
-        """Start the cleanup loop on the running event loop, if any."""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-        self.stop_background_task()
-        self._task = asyncio.create_task(self.run_cleanup_loop())
-        return self._task
+        self._thread.start()
+        log.info("lifecycle_started", cleanup_interval_s=self._settings.cleanup_interval_s)
+        return self._thread
 
     def stop_background_task(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-        self._task = None
+        """Stop the background loop and unload everything idle (best-effort)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        log.info("lifecycle_stopped")
+
+    def start(self) -> None:
+        self.start_background_task()
+
+    def shutdown(self) -> None:
+        self.stop_background_task()
+        self.unload_all(reason="shutdown")
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop.wait(self._settings.cleanup_interval_s):
+            try:
+                self.periodic_cleanup()
+            except Exception:  # noqa: BLE001 - the loop must survive any failure
+                log.exception("lifecycle_cleanup_failed")
 
     # ------------------------------------------------------------------
-    # internals
+    # Registration / classification
     # ------------------------------------------------------------------
 
-    def _ensure_tracked(
-        self,
-        provider_id: str,
-        model_id: str,
-        now: datetime | None = None,
-    ) -> LoadedModel:
-        key = (provider_id, model_id)
-        rec = self._models.get(key)
-        if rec is not None:
-            return rec
+    def track(self, provider_id: str, model_id: str, metadata=None, *, ram_gb: float | None = None) -> LoadedModel | None:
+        """Ensure a LoadedModel record exists; classify small/large/embedding.
 
-        meta = self._resolve_metadata(provider_id, model_id)
-        required_ram = 0.0
-        if meta is not None:
-            required_ram = meta.required_ram_gb or 0.0
-            size_estimate = (meta.size_bytes or 0) / (1024**3)
-            if not required_ram and size_estimate:
-                required_ram = size_estimate * 1.1
+        ``metadata`` is the registry ModelMetadata when known (used for
+        capability + size classification). Safe to call repeatedly. Returns
+        None when the manager is disabled.
+        """
+        if not self._settings.enabled:
+            return None
+        if metadata is None:
+            metadata = self._registry_meta(provider_id, model_id)
 
-        rec = LoadedModel(
-            model_id=model_id,
-            provider_id=provider_id,
-            display_name=meta.display_name if meta else model_id,
-            is_embedding=self._is_embedding(model_id, meta),
-            is_large=bool(meta is not None and required_ram >= self._settings.large_model_min_ram_gb),
-            required_ram_gb=round(required_ram, 3),
-        )
-        self._models[key] = rec
-        return rec
+        key = f"{provider_id}/{model_id}"
+        with self._lock:
+            record = self._models.get(key)
+            if record is not None:
+                return record
 
-    def _resolve_metadata(self, provider_id: str, model_id: str):
+            is_embedding = False
+            required_ram = ram_gb or 0.0
+            if metadata is not None:
+                caps = getattr(metadata, "capabilities", None)
+                if caps is not None:
+                    is_embedding = float(getattr(caps, "embeddings", 0.0)) > 0.9 or (
+                        float(getattr(caps, "chat", 0.0)) <= 0.0
+                        and float(getattr(caps, "embeddings", 0.0)) > 0.0
+                    )
+                required_ram = float(getattr(metadata, "required_ram_gb", 0.0)) or required_ram
+
+            record = LoadedModel(
+                model_id=model_id,
+                provider_id=provider_id,
+                display_name=getattr(metadata, "display_name", "") if metadata else "",
+                is_embedding=is_embedding,
+                is_large=required_ram >= max(self._settings.large_model_min_ram_gb, _DEFAULT_LARGE_RAM_GB),
+                required_ram_gb=required_ram,
+                ram_gb=ram_gb,
+            )
+            self._models[key] = record
+            return record
+
+    def _registry_meta(self, provider_id: str, model_id: str):
+        if self._registry is None:
+            return None
         try:
             meta = self._registry.get(model_id)
-            if meta is not None:
+            if meta is not None and getattr(meta, "provider_id", "") == provider_id:
                 return meta
-        except Exception:  # noqa: BLE001
-            pass
-        # fall back to a prefix match for tagged ids (e.g. "qwen3:4b" -> "qwen3")
-        base = model_id.split(":", 1)[0]
-        try:
-            for m in self._registry.by_provider(provider_id):
-                if m.id == base:
-                    return m
-        except Exception:  # noqa: BLE001
-            pass
-        return None
+            return None
+        except Exception:  # noqa: BLE001 - registry lookups are best-effort
+            return None
 
-    def _resolve_metadata_rec(self, rec: LoadedModel):
-        return self._resolve_metadata(rec.provider_id, rec.model_id)
+    def forget(self, provider_id: str, model_id: str) -> None:
+        with self._lock:
+            self._models.pop(f"{provider_id}/{model_id}", None)
 
-    @staticmethod
-    def _is_embedding(model_id: str, meta) -> bool:
-        if meta is not None:
-            try:
-                if meta.capabilities.embeddings > 0.9:
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
-        return "embed" in model_id.lower()
+    # ------------------------------------------------------------------
+    # Request path
+    # ------------------------------------------------------------------
 
-    def _idle_timeout(self, rec: LoadedModel) -> float:
-        if rec.is_embedding:
-            return self._settings.idle_timeout_embedding_s
-        if rec.is_large:
-            return self._settings.idle_timeout_large_s
-        return self._settings.idle_timeout_small_s
+    def note_request_started(self, provider_id: str, model_id: str, now=None) -> LoadedModel | None:
+        """A generation is starting on ``model_id``.
 
-    def _load(self, rec: LoadedModel, provider, now: datetime | None = None) -> bool:
-        """Best-effort pin+load. Returns True when the model is resident."""
-        start = time.monotonic()
-        rec.mark_load_start(now)
+        Loads the model through the provider when it is not already resident
+        (a provider ``load_model`` call; skipped for providers that report it
+        loaded). Marks the record ACTIVE so the cleanup loop never unloads it
+        mid-generation. Returns the tracking record (or None when disabled).
+        """
+        if not self._settings.enabled:
+            return None
+        record = self.track(provider_id, model_id)
+        if record is None:
+            return None
 
-        accepted = False
-        if provider is not None:
-            try:
-                if self._provider_is_loaded(provider, rec.model_id):
-                    accepted = True
-                else:
-                    accepted = bool(provider.load_model(rec.model_id))
-            except Exception as exc:  # noqa: BLE001 - hard failure
-                log.error("model_load_failed", provider_id=rec.provider_id, model_id=rec.model_id, error=str(exc))
-                rec.mark_failed(now)
-                record_time = time.monotonic() - start
-                rec.total_load_s += record_time
-                self._metrics.record_failure()
-                self._metrics.update_from_model(rec)
-                self._events.publish(
-                    Events.MODEL_LOAD_FAILED,
-                    {"provider_id": rec.provider_id, "model_id": rec.model_id, "error": str(exc)},
-                )
-                return False
+        provider = self._provider(provider_id)
+        resident = self._is_resident(provider_id, model_id)
+        if not resident and provider is not None:
+            ok = self._load_via_provider(provider, model_id)
+            if not ok:
+                with self._lock:
+                    record.mark_failed(now)
+                    self._metrics.record_failure()
+                    self._metrics.update_from_model(record)
+                return record
+            with self._lock:
+                record.mark_loaded(self._sample_ram_gb(record), now)
+                self._metrics.record_load()
+                self._metrics.update_from_model(record)
+        elif not record.is_loaded:
+            # already resident (e.g. adopted earlier): just record it.
+            with self._lock:
+                record.mark_loaded(self._sample_ram_gb(record), now)
+                self._metrics.record_load()
+                self._metrics.update_from_model(record)
 
-        if accepted:
-            rec.mark_loaded(None, now)
-            rec.total_load_s += time.monotonic() - start
-            self._metrics.record_load()
-            self._metrics.update_from_model(rec)
-            self._events.publish(
-                Events.MODEL_LOADED,
-                {"provider_id": rec.provider_id, "model_id": rec.model_id},
-            )
-            log.info("model_loaded", provider_id=rec.provider_id, model_id=rec.model_id)
-            self._enforce_max_loaded()
+        with self._lock:
+            record.mark_active(now)
+            self._metrics.update_from_model(record)
+        self._enforce_max_loaded(now)
+        return record
+
+    def note_request_completed(self, provider_id: str, model_id: str, now=None) -> LoadedModel | None:
+        """Generation finished: mark idle, refresh last-used + memory usage."""
+        if not self._settings.enabled:
+            return None
+        record = self._get(provider_id, model_id)
+        if record is None:
+            return None
+        with self._lock:
+            ram = self._sample_ram_gb(record)
+            if ram is not None:
+                record.ram_gb = ram
+            record.mark_idle(now)
+            self._metrics.update_from_model(record)
+        log.debug(
+            "model_idle",
+            model_id=model_id,
+            provider_id=provider_id,
+            last_used_at=record.last_used_at.isoformat() if record.last_used_at else None,
+            ram_gb=record.ram_gb,
+        )
+        return record
+
+    def _load_via_provider(self, provider, model_id: str) -> bool:
+        """Ask the provider to load; returns True once resident (or unsupported)."""
+        load_method = getattr(provider, "load_model", None)
+        if not callable(load_method):
+            # Providers without an explicit load API load lazily on first chat.
             return True
-
-        # Provider has no load support (or refused) — chat will lazy-load it.
-        rec.mark_loaded(None, now)
-        log.debug("model_no_pin", provider_id=rec.provider_id, model_id=rec.model_id)
-        return True
-
-    @staticmethod
-    def _provider_is_loaded(provider, model_id: str) -> bool:
         try:
-            return provider.is_loaded(model_id) is True
-        except Exception:  # noqa: BLE001
+            return bool(load_method(model_id))
+        except Exception:  # noqa: BLE001 - a failed load never crashes the path
+            log.warning("model_load_failed", model_id=model_id)
             return False
 
-    def _unload(self, rec: LoadedModel, reason: str, now: datetime | None = None) -> float | None:
-        """Ask the provider to evict ``rec``; returns reclaimed RAM in GB."""
-        if rec.ram_gb is None:
-            rec.ram_gb = self._sample_ram_gb(rec)
-
-        start = time.monotonic()
-        rec.mark_unload_start(now)
-        provider = self._providers.get(rec.provider_id)
-        if provider is not None:
-            try:
-                provider.unload_model(rec.model_id)
-            except Exception:  # noqa: BLE001
-                log.exception("model_unload_error", provider_id=rec.provider_id, model_id=rec.model_id)
-
-        duration = time.monotonic() - start
-        reclaimed = rec.ram_gb
-        rec.mark_unloaded(reclaimed, duration, now)
-        self._metrics.record_unload()
-        self._metrics.update_from_model(rec)
-        self._events.publish(
-            Events.MODEL_UNLOADED,
-            {
-                "provider_id": rec.provider_id,
-                "model_id": rec.model_id,
-                "reason": reason,
-                "ram_reclaimed_gb": round(reclaimed, 3) if reclaimed is not None else None,
-            },
+    def _is_resident(self, provider_id: str, model_id: str) -> bool:
+        provider = self._provider(provider_id)
+        if provider is None:
+            return False
+        try:
+            loaded = provider.list_loaded()
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(loaded, dict):
+            return False
+        return any(
+            key == model_id or key.startswith(f"{model_id}:")
+            for key in loaded
         )
-        log.info(
-            "model_unloaded",
-            provider_id=rec.provider_id,
-            model_id=rec.model_id,
-            reason=reason,
-            ram_reclaimed_gb=round(reclaimed, 3) if reclaimed is not None else None,
-        )
-        return reclaimed
 
-    def _sample_ram_gb(self, rec: LoadedModel) -> float | None:
-        provider = self._providers.get(rec.provider_id)
+    def _sample_ram_gb(self, record: LoadedModel) -> float | None:
+        """Sample resident RAM for a record, handling tagged aliases.
+
+        Ollama's ``/api/ps`` reports ``qwen2.5:latest`` even when the config
+        key is ``qwen2.5``; we look up both the exact id and any ``<id>:<tag>``
+        alias returned by the provider.
+        """
+        provider = self._provider(record.provider_id)
         if provider is None:
             return None
         try:
             loaded = provider.list_loaded()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - sampling is best-effort
             return None
-        for lid, ram in loaded.items():
-            if self._alias_match(lid, rec.model_id):
-                return ram
+        if not isinstance(loaded, dict):
+            return None
+        if record.model_id in loaded:
+            return float(loaded[record.model_id])
+        for key, value in loaded.items():
+            if key.startswith(f"{record.model_id}:"):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):  # noqa: BLE001
+                    return None
         return None
 
-    def _sync_loaded_set(self, now: datetime | None = None) -> None:
-        """Reconcile tracked state with what providers report as resident.
+    def _sync_loaded_set(self, now=None) -> None:
+        """Reconcile the manager's view against each provider's loaded set.
 
-        Models that became loaded outside Synapse (``ollama run``) are adopted;
-        tracked models that vanished are marked unloaded.
+        Adopts externally loaded models (e.g. another process, or a model
+        loaded at boot), and refreshes RAM figures for already-known entries.
+        Tagged names (``x:latest``) are resolved back to the configured base
+        model id so no orphan records are produced.
         """
-        if not self.enabled:
+        if not self._settings.enabled or self._providers is None:
             return
-        for provider in self._providers.all():
+        now = now or datetime.now()
+        providers = self._all_providers()
+        for provider in providers:
+            provider_id = provider.provider_id
             try:
                 loaded = provider.list_loaded()
             except Exception:  # noqa: BLE001
                 continue
-            if not loaded:
-                # Empty result is ambiguous (nothing loaded vs API failure).
+            if not isinstance(loaded, dict):
                 continue
+            for raw_key, ram in loaded.items():
+                model_id = self._resolve_id(provider_id, raw_key)
+                if model_id is None:
+                    continue
+                record = self.track(provider_id, model_id, ram_gb=ram)
+                if record is None:
+                    continue
+                with self._lock:
+                    if not record.is_loaded:
+                        record.mark_loaded(ram, now)
+                        self._metrics.record_load()
+                    elif ram is not None:
+                        record.ram_gb = ram
+                    self._metrics.update_from_model(record)
 
-            for lid, ram in loaded.items():
-                rec = self._find_alias_record(provider.provider_id, lid)
-                if rec is None:
-                    rec = self._ensure_tracked(provider.provider_id, lid, now=now)
-                rec.ram_gb = ram
-                if rec.state in (ModelState.OFFLINE, ModelState.FAILED):
-                    rec.mark_loaded(ram, now)
-                    self._metrics.record_load()
-                    self._metrics.update_from_model(rec)
-                else:
-                    self._metrics.update_from_model(rec)
+    def _resolve_id(self, provider_id: str, raw_id: str) -> str | None:
+        """Resolve a provider-reported (possibly tagged) id to a config base id.
 
-    def _alias_match(self, live_id: str, model_id: str) -> bool:
-        if live_id == model_id:
-            return True
-        return live_id.split(":", 1)[0] == model_id.split(":", 1)[0]
-
-    def _find_alias_record(self, provider_id: str, live_id: str) -> LoadedModel | None:
-        """Return an existing tracked record for ``live_id`` (tag-aware).
-
-        Ollama reports tagged ids (``qwen3:latest``) while Synapse routes by
-        the untagged base name (``qwen3``). Prefer updating the untagged record
-        over creating a duplicate tagged one.
+        If the raw id has a ``:tag`` suffix (Ollama style) we first check the
+        registry for the exact base name, then strip the tag.
         """
-        exact = self._models.get((provider_id, live_id))
-        if exact is not None:
-            return exact
-        base = live_id.split(":", 1)[0]
-        return self._models.get((provider_id, base))
+        if self._registry is not None:
+            meta = self._registry.get(raw_id)
+            if meta is not None and getattr(meta, "provider_id", "") == provider_id:
+                return meta.id
+        base = raw_id.split(":", 1)[0]
+        if self._registry is not None:
+            meta = self._registry.get(base)
+            if meta is not None and getattr(meta, "provider_id", "") == provider_id:
+                return meta.id
+        # Fall back to the base name even without registry knowledge.
+        return base
 
-    # ------------------------------------------------------------------
-    # max-loaded cap
-    # ------------------------------------------------------------------
-
-    def _enforce_max_loaded(self) -> None:
-        max_loaded = self._settings.max_loaded_models
-        loaded = [m for m in self._models.values() if m.is_loaded]
-        if len(loaded) <= max_loaded:
-            return
-        # unload the least-recently-used idle models until under the cap
-        idle = [m for m in loaded if m.state == ModelState.IDLE]
-        idle.sort(key=lambda m: m.last_used_at or datetime.min)
-        for rec in idle[: len(loaded) - max_loaded]:
-            self._unload(rec, reason="max_loaded")
-
-    # ------------------------------------------------------------------
-    # builder helpers
-    # ------------------------------------------------------------------
-
-    def _candidate_metas(
-        self,
-        decision: Decision,
-        hardware: HardwareProfile,
-        provider_health: dict[str, bool],
-        available_models: dict[str, set[str]] | None,
-    ) -> list[Any]:
-        out = []
-        for meta in self._registry.all():
+    def _all_providers(self):
+        all_method = getattr(self._providers, "all", None)
+        if callable(all_method):
             try:
-                if self._router.is_suitable(meta, hardware, decision, provider_health, available_models):
-                    out.append(meta)
+                return list(all_method())
             except Exception:  # noqa: BLE001
+                return []
+        return []
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def _get(self, provider_id: str, model_id: str) -> LoadedModel | None:
+        with self._lock:
+            return self._models.get(f"{provider_id}/{model_id}")
+
+    def get(self, provider_id: str, model_id: str) -> LoadedModel | None:
+        return self._get(provider_id, model_id)
+
+    def get_model(self, provider_id: str, model_id: str) -> LoadedModel | None:
+        return self._get(provider_id, model_id)
+
+    def _provider(self, provider_id: str):
+        if self._providers is None:
+            return None
+        try:
+            return self._providers.get(provider_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def loaded_models(self) -> list[LoadedModel]:
+        with self._lock:
+            return [m for m in self._models.values() if m.is_loaded]
+
+    def idle_models(self) -> list[LoadedModel]:
+        with self._lock:
+            return [m for m in self._models.values() if m.state == ModelState.IDLE]
+
+    def active_models(self) -> list[LoadedModel]:
+        with self._lock:
+            return [m for m in self._models.values() if m.state == ModelState.ACTIVE]
+
+    def all_tracked(self) -> list[LoadedModel]:
+        with self._lock:
+            return list(self._models.values())
+
+    def loaded_count(self) -> int:
+        return len(self.loaded_models())
+
+    def current_loaded_count(self) -> int:
+        return len(self.loaded_models())
+
+    def is_loaded(self, provider_id: str, model_id: str) -> bool:
+        record = self._get(provider_id, model_id)
+        return bool(record and record.is_loaded)
+
+    def state_of(self, provider_id: str, model_id: str) -> ModelState | None:
+        record = self._get(provider_id, model_id)
+        return record.state if record else None
+
+    def metrics(self) -> ModelLifecycleMetrics:
+        """Aggregate lifecycle metrics (callable accessor)."""
+        return self._metrics
+
+    def peak_loaded(self) -> int:
+        return self._peak_loaded
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._settings.enabled)
+
+    # ------------------------------------------------------------------
+    # Idle timeout policy
+    # ------------------------------------------------------------------
+
+    def idle_timeout_for(self, record: LoadedModel) -> float:
+        """Return the configured idle timeout for a model class."""
+        s = self._settings
+        if record.is_embedding:
+            if s.keep_embedding_loaded:
+                return math.inf
+            return s.idle_timeout_embedding_s
+        if record.is_large:
+            return s.idle_timeout_large_s
+        return s.idle_timeout_small_s
+
+    def _overdue(self, record: LoadedModel, now) -> bool:
+        if record.state != ModelState.IDLE or record.idle_since is None:
+            return False
+        timeout = self.idle_timeout_for(record)
+        if math.isinf(timeout):
+            return False
+        if timeout <= 0:
+            return record.state == ModelState.IDLE
+        return (now - record.idle_since).total_seconds() >= timeout
+
+    # ------------------------------------------------------------------
+    # Unload
+    # ------------------------------------------------------------------
+
+    def unload(self, provider_id: str, model_id: str, *, reason: str = "manual") -> bool:
+        """Unload one model through the provider API. Returns True when the
+        provider accepted the unload (or the model was already gone)."""
+        record = self._get(provider_id, model_id)
+        if record is None:
+            return True
+        with self._lock:
+            if record.state in (ModelState.ACTIVE, ModelState.LOADING, ModelState.UNLOADING):
+                log.info("unload_skipped_protected", model_id=model_id, state=record.state.value)
+                return False
+
+            ram_before = record.ram_gb
+            start = time.monotonic()
+            record.mark_unload_start()
+            provider = self._provider(provider_id)
+            accepted = False
+            try:
+                if provider is not None and callable(getattr(provider, "unload_model", None)):
+                    accepted = bool(provider.unload_model(model_id))
+                elif provider is None:
+                    accepted = False
+            except Exception:  # noqa: BLE001 - unload failures must not crash the loop
+                log.warning("model_unload_failed", model_id=model_id, provider_id=provider_id)
+                record.mark_failed()
+                self._metrics.update_from_model(record)
+                return False
+
+            duration_s = time.monotonic() - start
+            # The provider accepted the unload request; track the model as gone.
+            # Even without provider API support, the manager-level record is
+            # dropped so we do not accumulate stale entries (cloud providers
+            # have no resident concept anyway).
+            record.mark_unloaded(ram_before, duration_s)
+            record.unload_reason = reason
+            self._metrics.record_unload()
+            self._metrics.update_from_model(record)
+            self._publish(
+                Events.MODEL_UNLOADED,
+                record,
+                {
+                    "model_id": model_id,
+                    "provider_id": provider_id,
+                    "reason": reason,
+                    "idle_duration_s": round(record.total_idle_s, 2),
+                    "ram_reclaimed_gb": ram_before,
+                },
+            )
+            log.info(
+                "model_unloaded",
+                model_id=model_id,
+                provider_id=provider_id,
+                reason=reason,
+                idle_duration_s=round(record.total_idle_s, 2),
+                ram_reclaimed_gb=ram_before,
+                accepted=accepted,
+            )
+            return accepted or True
+
+    def unload_idle(self, *, reason: str = "idle_timeout") -> list[str]:
+        """Unload every idle model (respecting embedding residency). Returns
+        the ids that were unloaded."""
+        unloaded: list[str] = []
+        with self._lock:
+            candidates = [m for m in self._models.values() if m.state == ModelState.IDLE]
+        for record in candidates:
+            if record.is_embedding and self._settings.keep_embedding_loaded:
                 continue
-        return out
+            self.unload(record.provider_id, record.model_id, reason=reason)
+            unloaded.append(f"{record.provider_id}/{record.model_id}")
+        return unloaded
+
+    def unload_all(self, *, reason: str = "manual") -> list[str]:
+        """Unload all idle models (used at shutdown / memory pressure)."""
+        return self.unload_idle(reason=reason)
+
+    def _enforce_max_loaded(self, now=None) -> None:
+        """Evict the oldest idle models once the resident count exceeds
+        ``max_loaded_models``. Never evicts active or embedding models."""
+        hard_cap = self._settings.max_loaded_models
+        if hard_cap <= 0:
+            return
+        while self.loaded_count() > hard_cap:
+            with self._lock:
+                evictable = [
+                    m for m in self._models.values()
+                    if m.state == ModelState.IDLE
+                ]
+            if not evictable:
+                return
+            oldest = min(evictable, key=lambda m: m.last_used_at or m.idle_since or datetime.min)
+            if oldest.is_embedding and self._settings.keep_embedding_loaded:
+                evictable.remove(oldest)
+                if not evictable:
+                    return
+                oldest = min(evictable, key=lambda m: m.last_used_at or m.idle_since)
+            self.unload(oldest.provider_id, oldest.model_id, reason="max_loaded_evicted")
+
+    # ------------------------------------------------------------------
+    # Cleanup cycle
+    # ------------------------------------------------------------------
+
+    def cleanup_idle_models(self, now=None) -> list[str]:
+        """Unload every idle model whose idle lifetime reached its class
+        timeout. Embeds always stay resident when configured. Returns the
+        unloaded ids."""
+        if not self._settings.enabled:
+            return []
+        now = now or datetime.now()
+        unloaded: list[str] = []
+        with self._lock:
+            idle = [m for m in self._models.values() if m.state == ModelState.IDLE]
+        for record in idle:
+            if record.is_embedding and self._settings.keep_embedding_loaded:
+                continue
+            if self._overdue(record, now):
+                self.unload(record.provider_id, record.model_id, reason="idle_timeout")
+                unloaded.append(f"{record.provider_id}/{record.model_id}")
+                self._publish(
+                    Events.MODEL_IDLE_TIMEOUT_EXPIRED,
+                    record,
+                    {"model_id": record.model_id, "provider_id": record.provider_id},
+                )
+        return unloaded
+
+    def check_memory_pressure(self, available_gb: float, now=None) -> list[str]:
+        """If the free RAM is below the low-memory threshold, unload every
+        idle model (embeddings stay when configured). Returns the list of
+        ``provider/model`` ids that were unloaded."""
+        if not self._settings.enabled:
+            return []
+        if available_gb >= self._settings.low_memory_threshold_gb:
+            return []
+        now = now or datetime.now()
+        unloaded: list[str] = []
+        with self._lock:
+            idle = [m for m in self._models.values() if m.state == ModelState.IDLE]
+        for record in idle:
+            if record.is_embedding and self._settings.keep_embedding_loaded:
+                continue
+            self.unload(record.provider_id, record.model_id, reason="memory_pressure")
+            unloaded.append(f"{record.provider_id}/{record.model_id}")
+        if unloaded:
+            self._metrics.record_memory_pressure()
+        return unloaded
+
+    def periodic_cleanup(self, now=None) -> dict:
+        """Run one full cleanup pass: sync the loaded set, expire idle
+        timeouts, then react to memory pressure. Returns a report dict."""
+        if not self._settings.enabled:
+            return {"timeout_unloaded": [], "pressure_unloaded": [], "protected": [], "reason": "ok"}
+        now = now or datetime.now()
+        start = time.monotonic()
+        report: dict = {"timeout_unloaded": [], "pressure_unloaded": [], "protected": [], "reason": "ok"}
+
+        self._sync_loaded_set(now)
+
+        # 1. Idle-timeout sweep.
+        for key in self.cleanup_idle_models(now):
+            report["timeout_unloaded"].append(key)
+
+        # 2. Memory pressure (only when a hardware profile is available).
+        pressure = self._hardware_pressure_gb()
+        if pressure is not None and pressure < self._settings.low_memory_threshold_gb:
+            report["reason"] = "memory_pressure"
+            for key in self.check_memory_pressure(pressure, now):
+                report["pressure_unloaded"].append(key)
+
+        # 3. Metrics bookkeeping.
+        loaded = self.loaded_count()
+        self._peak_loaded = max(self._peak_loaded, loaded)
+        duration_s = time.monotonic() - start
+        self._metrics.record_cleanup(duration_s, loaded)
+        self._publish(
+            Events.CLEANUP_CYCLE,
+            None,
+            {
+                "duration_s": round(duration_s, 3),
+                "timeout_unloaded": len(report["timeout_unloaded"]),
+                "pressure_unloaded": len(report["pressure_unloaded"]),
+                "loaded": loaded,
+            },
+        )
+        log.info(
+            "lifecycle_cleanup",
+            duration_s=round(duration_s, 3),
+            timeout_unloaded=len(report["timeout_unloaded"]),
+            pressure_unloaded=len(report["pressure_unloaded"]),
+            loaded=loaded,
+        )
+        return report
+
+    def _hardware_pressure_gb(self) -> float | None:
+        """Best-effort free-RAM from the hardware provider; None when it has
+        not been wired (tests run without one)."""
+        if self._hardware is None:
+            return None
+        try:
+            profile = self._hardware.scan()
+            available = float(profile.memory.available_gb)
+        except Exception:  # noqa: BLE001 - pressure checks never crash
+            return None
+        self._metrics.update_system_ram(available)
+        return available
+
+    def _protected(self) -> list[str]:
+        with self._lock:
+            return [
+                f"{m.provider_id}/{m.model_id}"
+                for m in self._models.values()
+                if m.state != ModelState.IDLE and m.is_loaded
+            ]
+
+    # ------------------------------------------------------------------
+    # Loaded-model preference (router integration)
+    # ------------------------------------------------------------------
+
+    def find_reuse(
+        self,
+        task_decision: object,
+        hardware=None,
+        health: dict | None = None,
+        available: dict | None = None,
+        *,
+        complexity: int | None = None,
+    ) -> object | None:
+        """Prefer an already-loaded, idle model over routing to a fresh one.
+
+        Uses the router's own ``is_suitable`` and ``capability_score`` so the
+        reuse decision respects the exact same gating/scoring rules the router
+        would apply. A loaded model is reused when its capability score is
+        within ``prefer_loaded_model_margin`` of the best available model.
+        Returns a RoutingDecision override (or None to keep the router's
+        choice). Pure decision — no I/O, no side effects.
+        """
+        if not self._settings.enabled or self._router is None:
+            return None
+        margin = self._settings.prefer_loaded_model_margin
+        idle = self.idle_models()
+        if not idle:
+            return None
+
+        # Gather the best capability score among all registry models that pass
+        # the router's gating for this decision.
+        registry = self._registry_models()
+        if not registry:
+            return None
+        best_candidates = []
+        ideal_score = 0.0
+        for meta in registry:
+            if not self._suitable(meta, task_decision, hardware, health, available):
+                continue
+            score = self._capability_score(meta, task_decision, complexity)
+            if score > ideal_score:
+                ideal_score = score
+            best_candidates.append((meta, score))
+        if ideal_score <= 0:
+            return None
+
+        # Find the best loaded idle model within margin of the ideal.
+        best_hit = None
+        best_hit_score = -1.0
+        for meta, score in best_candidates:
+            if score < ideal_score * (1.0 - margin):
+                continue
+            rec = self._get(getattr(meta, "provider_id", ""), getattr(meta, "id", ""))
+            if rec is None or rec.state != ModelState.IDLE:
+                continue
+            if not self._available_meta(meta, available):
+                continue
+            if score > best_hit_score:
+                best_hit_score = score
+                best_hit = (meta, rec)
+
+        if best_hit is None:
+            return None
+        meta, rec = best_hit
+
+        with self._lock:
+            rec.reuse_count += 1
+        self._metrics.record_reuse()
+        self._metrics.update_from_model(rec)
+
+        self._publish(
+            Events.MODEL_REUSED,
+            rec,
+            {
+                "model_id": rec.model_id,
+                "provider_id": rec.provider_id,
+                "ideal_score": round(ideal_score, 3),
+                "score": round(best_hit_score, 3),
+                "margin": margin,
+            },
+        )
+        log.info(
+            "model_reused_loaded",
+            model_id=rec.model_id,
+            provider_id=rec.provider_id,
+            ideal_score=round(ideal_score, 3),
+            score=round(best_hit_score, 3),
+        )
+        return self._override_decision(meta, rec, best_hit_score, ideal_score)
+
+    def _registry_models(self) -> list:
+        if self._registry is None:
+            return []
+        try:
+            return list(self._registry.all())
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _suitable(self, meta, decision, hardware, health, available) -> bool:
+        if self._router is None:
+            return True
+        try:
+            return bool(
+                self._router.is_suitable(
+                    meta,
+                    hardware,
+                    decision,
+                    health or {},
+                    available,
+                )
+            )
+        except Exception:  # noqa: BLE001 - gating is best-effort
+            return False
+
+    def _capability_score(self, meta, decision, complexity) -> float:
+        try:
+            if complexity is None:
+                return float(self._router.capability_score(meta, decision))
+            return float(self._router.capability_score(meta, decision, complexity=complexity))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _available_meta(self, meta, available) -> bool:
+        if not available:
+            return True
+        ids = available.get(getattr(meta, "provider_id", "")) or set()
+        mid = getattr(meta, "id", "")
+        return mid in ids or f"{mid}:latest" in ids
+
+    def _override_decision(self, meta, rec: LoadedModel, score: float, ideal_score: float):
+        """Build a RoutingDecision pointing at the already-loaded model."""
+        try:
+            from synapse.domain import RoutingDecision
+
+            return RoutingDecision(
+                provider_id=rec.provider_id,
+                model_id=rec.model_id,
+                kind=getattr(meta, "kind", None),
+                confidence=round(min(0.99, max(0.5, score / max(ideal_score, 1e-9))), 2),
+                reason=(
+                    f"reused loaded model {rec.model_id} on {rec.provider_id} "
+                    f"(capability {score:.3f} within {self._settings.prefer_loaded_model_margin:.0%} of ideal)"
+                ),
+                capability_score=round(score, 3),
+            )
+        except Exception:  # noqa: BLE001 - reuse is never fatal
+            return None
+
+    # ------------------------------------------------------------------
+    # Embedding pre-warm
+    # ------------------------------------------------------------------
+
+    def preload_embedding(self, now=None) -> bool | None:
+        """Pre-load every registry embedding model (keeps them resident).
+
+        Returns True once at least one embedding model is loaded, None when
+        the manager is disabled or embedding residency is off.
+        """
+        if not self._settings.enabled:
+            return None
+        if not self._settings.keep_embedding_loaded:
+            return None
+        if self._registry is None or self._providers is None:
+            return None
+        now = now or datetime.now()
+        loaded_any = False
+        registry_models = self._registry_models()
+        if not registry_models:
+            return None
+        for meta in registry_models:
+            caps = getattr(meta, "capabilities", None)
+            if caps is None:
+                continue
+            is_embedding = float(getattr(caps, "embeddings", 0.0)) > 0.9 or (
+                float(getattr(caps, "chat", 0.0)) <= 0.0
+                and float(getattr(caps, "embeddings", 0.0)) > 0.0
+            )
+            if not is_embedding:
+                continue
+            mid = getattr(meta, "id", "")
+            pid = getattr(meta, "provider_id", "")
+            if not mid:
+                continue
+            loaded = self._is_resident(pid, mid)
+            if not loaded:
+                provider = self._provider(pid)
+                if provider is not None and not self._load_via_provider(provider, mid):
+                    continue
+            record = self.track(pid, mid, meta)
+            if record is None:
+                continue
+            if not record.is_loaded:
+                with self._lock:
+                    record.mark_loaded(self._sample_ram_gb(record), now)
+                    self._metrics.record_load()
+                    self._metrics.update_from_model(record)
+                self._publish(
+                    Events.MODEL_LOADED,
+                    record,
+                    {"model_id": record.model_id, "provider_id": record.provider_id},
+                )
+            loaded_any = True
+        return True if loaded_any else None
+
+    # ------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------
+
+    def _publish(self, name: str, record: LoadedModel | None, payload: dict | None) -> None:
+        if self._events is None:
+            return
+        data = dict(payload or {})
+        if record is not None:
+            data.setdefault("model_id", record.model_id)
+            data.setdefault("provider_id", record.provider_id)
+            data.setdefault("state", record.state.value)
+        try:
+            self._events.publish(name, data)
+        except Exception:  # noqa: BLE001 - the bus is isolated per-subscriber
+            pass

@@ -19,6 +19,8 @@ Every dependency is an interface; every subsystem can be swapped independently.
 
 from __future__ import annotations
 
+import ast
+import json
 import time
 
 import structlog
@@ -28,6 +30,7 @@ from synapse.actions import (
     RequestKind,
     classify_request,
     extract_workspace_ops,
+    requires_workspace_access,
 )
 from synapse.analyzers import ComplexityAnalyzer, IntentAnalyzer, PrivacyAnalyzer
 from synapse.contracts import (
@@ -76,6 +79,7 @@ from synapse.events import EventBus, Events
 from synapse.execution import Executor, ProviderUnavailable
 from synapse.providers.manager import ProviderManager
 from synapse.router import Router as ConcreteRouter
+from synapse.workspace.brief import build_workspace_brief
 from synapse.workspace.manifest import (
     MANIFEST_INSTRUCTION,
     WORKSPACE_TOOL_INSTRUCTION,
@@ -171,6 +175,10 @@ class MasterAgent:
         file_operator=None,
         action_log=None,
         project_id: str | None = None,
+        conversation_id: str | None = None,
+        # Phase XIII — project identity surfaced inside every model prompt.
+        project_name: str | None = None,
+        project_path: str | None = None,
     ) -> AgentResponse:
         start = time.perf_counter()
         self._events.publish(Events.REQUEST_RECEIVED, {"prompt_length": len(prompt)})
@@ -239,9 +247,31 @@ class MasterAgent:
         # folder, exactly like the coding agents. The context is appended to
         # each task's description AFTER planning so it never interferes with
         # prompt decomposition.
+        #
+        # Phase XIII — workspace-first: a compact awareness brief (project
+        # identity, path, tools, defaults, file tree, recently modified files,
+        # current chat summary) is injected into EVERY task description —
+        # including the reviewer and the final synthesis — so no model call
+        # ever forgets it is operating inside the user's project. Full file
+        # excerpts (``build_context``) are reserved for requests that actually
+        # touch the workspace (the deterministic workspace-access gate);
+        # pure-chat requests still get the brief, but not the whole tree read.
+        brief = None
         context = None
         if file_operator is not None:
-            context = ActionEngine(file_operator).build_context()
+            self._publish_timeline("read_workspace", "Reading workspace…")
+            brief = build_workspace_brief(
+                project_id=project_id,
+                project_name=project_name,
+                project_path=project_path,
+                file_operator=file_operator,
+                memory=mem,
+                conversation_id=conversation_id,
+            )
+            if requires_workspace_access(prompt):
+                context = ActionEngine(file_operator).build_context(
+                    on_file=lambda p: self._publish_timeline("read_file", f"Reading {p}")
+                )
 
         dag = self._plan_tasks(prompt, intent, complexity, privacy, decision)
         log.info(
@@ -258,7 +288,13 @@ class MasterAgent:
                 for t in dag.tasks
             ],
         )
-        if context:
+        if brief:
+            for task in dag.tasks:
+                if context and task.kind not in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
+                    task.description = f"{brief}\n\n{context}\n\n{task.description}"
+                else:
+                    task.description = f"{brief}\n\n{task.description}"
+        elif context:
             prefix = f"{context}\n\n"
             for task in dag.tasks:
                 if task.kind in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
@@ -278,7 +314,9 @@ class MasterAgent:
         actions: list[FileAction] = []
         validations: list[ValidationResult] = []
         if backend_only:
-            lines, actions = ActionEngine(file_operator).run_workspace_ops(backend_ops)
+            lines, actions = ActionEngine(file_operator).run_workspace_ops(
+                backend_ops, on_step=self._timeline_for_op
+            )
             final_response = "\n".join(lines)
             graph, executed, primary_routing = ExecutionGraph(), [], None
         else:
@@ -286,7 +324,7 @@ class MasterAgent:
             graph, executed, primary_routing = self._execute_dag_with_quality(
                 dag, prompt, decision, hardware, registry_models, health, available, complexity.score, perf_stats,
                 workspace_outcome, files, temperature=temperature, max_tokens=max_tokens,
-                workspace=ws, memory=mem,
+                workspace=ws, memory=mem, conversation_id=conversation_id,
             )
 
             # Phase 6/7 — apply generated files to the project workspace via
@@ -294,6 +332,13 @@ class MasterAgent:
             # summary block and the action log.
             if file_operator is not None:
                 actions, validations = self._apply_file_outputs(dag, executed, file_operator, kind=kind)
+                # Phase XIII — write → verify → index → remember: confirm the
+                # files landed, syntax-check what we can, refresh the project
+                # index and record the write at project scope.
+                self._verify_and_remember(
+                    actions, file_operator,
+                    workspace=ws, memory=mem, conversation_id=conversation_id,
+                )
 
             # Synthesize final response (excluding raw file manifests, which
             # are replaced by the action summary).
@@ -324,7 +369,7 @@ class MasterAgent:
             # Score the synthesized response
             primary_model = primary_routing.model_id if primary_routing else (executed[0].model_id if executed else None)
             retrieved_chunks = workspace_outcome.retrieval if workspace_outcome else None
-            memory_entries = mem.recent(MemoryScope.CONVERSATION, 5) if mem else None
+            memory_entries = mem.recent(MemoryScope.CONVERSATION, 5, conversation=conversation_id) if mem else None
 
             conf_score = self._confidence.score(
                 final_response,
@@ -407,7 +452,7 @@ class MasterAgent:
                 + "\n\n"
                 + final_response
             )
-        self._save_memory(prompt, final_response, memory=mem)
+        self._save_memory(prompt, final_response, memory=mem, conversation_id=conversation_id)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         routing = primary_routing or RoutingDecision(reason="no task routed")
@@ -504,6 +549,7 @@ class MasterAgent:
         max_tokens: int | None = None,
         workspace=None,
         memory=None,
+        conversation_id: str | None = None,
     ) -> tuple[ExecutionGraph, list[Task], RoutingDecision | None]:
         """Execute DAG with Phase 4 quality checks (confidence, verification, escalation, self-correction)."""
         ws = workspace if workspace is not None else self._workspace
@@ -526,7 +572,7 @@ class MasterAgent:
             if self._context_builder:
                 memory_results = None
                 if mem:
-                    hits = mem.search(MemoryScope.CONVERSATION, task.description, k=2)
+                    hits = mem.search(MemoryScope.CONVERSATION, task.description, k=2, conversation=conversation_id)
                     if hits:
                         memory_results = [{"text": h.text, "scope": h.scope.value, "source": h.source} for h in hits]
 
@@ -536,7 +582,7 @@ class MasterAgent:
 
                 conversation_history = None
                 if mem:
-                    recent = mem.recent(MemoryScope.CONVERSATION, 5)
+                    recent = mem.recent(MemoryScope.CONVERSATION, 5, conversation=conversation_id)
                     conversation_history = [{"role": h.source, "content": h.text} for h in recent]
 
                 context_bundle = self._context_builder.build(
@@ -826,6 +872,34 @@ class MasterAgent:
             return result.response
         return executed[0].result or ""
 
+    def _publish_timeline(self, kind: str, text: str) -> None:
+        """Publish a live-timeline step so the UI can show the agent working."""
+        try:
+            self._events.publish(Events.TIMELINE, {"kind": kind, "text": text})
+        except Exception:  # noqa: BLE001 - a timeline must never break the pipeline
+            log.debug("timeline_publish_failed", kind=kind)
+
+    def _timeline_for_op(self, step: dict) -> None:
+        """Turn an engine operation step into a readable timeline line."""
+        kind = step.get("kind") or step.get("action")
+        path = step.get("path") or ""
+        if kind == "list":
+            self._publish_timeline("list", "Listing workspace")
+        elif kind == "search":
+            self._publish_timeline("search", f"Searching {path or 'workspace'}…")
+        elif kind == "read":
+            self._publish_timeline("read", f"Reading {path or 'workspace'}…")
+        elif kind == "create_folder":
+            self._publish_timeline("create_folder", f"Creating folder {path}")
+        elif kind == "rename":
+            self._publish_timeline("rename", f"Renaming {path} → {step.get('to', '')}")
+        elif kind == "delete":
+            self._publish_timeline("delete", f"Deleting {path}")
+        elif kind == "write":
+            self._publish_timeline("write", f"Writing {path}")
+        elif kind == "edit":
+            self._publish_timeline("edit", f"Updating {path}")
+
     # -- Phase 6/7: file outputs, review, and action logging --------------------
 
     def _apply_file_outputs(
@@ -881,7 +955,7 @@ class MasterAgent:
                     )
                 continue
             ops = engine.plan_project_ops(kind, ops)
-            task_actions, task_validations = engine.apply(ops)
+            task_actions, task_validations = engine.apply(ops, on_step=self._timeline_for_op)
             log.info(
                 "actions_executed",
                 task_id=task.id,
@@ -913,6 +987,97 @@ class MasterAgent:
             failures=[{"path": a.path, "error": a.error} for a in actions if a.status == "failed"],
         )
         return actions, validations
+
+    def _verify_and_remember(
+        self,
+        actions: list[FileAction],
+        file_operator,
+        *,
+        workspace=None,
+        memory=None,
+        conversation_id: str | None = None,
+    ) -> None:
+        """Phase XIII — the write→verify→index→remember close of every request.
+
+        After files are applied: confirm each changed file exists on the
+        workspace disk, syntax-check what we can, refresh the project index for
+        the written files (so grounding/search reflects the new state), and
+        record the write in project memory (so a later request can recall what
+        the agent produced without re-reading the folder). Never raises.
+        """
+        changed = [
+            a for a in actions
+            if a.action in ("created", "modified", "renamed") and a.status == "ok"
+        ]
+        if not changed:
+            return
+
+        rels = [a.path for a in changed if a.action in ("created", "modified")]
+        verified = 0
+        for rel in rels:
+            try:
+                if file_operator.exists(rel):
+                    verified += 1
+                    content = file_operator.read(rel)
+                    if content is not None and not self._simple_syntax_check(rel, content):
+                        self._publish_timeline("index", f"{rel} failed syntax check")
+                    else:
+                        self._publish_timeline("verified", f"Verified {rel}")
+            except Exception:  # noqa: BLE001 - verification never breaks the request
+                log.debug("work_verify_failed", path=rel, exc_info=True)
+        if verified and workspace is not None:
+            self._index_changed_files(workspace, file_operator, rels)
+
+        if memory is not None:
+            try:
+                summary = ", ".join(f"{a.action} {a.path}" for a in changed)
+                memory.save(
+                    MemoryScope.PROJECT,
+                    f"The agent wrote to the workspace: {summary}.",
+                    source="workspace",
+                    metadata={"source": "phase_xiii"},
+                )
+                self._events.publish(
+                    Events.MEMORY_WRITTEN,
+                    {"entries": 1, "scope": MemoryScope.PROJECT.value},
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("work_remember_failed", exc_info=True)
+
+    def _index_changed_files(self, workspace, file_operator, rels: list[str]) -> None:
+        """Import written files into the project index (sha256 dedupe) and
+        kick off embedding jobs so the refreshed state is searchable."""
+        for rel in rels:
+            try:
+                data = file_operator.read(rel)
+            except Exception:  # noqa: BLE001
+                continue
+            if not data:
+                continue
+            try:
+                info = workspace.upload(rel, data.encode("utf-8"))
+                workspace.index(info.id)
+                self._publish_timeline("index", f"Indexed {rel}")
+            except Exception:  # noqa: BLE001 - index refresh is best-effort
+                log.debug("work_index_failed", path=rel, exc_info=True)
+
+    @staticmethod
+    def _simple_syntax_check(rel: str, content: str) -> bool:
+        """Cheap local syntax validation for known plain-text formats. Unknown
+        languages are reported OK (no interpreter available at this layer)."""
+        if rel.endswith(".py"):
+            try:
+                ast.parse(content)
+                return True
+            except SyntaxError:
+                return False
+        if rel.endswith((".json", ".jsonc")):
+            try:
+                json.loads(content)
+                return True
+            except ValueError:
+                return False
+        return True
 
     def _compose_response(
         self,
@@ -1023,13 +1188,13 @@ class MasterAgent:
                 best_score = score
         return best
 
-    def _save_memory(self, prompt: str, response: str, memory=None) -> None:
+    def _save_memory(self, prompt: str, response: str, memory=None, conversation_id: str | None = None) -> None:
         mem = memory if memory is not None else self._memory
         if mem is None:
             return
         try:
-            mem.save(MemoryScope.CONVERSATION, prompt, source="user")
-            mem.save(MemoryScope.CONVERSATION, response, source="assistant")
+            mem.save(MemoryScope.CONVERSATION, prompt, source="user", conversation=conversation_id)
+            mem.save(MemoryScope.CONVERSATION, response, source="assistant", conversation=conversation_id)
             self._events.publish(Events.MEMORY_WRITTEN, {"entries": 2, "scope": MemoryScope.CONVERSATION.value})
         except Exception:  # noqa: BLE001
             log.debug("memory_save_failed")
@@ -1065,6 +1230,7 @@ class MasterAgent:
 
     def _execute_and_record(self, routing: RoutingDecision, prompt: str, *, temperature: float = 0.7, max_tokens: int | None = None) -> ChatResponse:
         """Execute and feed the outcome back into the performance store."""
+        self._publish_timeline("generate", "Generating…")
         try:
             response = self._executor.execute(routing, prompt, temperature=temperature, max_tokens=max_tokens)
         except ProviderUnavailable as exc:

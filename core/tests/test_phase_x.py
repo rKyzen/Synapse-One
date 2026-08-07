@@ -5,10 +5,15 @@ Covers:
 - Language/framework stack detection (manifests + extension fallback)
 - Adopting an existing folder, scanning/importing/indexing it, and the
   project dashboard + file content endpoints
+- ``/request/stream`` — SSE live execution timeline, ending with the same
+  AgentResponse payload as ``/request``
+- Per-chat isolation (conversation memory, history) + auto-rename from
+  conversation context
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -390,3 +395,272 @@ class TestUniversalWorkspaceTool:
             for p in folder.rglob("*")
             if p.is_file() and ".git" not in p.parts and "node_modules" not in p.parts
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase XI — live execution timeline (/request/stream, SSE)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestStream:
+    def _events(self, client, **body) -> list[dict]:
+        events = []
+        with client.stream(
+            "POST", "/request/stream", json={"prompt": "hello", **body}
+        ) as resp:
+            assert resp.status_code == 200, resp.text
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                events.append(json.loads(line[len("data: ") :]))
+        return events
+
+    def test_stream_emits_timeline_then_done(self, client, temp_paths: SynapsePaths):
+        events = self._events(client)
+        kinds = [e["kind"] for e in events]
+        assert "understand" in kinds
+        assert "finished" in kinds
+        assert kinds[-1] == "done"
+        assert events[-1]["response"]["response"]
+
+    def test_stream_shows_workspace_reads_and_finished(self, client, temp_paths: SynapsePaths):
+        pi, _ = self._adopted(client, temp_paths, "StreamProject")
+        events = self._events(client, project_id=pi)
+        kinds = [e["kind"] for e in events]
+        assert "read_workspace" in kinds
+        assert "finished" in kinds
+        assert kinds[-1] == "done"
+        assert events[-1]["meta"]
+
+    @staticmethod
+    def _adopted(client, temp_paths: SynapsePaths, name: str) -> tuple[str, Path]:
+        folder = _make_project_folder(temp_paths.home)
+        pid = client.post(
+            "/projects", json={"name": name, "workspace_path": str(folder)}
+        ).json()["id"]
+        client.post(f"/projects/{pid}/scan")
+        return pid, folder
+
+
+# ---------------------------------------------------------------------------
+# Phase XII — per-chat isolation + auto-rename
+# ---------------------------------------------------------------------------
+
+
+class TestChatIsolation:
+    def test_conversation_memory_is_isolated_per_chat(self, client, temp_paths: SynapsePaths):
+        pi, _ = TestRequestStream._adopted(client, temp_paths, "IsolatedMem")
+        chat_a = client.post(f"/projects/{pi}/chats", json={}).json()
+        chat_b = client.post(f"/projects/{pi}/chats", json={}).json()
+        assert chat_a["id"] != chat_b["id"]
+
+        r1 = client.post(
+            "/request", json={"prompt": "alpha topic", "project_id": pi, "chat_id": chat_a["id"]}
+        )
+        r2 = client.post(
+            "/request", json={"prompt": "beta topic", "project_id": pi, "chat_id": chat_b["id"]}
+        )
+        assert r1.status_code == 200, r1.text
+        assert r2.status_code == 200, r2.text
+
+        convo_file = temp_paths.memory_dir / pi / "conversation.json"
+        data = json.loads(convo_file.read_text(encoding="utf-8"))
+        assert len(data) >= 4
+        assert {e["conversation"] for e in data} == {chat_a["id"], chat_b["id"]}
+        a_conv = [e for e in data if e["conversation"] == chat_a["id"]]
+        b_conv = [e for e in data if e["conversation"] == chat_b["id"]]
+        assert all(e["text"] != "beta topic" for e in a_conv)
+        assert all(e["text"] != "alpha topic" for e in b_conv)
+
+    def test_chats_have_own_messages_and_titles(self, client, temp_paths: SynapsePaths):
+        pi, _ = TestRequestStream._adopted(client, temp_paths, "OwnState")
+        chat_a = client.post(f"/projects/{pi}/chats", json={}).json()
+        chat_b = client.post(f"/projects/{pi}/chats", json={}).json()
+        client.post(
+            "/request", json={"prompt": "history only for a", "project_id": pi, "chat_id": chat_a["id"]}
+        )
+        msgs_a = client.get(f"/projects/{pi}/chats/{chat_a['id']}/messages").json()
+        msgs_b = client.get(f"/projects/{pi}/chats/{chat_b['id']}/messages").json()
+        assert len(msgs_a) == 2
+        assert msgs_b == []
+        assert msgs_a[0]["content"] == "history only for a"
+
+
+class TestAutoRename:
+    def test_first_user_message_renames_default_chat(self, tmp_path):
+        from synapse.projects.chats import ChatStore
+
+        store = ChatStore("p", tmp_path / "chats")
+        chat = store.create("General Discussion")
+        store.append(chat.id, role="user", content="Analyze\n  our codebase   for bugs")
+        assert store.get(chat.id).title == "Analyze our codebase for bugs"
+
+    def test_explicit_rename_is_never_overwritten(self, tmp_path):
+        from synapse.projects.chats import ChatStore
+
+        store = ChatStore("p", tmp_path / "chats")
+        chat = store.create("New chat")
+        store.rename(chat.id, "My custom title")
+        store.append(chat.id, role="user", content="something else")
+        assert store.get(chat.id).title == "My custom title"
+
+    def test_blank_message_falls_back(self, tmp_path):
+        from synapse.projects.chats import ChatStore
+
+        store = ChatStore("p", tmp_path / "chats")
+        chat = store.create("New chat")
+        store.append(chat.id, role="user", content="   \n\t ")
+        assert store.get(chat.id).title == "Chat"
+
+
+# ---------------------------------------------------------------------------
+# Phase XIII — workspace-first / tool-first redesign
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceAccessGate:
+    def test_build_verbs_touch_the_workspace(self):
+        from synapse.actions import requires_workspace_access
+
+        for prompt in (
+            "build a calculator app",
+            "create a python script that prints hello",
+            "refactor the login function",
+            "fix the bug in main.py",
+            "design a landing page",
+        ):
+            assert requires_workspace_access(prompt), prompt
+
+    def test_explicit_destination_touches_the_workspace(self):
+        from synapse.actions import requires_workspace_access
+
+        assert requires_workspace_access("save the summary to analysis.md")
+
+    def test_pure_greeting_stays_chat(self):
+        from synapse.actions import requires_workspace_access
+
+        for prompt in ("hello", "hi there", "thanks", "who are you", "ok goodbye"):
+            assert requires_workspace_access(prompt) is False, prompt
+
+    def test_chat_only_opinion_stays_chat(self):
+        from synapse.actions import requires_workspace_access
+
+        assert requires_workspace_access("sum two numbers and tell me") is False
+
+
+class TestWorkspaceBrief:
+    class StubOperator:
+        root = r"C:\user\project"
+
+        @staticmethod
+        def list_tree():
+            return [
+                {"path": "src/main.py", "size": 12, "modified_at": "2026-08-06T10:00:00+00:00"},
+                {"path": "README.md", "size": 4, "modified_at": "2026-08-06T11:00:00+00:00"},
+            ]
+
+    class StubMemory:
+        def __init__(self, convo_id="chat-1"):
+            self._convo = convo_id
+
+        def recent(self, scope, limit=10, conversation=None):
+            from synapse.domain.memory import MemoryEntry
+
+            def entry(i, text, source):
+                return MemoryEntry(
+                    id=f"e{i}", scope=scope, text=text, source=source, conversation=conversation
+                )
+
+            return [entry(2, "agent: wrote the fix", "assistant"), entry(1, "user: please fix the bug", "user")]
+
+    def test_brief_names_project_path_tree_tools_and_recent(self):
+        from synapse.workspace.brief import build_workspace_brief
+
+        brief = build_workspace_brief(
+            project_id="p123",
+            project_name="MyApp",
+            project_path=None,
+            file_operator=self.StubOperator(),
+            memory=self.StubMemory(),
+            conversation_id="chat-1",
+        )
+        assert "Current workspace: MyApp" in brief
+        assert "p123" in brief
+        assert r"C:\user\project" in brief
+        assert "Read Files" in brief
+        assert "Write Files" in brief
+        assert "src/main.py" in brief
+        assert "README.md" in brief
+        assert "Recently modified" in brief
+        # Newest first.
+        assert brief.index("README.md") < brief.index("src/main.py")
+
+    def test_brief_summarizes_the_current_chat(self):
+        from synapse.workspace.brief import build_workspace_brief
+
+        brief = build_workspace_brief(
+            project_id="p1", file_operator=self.StubOperator(),
+            memory=self.StubMemory(), conversation_id="chat-1",
+        )
+        assert "fix the bug" in brief
+        assert "- user:" in brief
+
+    def test_brief_degrades_gracefully(self):
+        from synapse.workspace.brief import build_workspace_brief
+
+        brief = build_workspace_brief(project_id="pFresh")
+        assert "Current workspace: pFresh" in brief
+        assert "Available workspace tools" in brief
+        assert "(none yet" in brief
+
+
+class TestWorkspaceFirstRequest:
+    @staticmethod
+    def _adopted(client, temp_paths: SynapsePaths, name: str) -> tuple[str, Path]:
+        folder = _make_project_folder(temp_paths.home)
+        pid = client.post(
+            "/projects", json={"name": name, "workspace_path": str(folder)}
+        ).json()["id"]
+        client.post(f"/projects/{pid}/scan")
+        return pid, folder
+
+    def test_written_file_is_verified_indexed_and_remembered(self, client, temp_paths: SynapsePaths):
+        pi, folder = self._adopted(client, temp_paths, "Redesign")
+        resp = client.post(
+            "/request",
+            json={"prompt": "Just a chat — write the project overview to output.md", "project_id": pi},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "output.md" in {a["path"] for a in body["actions"]}
+
+        # Verified on disk.
+        assert (folder / "output.md").exists()
+
+        # Index refreshed: the written file is now part of the project index.
+        dashboard = client.get(f"/projects/{pi}/dashboard").json()
+        assert "output.md" in {f["name"] for f in dashboard["recent_files"]}
+
+        # Remembered at project scope: a later request can recall the write
+        # without re-reading the folder.
+        project_memory = json.loads(
+            (temp_paths.memory_dir / pi / "project.json").read_text(encoding="utf-8")
+        )
+        assert "wrote to the workspace: created output.md" in " ".join(
+            e["text"] for e in project_memory
+        )
+
+    def test_stream_shows_verify_and_index_steps(self, client, temp_paths: SynapsePaths):
+        pi, _ = self._adopted(client, temp_paths, "RedesignStream")
+        events = []
+        with client.stream(
+            "POST", "/request/stream",
+            json={"prompt": "write the project overview to output.md", "project_id": pi},
+        ) as stream:
+            for line in stream.iter_lines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[len("data: ") :]))
+        kinds = [e["kind"] for e in events]
+        assert "verified" in kinds
+        assert "index" in kinds
+        assert kinds[-1] == "done"

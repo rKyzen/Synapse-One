@@ -83,6 +83,10 @@ class ModelLifecycleMetrics:
     def update_system_ram(self, ram_gb: float) -> None:
         self._system["system_ram_gb"] = round(ram_gb, 2)
 
+    def set_current_loaded(self, count: int) -> None:
+        """Keep ``current_loaded_models`` in sync between cleanup cycles."""
+        self._system["current_loaded_models"] = int(count)
+
     def _recompute_averages(self) -> None:
         loads = self._system["total_loads"]
         unloads = self._system["total_unloads"]

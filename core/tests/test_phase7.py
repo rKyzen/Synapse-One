@@ -42,6 +42,8 @@ from synapse.workspace.operator import FileOperator  # noqa: E402
 
 def _reply_for(prompt: str) -> str:
     lowered = prompt.lower()
+    if "review the generated files" in lowered:
+        return "All generated files are consistent and well-formed."
     if "portfolio" in lowered:
         return json.dumps({
             "folders": ["assets", "css", "js"],
@@ -71,8 +73,6 @@ def _reply_for(prompt: str) -> str:
                 {"path": "README.md", "content": "# Hello App\n"},
             ]
         })
-    if "review" in lowered:
-        return "All generated files are consistent and well-formed."
     if "plain site" in lowered:
         # realistic model output: prose + fenced code, NO JSON manifest
         return (

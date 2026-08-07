@@ -23,7 +23,10 @@ from synapse.contracts.correction import (
 )
 
 _PYTHON_FN_CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\(\)")
-_FILE_REF = re.compile(r"(?:in|at|`)?([\w./-]+\.(?:py|md|txt|json|toml|cfg|ini|yaml|yml|log|csv|sql|js|ts|tsx|jsx|html|css))", re.IGNORECASE)
+_FILE_REF = re.compile(
+    r"(?:^|[\s(`<>\"'])([\w./-]+\.(?:py|md|txt|json|toml|cfg|ini|yaml|yml|log|csv|sql|js|ts|tsx|jsx|html|css))(?=[\s,;.\]}>'\"`]|$)",
+    re.IGNORECASE,
+)
 _PACKAGE_REF = re.compile(r"pip install\s+([\w.-]+)")
 _CITATION_REF = re.compile(r"(?:see|per|according to)\s+\[(\d+)\]|\[(\d+)\]", re.IGNORECASE)
 

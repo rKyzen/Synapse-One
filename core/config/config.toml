@@ -5,24 +5,6 @@
 level = "INFO"
 json = false
 
-# Model lifecycle — RAM-resident model management.
-#   idle_timeout_small  : unload idle models after N seconds (fast/small models)
-#   idle_timeout_large  : unload idle LARGE models sooner (they waste more RAM)
-#   idle_timeout_embedding : never auto-unload the embedding model
-#   cleanup_interval    : background cleanup runs every N seconds
-#   keep_embedding_loaded : keep nomic-embed-text resident
-#   low_memory_threshold: GB of free RAM that triggers immediate idle unload
-#   max_loaded_models   : soft ceiling on concurrently loaded models
-[lifecycle]
-idle_timeout_small = 60
-idle_timeout_large = 30
-idle_timeout_embedding = 1e18
-cleanup_interval = 15
-keep_embedding_loaded = true
-low_memory_threshold = 4
-large_model_min_ram_gb = 8
-max_loaded_models = 4
-
 # Task Planner — decomposes large prompts into a task DAG.
 #   enabled             : set false to always treat the whole prompt as one task
 #   min_split_complexity: below this complexity score, no decomposition
@@ -95,6 +77,23 @@ provider = "faiss"
 [performance]
 enabled = true
 max_entries = 500
+
+# Model lifecycle & resource management (Phase 2.5+).
+# Timeouts in seconds; the cleanup loop runs every `cleanup_interval` seconds
+# and unloads models that have been idle longer than their class timeout.
+# Negative/floating values are allowed; set a large timeout to effectively
+# keep a class resident. A model must be idle (not generating) to be unloaded.
+[lifecycle]
+idle_timeout_small = 60          # general (small/medium) models
+idle_timeout_large = 30          # large models (>= large_model_min_ram_gb)
+idle_timeout_embedding = 3600    # only used if keep_embedding_loaded = false
+cleanup_interval = 15            # background sweep period
+keep_embedding_loaded = true     # never auto-unload embedding models
+low_memory_threshold = 4         # GB of free RAM; below this, unload all idle
+prefer_loaded_model_margin = 0.05 # reuse an already-loaded model if capability
+                                  # gap is smaller than this (0.05 == 5%)
+large_model_min_ram_gb = 8.0     # models needing >= this RAM are "large"
+max_loaded_models = 4            # soft cap for the resident-model sweep
 
 # Phase 4 — answer quality & reliability.
 #   refuse_threshold   : confidence below this -> refuse/hedge instead of guessing

@@ -24,8 +24,13 @@ class MemoryStore(ABC):
         embedding: list[float] | None = None,
         source: str = "",
         metadata: dict | None = None,
+        conversation: str | None = None,
     ) -> MemoryEntry:
-        """Store an entry and return it (with id + timestamp)."""
+        """Store an entry and return it (with id + timestamp).
+
+        ``conversation`` scopes the entry to one chat so conversation memory
+        is fully isolated per chat.
+        """
 
     @abstractmethod
     def search(
@@ -35,16 +40,23 @@ class MemoryStore(ABC):
         *,
         k: int = 3,
         min_similarity: float = 0.35,
+        conversation: str | None = None,
     ) -> list[MemoryEntry]:
         """Return up to ``k`` entries most similar to ``query``, best first.
 
         Entries carry a ``similarity`` field. Degrades to keyword match when
-        embeddings are unavailable. Never raises.
+        embeddings are unavailable. Never raises. When ``conversation`` is
+        given, only entries owned by that chat are considered (CONVERSATION
+        scope isolation).
         """
 
     @abstractmethod
-    def recent(self, scope: MemoryScope, limit: int = 10) -> list[MemoryEntry]:
-        """Newest entries first — cheap chronological view."""
+    def recent(self, scope: MemoryScope, limit: int = 10, conversation: str | None = None) -> list[MemoryEntry]:
+        """Newest entries first — cheap chronological view.
+
+        When ``conversation`` is given, only entries owned by that chat are
+        returned.
+        """
 
     @abstractmethod
     def clear(self, scope: MemoryScope | None = None) -> int:

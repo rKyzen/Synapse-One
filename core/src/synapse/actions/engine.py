@@ -21,6 +21,7 @@ answers directly and no model is consulted.
 from __future__ import annotations
 
 import re
+from typing import Callable
 
 from synapse.domain.enums import RequestKind
 from synapse.domain.fileops import FileAction, ValidationResult
@@ -117,11 +118,15 @@ class ActionEngine:
         ops: list[dict],
         *,
         confirm_delete: bool = False,
+        on_step: Callable[[dict], None] | None = None,
     ) -> tuple[list[FileAction], list[ValidationResult]]:
         """Execute manifest ops against the workspace; verify every mutation.
 
-        Never raises: violations become failed FileActions so the rest of the
-        request proceeds. Deletes require ``confirm_delete``.
+        Never raises: violations go through failed FileActions so the rest of
+        the request proceeds. Deletes require ``confirm_delete``.
+
+        ``on_step`` (when given) receives ``{"kind", "path", ...}`` for the
+        mutation about to execute, so a live UI can show file activity.
         """
         actions: list[FileAction] = []
         validations: list[ValidationResult] = []
@@ -133,6 +138,22 @@ class ActionEngine:
                 actions.append(entry)
                 self._log_result(entry)
                 continue
+            step = {"action": action, "path": path}
+            if action in ("create_folder", "mkdir", "folder"):
+                step["kind"] = "create_folder"
+            elif action in ("rename", "move"):
+                step["kind"] = "rename"
+                step["to"] = op.get("to", "")
+            elif action in ("delete", "remove"):
+                step["kind"] = "delete"
+            elif action in ("edit", "patch", "replace"):
+                step["kind"] = "edit"
+            elif action in ("search", "list", "read"):
+                step["kind"] = "informational"
+            else:
+                step["kind"] = "write"
+            if on_step and step["kind"] != "informational":
+                on_step(step)
             try:
                 if action in ("create_folder", "mkdir", "folder"):
                     self.create_folder(path)
@@ -219,12 +240,30 @@ class ActionEngine:
 
     # -- model-free workspace operations ------------------------------------------
 
-    def run_workspace_ops(self, ops: list[dict]) -> tuple[list[str], list[FileAction]]:
+    def run_workspace_ops(
+        self,
+        ops: list[dict],
+        *,
+        on_step: Callable[[dict], None] | None = None,
+    ) -> tuple[list[str], list[FileAction]]:
         """Execute explicit backend-only operations; returns (display_lines, actions)."""
         lines: list[str] = []
         actions: list[FileAction] = []
         for op in ops:
             action = op.get("action")
+            if on_step:
+                step = {"action": action, "path": op.get("path", "") or op.get("pattern", "")}
+                if action in ("rename", "move"):
+                    step["to"] = op.get("to", "")
+                if action == "list":
+                    step["kind"] = "list"
+                elif action == "search":
+                    step["kind"] = "search"
+                elif action == "read":
+                    step["kind"] = "read"
+                else:
+                    step["kind"] = action or "step"
+                on_step(step)
             try:
                 if action == "list":
                     entries = self._op.list_tree()
@@ -283,11 +322,19 @@ class ActionEngine:
 
     # -- context for analysis / modification ---------------------------------------
 
-    def build_context(self, *, max_files: int = 8, max_bytes_per_file: int = 4000) -> str | None:
+    def build_context(
+        self,
+        *,
+        max_files: int = 8,
+        max_bytes_per_file: int = 4000,
+        on_file: Callable[[str], None] | None = None,
+    ) -> str | None:
         """Snapshot of the workspace (listing + excerpts) to feed a model.
 
         Lets the model edit or analyze real existing files instead of
         hallucinating their content. Returns None when the workspace is empty.
+        ``on_file`` (when given) is called with each excerpted path so a live
+        UI can show per-file reads.
         """
         entries = self._op.list_tree()
         if not entries:
@@ -301,6 +348,8 @@ class ActionEngine:
                 continue
             excerpt = content[:max_bytes_per_file]
             parts.append(f"\n### {entry['path']}\n{excerpt}")
+            if on_file:
+                on_file(entry["path"])
         return "\n".join(parts)
 
     # -- summary ---------------------------------------------------------------------

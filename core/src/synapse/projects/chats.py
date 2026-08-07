@@ -10,6 +10,7 @@ recorded and survives an unexpected shutdown. Nothing here raises on I/O.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -151,9 +152,14 @@ class ChatStore:
                 return None
             record.messages.append(message)
             record.updated_at = message.created_at
-            # Auto-title from the first user message.
-            if record.title in ("New chat", "new chat", "") and message.role == "user":
-                record.title = content if len(content) <= 60 else content[:60] + "..."
+            # Auto-rename from conversation context: the first meaningful user
+            # message seeds the chat's title (works for every default
+            # placeholder — "New chat", the "General Discussion" created by
+            # ``ensure_chat``, or an empty title). Whitespace is collapsed so
+            # a multi-line prompt becomes a clean one-line title. A title the
+            # user set explicitly is never overwritten.
+            if message.role == "user" and self._default_title(record.title):
+                record.title = self._title_from(message.content)
             self._write(record)
             log.info(
                 "message_recorded",
@@ -163,6 +169,19 @@ class ChatStore:
                 chars=len(content),
             )
             return message
+
+    @staticmethod
+    def _default_title(title: str) -> bool:
+        return title.strip().lower() in ("", "new chat", "general discussion")
+
+    @staticmethod
+    def _title_from(content: str) -> str:
+        """A clean one-line title derived from the conversation's first message."""
+        text = re.sub(r"\s+", " ", content).strip()
+        text = text.lstrip("#>*-\t ")
+        if not text:
+            return "Chat"
+        return text if len(text) <= 50 else text[:50].rstrip() + "..."
 
     @staticmethod
     def _to_info(record: ChatRecord) -> ChatInfo:
