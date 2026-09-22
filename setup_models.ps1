@@ -13,9 +13,38 @@ function Get-Config {
     return Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 }
 
+function Get-AvailableRamGb {
+    try {
+        $bytes = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB
+        return [math]::Round($bytes / 1GB, 1)
+    } catch {
+        $bytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+        return [math]::Round($bytes / 1GB, 1)
+    }
+}
+
 function Get-TotalRamGb {
-    $bytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
-    return [math]::Round($bytes / 1GB, 1)
+    try {
+        $bytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+        return [math]::Round($bytes / 1GB, 1)
+    } catch {
+        return 0.0
+    }
+}
+
+function Get-GpuVramGb {
+    try {
+        $adapters = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+        $maxBytes = 0
+        foreach ($a in $adapters) {
+            if ($a.AdapterRAM -and $a.AdapterRAM -gt $maxBytes) {
+                $maxBytes = $a.AdapterRAM
+            }
+        }
+        return [math]::Round($maxBytes / 1GB, 1)
+    } catch {
+        return 0.0
+    }
 }
 
 function Get-CpuName {
@@ -23,14 +52,38 @@ function Get-CpuName {
 }
 
 function Get-TierInfo {
-    param($Config, $RamGb, $CpuName)
-    $ramOk = $RamGb -ge [double]$Config.hardware.tier2_min_ram_gb
-    $cpuOk = $false
-    foreach ($pattern in $Config.hardware.tier2_min_cpu_patterns) {
-        if ($CpuName -match $pattern) { $cpuOk = $true; break }
+    param($Config, $AvailableRamGb, $VramGb, $CpuName)
+    $t3PlusMinRam = if ($Config.hardware.tier3_plus_min_available_ram_gb) { [double]$Config.hardware.tier3_plus_min_available_ram_gb } else { 32.0 }
+    $t3PlusMinVram = if ($Config.hardware.tier3_plus_min_vram_gb) { [double]$Config.hardware.tier3_plus_min_vram_gb } else { 20.0 }
+    $t3MinRam = if ($Config.hardware.tier3_min_available_ram_gb) { [double]$Config.hardware.tier3_min_available_ram_gb } else { 16.0 }
+    $t3MinVram = if ($Config.hardware.tier3_min_vram_gb) { [double]$Config.hardware.tier3_min_vram_gb } else { 12.0 }
+    $t2MinRam = if ($Config.hardware.tier2_min_available_ram_gb) { [double]$Config.hardware.tier2_min_available_ram_gb } else { 6.0 }
+
+    if (($AvailableRamGb -ge $t3PlusMinRam) -or ($VramGb -ge $t3PlusMinVram)) {
+        if ($Config.tiers.tier3_plus) {
+            return @{ tier = "tier3_plus"; name = $Config.tiers.tier3_plus.display }
+        }
     }
-    if ($ramOk -and $cpuOk) {
-        return @{ tier = "tier2"; name = $Config.tiers.tier2.display }
+
+    if (($AvailableRamGb -ge $t3MinRam) -or ($VramGb -ge $t3MinVram)) {
+        if ($Config.tiers.tier3) {
+            return @{ tier = "tier3"; name = $Config.tiers.tier3.display }
+        }
+    }
+
+    $cpuOk = $false
+    if ($Config.hardware.tier2_min_cpu_patterns) {
+        foreach ($pattern in $Config.hardware.tier2_min_cpu_patterns) {
+            if ($CpuName -match $pattern) { $cpuOk = $true; break }
+        }
+    } else {
+        $cpuOk = $true
+    }
+
+    if ($AvailableRamGb -ge $t2MinRam -and $cpuOk) {
+        if ($Config.tiers.tier2) {
+            return @{ tier = "tier2"; name = $Config.tiers.tier2.display }
+        }
     }
     return @{ tier = "tier1"; name = $Config.tiers.tier1.display }
 }
@@ -62,9 +115,11 @@ function Get-InstalledModels {
 
 function Get-Status {
     $config = Get-Config
-    $ramGb = Get-TotalRamGb
+    $availRamGb = Get-AvailableRamGb
+    $totalRamGb = Get-TotalRamGb
+    $vramGb = Get-GpuVramGb
     $cpuName = Get-CpuName
-    $tier = Get-TierInfo $config $ramGb $cpuName
+    $tier = Get-TierInfo $config $availRamGb $vramGb $cpuName
 
     $modelIds = @()
     foreach ($m in $config.tiers.($tier.tier).models) { $modelIds += $m.id }
@@ -82,7 +137,10 @@ function Get-Status {
     Write-Output "INSTALL_URL=$($config.ollama.install_url)"
     Write-Output "TIER=$($tier.tier)"
     Write-Output "TIER_NAME=$($tier.name)"
-    Write-Output "RAM_GB=$ramGb"
+    Write-Output "RAM_GB=$availRamGb"
+    Write-Output "RAM_AVAILABLE_GB=$availRamGb"
+    Write-Output "RAM_TOTAL_GB=$totalRamGb"
+    Write-Output "VRAM_GB=$vramGb"
     Write-Output "CPU=$cpuName"
     Write-Output "MODELS=$($modelIds -join ' ')"
     Write-Output "PRESENT=$($present -join ' ')"

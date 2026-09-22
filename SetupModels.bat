@@ -104,8 +104,9 @@ for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass
     for /f "tokens=1,* delims==" %%A in ("%%L") do set "%%A=%%B"
 )
 echo Tier detected: %TIER% (%TIER_NAME%)
-echo   RAM : %RAM_GB% GB
-echo   CPU : %CPU%
+echo   Available RAM : %RAM_AVAILABLE_GB% GB (Total: %RAM_TOTAL_GB% GB)
+echo   VRAM          : %VRAM_GB% GB
+echo   CPU           : %CPU%
 echo.
 
 REM ---------------------------------------------
@@ -166,8 +167,9 @@ for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass
     for /f "tokens=1,* delims==" %%A in ("%%L") do set "%%A=%%B"
 )
 echo Tier detected: %TIER% (%TIER_NAME%)
-echo   RAM : %RAM_GB% GB
-echo   CPU : %CPU%
+echo   Available RAM : %RAM_AVAILABLE_GB% GB (Total: %RAM_TOTAL_GB% GB)
+echo   VRAM          : %VRAM_GB% GB
+echo   CPU           : %CPU%
 echo.
 echo Checking installed models ...
 

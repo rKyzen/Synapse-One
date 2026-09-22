@@ -502,6 +502,22 @@ class Router(Router):
         if complexity >= _DEEP_REASONING_THRESHOLD:
             score += m.capabilities.reasoning * _DEEP_REASONING_BONUS
 
+        # Strengths and weaknesses matching
+        weaknesses_text = " ".join(m.weaknesses).lower() if m.weaknesses else ""
+        strengths_text = " ".join(m.strengths).lower() if m.strengths else ""
+
+        if Capability.MATH in required or Capability.REASONING in required:
+            if "deep math" in weaknesses_text or "mathematical proof" in weaknesses_text:
+                score -= 0.30
+            if "math reasoning" in strengths_text or "advanced reasoning" in strengths_text or "deep math" in strengths_text:
+                score += 0.20
+
+        if Capability.CODING in required:
+            if "heavy code" in weaknesses_text or "code generation" in weaknesses_text:
+                score -= 0.30
+            if "code generation" in strengths_text or "refactoring" in strengths_text or "debugging" in strengths_text:
+                score += 0.15
+
         # Unused specializations are penalized.
         if Capability.VISION not in required:
             if m.capabilities.vision:
@@ -516,7 +532,9 @@ class Router(Router):
         # Structural biases.
         score += _LOCAL_BIAS if m.kind == ProviderKind.LOCAL else 0.0
         score += m.privacy_score * _PRIVACY_BIAS
-        score += _LATENCY_WEIGHT.get(m.latency, 0.5) * _LATENCY_BONUS
+        # Only favor fast latency on simple tasks; do not let small models overpower reasoning on hard tasks
+        latency_scale = 1.0 if complexity < _DEEP_REASONING_THRESHOLD else 0.2
+        score += _LATENCY_WEIGHT.get(m.latency, 0.5) * _LATENCY_BONUS * latency_scale
         score -= min(_COST_PENALTY_CAP, m.estimated_cost_per_1k * _COST_SCALE)
 
         return max(0.0, score)

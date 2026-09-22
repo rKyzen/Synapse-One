@@ -102,8 +102,8 @@ _RULES: list[tuple[IntentKind, re.Pattern[str]]] = [
     (
         IntentKind.FILE_GENERATION,
         re.compile(
-            rf"\b{_CREATE_VERBS}\s+(?:a\s+|an\s+|the\s+|my\s+)?"
-            r"(?:[\w\-]+\s+){{0,4}}?" + _ARTIFACT_RE.pattern,
+            rf"\b{_CREATE_VERBS}\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+|an\s+|the\s+|my\s+)?"
+            r"(?:[\w\-]+\s+){0,6}?" + _ARTIFACT_RE.pattern,
             re.IGNORECASE,
         ),
     ),

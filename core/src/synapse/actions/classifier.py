@@ -102,11 +102,21 @@ _RULES: list[tuple[re.Pattern[str], RequestKind]] = [
         re.compile(r"\b(add|remove|change)\s+(a\s+)?(feature|button|color|style|dark\s*mode|light\s*mode|page|section|function|method|test|route|navbar)\b"),
         RequestKind.FILE_MODIFICATION,
     ),
+    # -- single file creation ----------------------------------------------
+    (
+        re.compile(
+            r"\b(create|write|generate|add)\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+|an\s+|the\s+|my\s+)?"
+            r"(?:[\w\-]+\s+){0,6}?"
+            r"(script|program|function|class|test|unit\s*test|file|endpoint|sql\s*query|"
+            r"python\s+script|bash\s+script|shell\s+script)\b"
+        ),
+        RequestKind.FILE_CREATION,
+    ),
     # -- project generation (new artifacts) -------------------------------
     (
         re.compile(
-            r"\b(create|build|make|generate|scaffold|design|develop)\s+(a\s+|an\s+)?"
-            r"(?:[\w\-]+\s+)?"
+            r"\b(create|build|make|generate|scaffold|design|develop)\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+|an\s+|the\s+|my\s+)?"
+            r"(?:[\w\-]+\s+){0,6}?"
             r"(website|web\s*app|web\s*page|site|portfolio|app|application|project|"
             r"dashboard|game|cli|tool|plugin|extension|module|package|api|landing\s*page|"
             r"store|shop|ecommerce|blog|forum|cms|chatbot|bot|calculator|todo\s*list|"
@@ -114,13 +124,12 @@ _RULES: list[tuple[re.Pattern[str], RequestKind]] = [
         ),
         RequestKind.PROJECT_GENERATION,
     ),
-    # -- single file creation ----------------------------------------------
+    # -- generic language/config file creation fallback -------------------
     (
         re.compile(
-            r"\b(create|write|generate|add)\s+(a\s+|an\s+)?"
-            r"(?:[\w\-]+\s+)?"
-            r"(script|program|function|class|test|unit\s*test|file|endpoint|sql\s*query|"
-            r"python|javascript|typescript|html|css|bash|shell|go|rust|java|c\+\+|ruby|php|config)\b"
+            r"\b(create|write|generate|add)\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+|an\s+|the\s+|my\s+)?"
+            r"(?:[\w\-]+\s+){0,6}?"
+            r"(python|javascript|typescript|html|css|bash|shell|go|rust|java|c\+\+|ruby|php|config)\b"
         ),
         RequestKind.FILE_CREATION,
     ),

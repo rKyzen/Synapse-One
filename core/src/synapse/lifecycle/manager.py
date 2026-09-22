@@ -190,6 +190,7 @@ class ModelLifecycleManager:
         provider = self._provider(provider_id)
         resident = self._is_resident(provider_id, model_id)
         if not resident and provider is not None:
+            self._prepare_for_load(record)
             ok = self._load_via_provider(provider, model_id)
             if not ok:
                 with self._lock:
@@ -235,6 +236,24 @@ class ModelLifecycleManager:
             ram_gb=record.ram_gb,
         )
         return record
+
+    def _prepare_for_load(self, record: LoadedModel) -> None:
+        """Ensure hardware safety before loading ``record``.
+
+        - If the model is large, unloads any idle large models to prevent
+          concurrent large-model contention.
+        - If hardware reports available RAM below the model's requirement,
+          unloads idle models to reclaim memory.
+        """
+        if record.is_large:
+            for idle in self.idle_models():
+                if idle.is_large and not (idle.is_embedding and self._settings.keep_embedding_loaded):
+                    self.unload(idle.provider_id, idle.model_id, reason="prevent_concurrent_large")
+
+        if self._hardware is not None and record.required_ram_gb > 0:
+            avail = self._hardware_pressure_gb()
+            if avail is not None and avail < record.required_ram_gb:
+                self.unload_idle(reason="pre_load_memory_reclaim")
 
     def _load_via_provider(self, provider, model_id: str) -> bool:
         """Ask the provider to load; returns True once resident (or unsupported)."""

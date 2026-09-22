@@ -149,6 +149,11 @@ class DecisionTrace(BaseModel):
     complexity_reasoning: list[str] = Field(default_factory=list)
     privacy_reasoning: list[str] = Field(default_factory=list)
     hardware_reasoning: list[str] = Field(default_factory=list)
+    master_analysis: dict[str, Any] | None = None
+    workspace_needed: bool | None = None
+    reasoning_complexity: str | None = None
+    domain: str | None = None
+    timings: dict[str, float] = Field(default_factory=dict)
 
 
 class AgentResponse(BaseModel):

@@ -136,6 +136,13 @@ class ModelMetadata(BaseModel):
     average_tokens_per_second: float | None = None
     average_latency_s: float | None = None
     capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
+    role: str = ""
+    strengths: list[str] = Field(default_factory=list)
+    weaknesses: list[str] = Field(default_factory=list)
+    speed_tier: str = ""
+    hardware_tier: str = ""
+    modalities: list[str] = Field(default_factory=lambda: ["text"])
+    tools_supported: bool = False
 
     @property
     def supports(self) -> set[Capability]:
@@ -151,6 +158,80 @@ class ModelMetadata(BaseModel):
             elif self.capabilities.score_for(capability) > 0:
                 caps.add(capability)
         return caps
+
+
+def format_model_registry_summary(
+    models: list[ModelMetadata],
+    tier: str | None = None,
+    available_ram_gb: float | None = None,
+    vram_gb: float | None = None,
+) -> str:
+    """Format active models into structured ground-truth catalog for the Master Model prompt."""
+    lines: list[str] = [
+        "### REGISTERED SPECIALIST MODELS & TOOLS",
+        "The following models and tools are registered on this system. You MUST select from these models/tools:",
+        "",
+    ]
+    for m in models:
+        # derive strong capabilities
+        strong_caps: list[str] = []
+        if m.capabilities.coding >= 0.6:
+            strong_caps.append("coding")
+        if m.capabilities.math >= 0.6:
+            strong_caps.append("math")
+        if m.capabilities.reasoning >= 0.6:
+            strong_caps.append("reasoning")
+        if m.capabilities.writing >= 0.6:
+            strong_caps.append("writing")
+        if m.capabilities.planning >= 0.6:
+            strong_caps.append("agent_planning")
+        if m.capabilities.vision:
+            strong_caps.append("vision")
+        if m.capabilities.tools or m.tools_supported:
+            strong_caps.append("tools")
+        if m.capabilities.chat >= 0.6:
+            strong_caps.append("conversation")
+        if m.capabilities.embeddings >= 0.6:
+            strong_caps.append("embeddings")
+
+        cap_str = ", ".join(strong_caps) if strong_caps else "general"
+        strengths_str = "; ".join(m.strengths) if m.strengths else "General capability"
+        weaknesses_str = "; ".join(m.weaknesses) if m.weaknesses else "None specific"
+        modalities_str = ", ".join(m.modalities) if m.modalities else "text"
+        speed = m.speed_tier or m.latency.value
+        tool_support = "Yes" if (m.tools_supported or m.capabilities.tools) else "No"
+        res = f"~{m.required_ram_gb}GB RAM"
+        if m.required_vram_gb > 0:
+            res += f", ~{m.required_vram_gb}GB VRAM"
+
+        lines.append(f"Model: {m.id}")
+        if m.role:
+            lines.append(f"  Role: {m.role}")
+        lines.append(f"  Capabilities: {cap_str}")
+        lines.append(f"  Strengths: {strengths_str}")
+        lines.append(f"  Weaknesses: {weaknesses_str}")
+        lines.append(f"  Context Limit: {m.context_window or 32768} tokens")
+        lines.append(f"  Modality: {modalities_str}")
+        lines.append(f"  Approx Resource Requirements: {res}")
+        lines.append(f"  Speed Characteristics: {speed}")
+        if m.hardware_tier:
+            lines.append(f"  Hardware Tier: {m.hardware_tier}")
+        lines.append(f"  Tool / Function-calling Support: {tool_support}")
+        lines.append("")
+
+    lines.append("### AVAILABLE DETERMINISTIC TOOLS")
+    lines.append("Tool: filesystem_tool")
+    lines.append("  Role: File and folder operations (create, read, edit, delete, rename files)")
+    lines.append("  Capability: file_creation, file_editing, file_reading")
+    lines.append("  Resource Requirements: 0 GB (native filesystem)")
+    lines.append("")
+    lines.append("Tool: test_runner")
+    lines.append("  Role: Project unit test execution and validation")
+    lines.append("  Capability: testing, validation")
+    lines.append("  Resource Requirements: 0 GB (local test subprocess)")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 class ModelDescriptor(BaseModel):

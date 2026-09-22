@@ -82,8 +82,8 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .msg.assistant .avatar { border-color: var(--border2); color: var(--text2); }
 .msg.user .avatar { border-color: var(--muted); color: var(--muted); }
 .msg-body { max-width: 80%; min-width: 0; }
-.bubble { padding: 8px 12px; font-size: 13px; line-height: 1.6; word-wrap: break-word; overflow-wrap: break-word; border: 1px solid var(--border); background: var(--surface); min-height: 20px; }
-.msg.user .bubble { background: rgba(255,255,255,0.06); border-color: var(--border2); }
+.bubble { padding: 8px 12px; font-size: 13px; line-height: 1.6; word-wrap: break-word; overflow-wrap: break-word; border: 1px solid var(--border); background: var(--surface); min-height: 20px; tab-size: 2; word-break: break-word; }
+.msg.user .bubble { background: rgba(255,255,255,0.06); border-color: var(--border2); white-space: pre-wrap; }
 .msg.assistant .bubble { background: transparent; }
 .msg-actions { display: flex; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity .1s; }
 .msg:hover .msg-actions { opacity: 1; }
@@ -99,14 +99,32 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 
 /* Markdown & formatting inside bubbles */
 .bubble p { margin: 0 0 6px; } .bubble p:last-child { margin-bottom: 0; }
-.bubble h1, .bubble h2, .bubble h3 { margin: 8px 0 4px; line-height: 1.3; font-weight: 600; }
+.bubble strong { font-weight: 600; color: var(--white); }
+.bubble em { font-style: italic; color: var(--text); }
+.bubble del { text-decoration: line-through; opacity: .7; }
+.bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 { margin: 8px 0 4px; line-height: 1.3; font-weight: 600; color: var(--white); }
 .bubble h1 { font-size: 15px; } .bubble h2 { font-size: 14px; } .bubble h3 { font-size: 13px; }
-.bubble ul, .bubble ol { margin: 4px 0 6px 18px; }
-.bubble li { margin: 1px 0; }
+.bubble h4 { font-size: 12px; } .bubble h5 { font-size: 11.5px; } .bubble h6 { font-size: 11px; color: var(--text2); }
+.bubble ul, .bubble ol { margin: 4px 0 6px 20px; padding: 0; white-space: normal; }
+.bubble ul { list-style-type: disc; }
+.bubble ul ul { list-style-type: circle; }
+.bubble ul ul ul { list-style-type: square; }
+.bubble ol { list-style-type: decimal; }
+.bubble ol ol { list-style-type: lower-alpha; }
+.bubble ol ol ol { list-style-type: lower-roman; }
+.bubble li { margin: 2px 0; line-height: 1.5; }
+.bubble li > ul, .bubble li > ol { margin: 2px 0 2px 18px; }
+.bubble li.task-item { list-style: none; margin-left: -16px; display: flex; align-items: baseline; gap: 6px; }
+.bubble li.task-item input[type=checkbox] { accent-color: var(--white); margin: 0; pointer-events: none; }
 .bubble a { color: var(--white); text-decoration: underline; text-underline-offset: 2px; }
 .bubble code { background: rgba(255,255,255,0.06); padding: 1px 4px; font-family: var(--mono); font-size: 12px; }
-.bubble blockquote { border-left: 2px solid var(--border2); margin: 4px 0; padding: 2px 10px; color: var(--text2); }
-.bubble pre { position: relative; background: rgba(255,255,255,0.03); border: 1px solid var(--border); padding: 8px 10px 6px; font-size: 11px; line-height: 1.5; overflow: auto; max-height: 300px; margin: 4px 0; font-family: var(--mono); }
+.bubble blockquote { border-left: 2px solid var(--border2); margin: 6px 0; padding: 4px 10px; color: var(--text2); background: rgba(255,255,255,0.02); }
+.bubble blockquote p { margin: 2px 0; }
+.bubble table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12px; white-space: normal; }
+.bubble th, .bubble td { border: 1px solid var(--border); padding: 5px 8px; text-align: left; }
+.bubble th { background: var(--surface2); color: var(--white); font-weight: 600; font-family: var(--mono); font-size: 11px; }
+.bubble tr:nth-child(even) { background: rgba(255,255,255,0.015); }
+.bubble pre { position: relative; background: rgba(255,255,255,0.03); border: 1px solid var(--border); padding: 8px 10px 6px; font-size: 11px; line-height: 1.5; overflow: auto; max-height: 300px; margin: 4px 0; font-family: var(--mono); white-space: pre; }
 .bubble pre code { background: none; padding: 0; font-size: 11px; }
 .bubble pre .lang { position: absolute; top: 4px; right: 36px; font-size: 9px; color: var(--muted); text-transform: uppercase; pointer-events: none; }
 .bubble pre .copy-btn { position: absolute; top: 3px; right: 4px; border: 1px solid var(--border); color: var(--muted); font-size: 9px; padding: 1px 6px; font-family: var(--mono); opacity: 0; transition: opacity .1s; }
@@ -621,35 +639,137 @@ $('newChatBtn').addEventListener('click', createChat);
 $('toggleSidebar').addEventListener('click', () => $('sidebar').classList.toggle('collapsed'));
 function esc(s) { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; }
 function mdInline(s) {
-  return s.replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/__([^_]+)__/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+  if (!s) return '';
+  return s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>')
+    .replace(/___([^_]+)___/g, '<strong><em>$1</em></strong>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/(^|[^\*])\*([^\s*](?:[^*\n]*[^\s*])?)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/(^|[^_])_([^\s_](?:[^_\n]*[^\s_])?)_(?!_)/g, '$1<em>$2</em>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 function renderMd(src) {
   const blocks = []; let s = esc(src);
   s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => { const idx = blocks.length; blocks.push({ lang, code }); return '\x00B' + idx + '\x00'; });
-  const out = []; const lines = s.split('\n'); let list = null, buf = [], inBlock = null;
-  const flush = () => {
-    if (list === 'ul') out.push('<ul>' + buf.map(x => '<li>' + mdInline(x) + '</li>').join('') + '</ul>');
-    else if (list === 'ol') out.push('<ol>' + buf.map(x => '<li>' + mdInline(x) + '</li>').join('') + '</ol>');
-    else if (inBlock === 'bq') out.push('<blockquote>' + buf.join('<br>') + '</blockquote>');
-    else if (inBlock) out.push('<' + inBlock + '>' + buf.join('<br>') + '</' + inBlock + '>');
-    else if (buf.length) out.push('<p>' + buf.join('<br>') + '</p>');
-    buf = []; list = null; inBlock = null;
+  const out = []; const lines = s.split('\n');
+  let listStack = []; let buf = []; let bqBuf = []; let inBq = false; let inTable = false; let tableRows = [];
+
+  const closeLists = (toIndent = -1) => {
+    while (listStack.length && listStack[listStack.length - 1].indent > toIndent) {
+      const top = listStack.pop();
+      out.push(top.type === 'ul' ? '</ul>' : '</ol>');
+    }
   };
+  const flushBuf = () => {
+    if (buf.length) {
+      out.push('<p>' + buf.map(x => mdInline(x)).join('<br>') + '</p>');
+      buf = [];
+    }
+  };
+  const flushBq = () => {
+    if (bqBuf.length) {
+      out.push('<blockquote>' + bqBuf.map(x => mdInline(x)).join('<br>') + '</blockquote>');
+      bqBuf = [];
+      inBq = false;
+    }
+  };
+  const flushTable = () => {
+    if (tableRows.length >= 2 && /^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/.test(tableRows[1])) {
+      let html = '<table>';
+      const headerCols = tableRows[0].split('|').slice(1, -1).map(c => c.trim());
+      html += '<thead><tr>' + headerCols.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+      for (let r = 2; r < tableRows.length; r++) {
+        const rowCols = tableRows[r].split('|').slice(1, -1).map(c => c.trim());
+        html += '<tr>' + rowCols.map(c => '<td>' + mdInline(c) + '</td>').join('') + '</tr>';
+      }
+      html += '</tbody></table>';
+      out.push(html);
+    } else {
+      for (const r of tableRows) {
+        out.push('<p>' + mdInline(r) + '</p>');
+      }
+    }
+    tableRows = [];
+    inTable = false;
+  };
+  const flushAll = () => {
+    flushBuf();
+    flushBq();
+    flushTable();
+    closeLists(-1);
+  };
+
   for (const raw of lines) {
-    const hm = raw.match(/^(#{1,3})\s+(.*)$/); const ulm = raw.match(/^[-*]\s+(.*)$/);
-    const olm = raw.match(/^\d+[.)]\s+(.*)$/); const qm = raw.match(/^>\s?(.*)$/);
-    if (hm) { flush(); out.push('<h' + hm[1].length + '>' + mdInline(hm[2]) + '</h' + hm[1].length + '>'); }
-    else if (ulm) { if (inBlock) flush(); if (list !== 'ul') { if (list) flush(); list = 'ul'; } buf.push(ulm[1]); }
-    else if (olm) { if (inBlock) flush(); if (list !== 'ol') { if (list) flush(); list = 'ol'; } buf.push(olm[1]); }
-    else if (qm) { if (list) flush(); if (inBlock !== 'bq') { if (inBlock) flush(); inBlock = 'bq'; } buf.push(qm[1]); }
-    else if (/^\s*$/.test(raw)) flush();
-    else if (/^---+$/.test(raw)) { flush(); out.push('<hr>'); }
-    else { if (list) flush(); if (!inBlock) inBlock = 'p'; buf.push(raw); }
+    if (/^\s*$/.test(raw)) { flushAll(); continue; }
+    if (raw.trim().startsWith('\x00B') && raw.trim().endsWith('\x00')) { flushAll(); out.push(raw.trim()); continue; }
+    if (/^\s*([-*_]\s*){3,}$/.test(raw)) { flushAll(); out.push('<hr>'); continue; }
+    const tableMatch = raw.match(/^\s*\|(.+)\|\s*$/);
+    if (tableMatch) {
+      flushBuf(); flushBq(); closeLists(-1); inTable = true; tableRows.push(tableMatch[0].trim()); continue;
+    } else if (inTable) {
+      flushTable();
+    }
+    const hm = raw.match(/^(#{1,6})\s+(.*)$/);
+    if (hm) {
+      flushAll();
+      const level = hm[1].length;
+      out.push('<h' + level + '>' + mdInline(hm[2].trim()) + '</h' + level + '>');
+      continue;
+    }
+    const qm = raw.match(/^\s*(?:>|&gt;)\s?(.*)$/);
+    if (qm) {
+      flushBuf(); closeLists(-1); inBq = true; bqBuf.push(qm[1]); continue;
+    } else if (inBq) {
+      flushBq();
+    }
+    const ulm = raw.match(/^(\s*)([-*+])\s+(.*)$/);
+    const olm = raw.match(/^(\s*)(\d+)[.)]\s+(.*)$/);
+    if (ulm || olm) {
+      flushBuf();
+      const isUl = !!ulm;
+      const indent = (ulm ? ulm[1] : olm[1]).length;
+      let content = (ulm ? ulm[3] : olm[3]).trim();
+      const listType = isUl ? 'ul' : 'ol';
+      const taskM = content.match(/^\[([ xX])\]\s+(.*)$/);
+      let isTask = false;
+      if (taskM) {
+        isTask = true;
+        const checked = taskM[1] !== ' ' ? ' checked' : '';
+        content = '<input type="checkbox" disabled' + checked + '><span>' + mdInline(taskM[2]) + '</span>';
+      } else {
+        content = mdInline(content);
+      }
+      if (!listStack.length || indent > listStack[listStack.length - 1].indent) {
+        listStack.push({ type: listType, indent: indent });
+        out.push(listType === 'ul' ? '<ul>' : '<ol>');
+      } else if (indent < listStack[listStack.length - 1].indent) {
+        closeLists(indent);
+        if (!listStack.length || listStack[listStack.length - 1].indent !== indent) {
+          listStack.push({ type: listType, indent: indent });
+          out.push(listType === 'ul' ? '<ul>' : '<ol>');
+        }
+      } else if (listStack[listStack.length - 1].type !== listType) {
+        out.push(listStack.pop().type === 'ul' ? '</ul>' : '</ol>');
+        listStack.push({ type: listType, indent: indent });
+        out.push(listType === 'ul' ? '<ul>' : '<ol>');
+      }
+      out.push(isTask ? '<li class="task-item">' + content + '</li>' : '<li>' + content + '</li>');
+      continue;
+    } else if (listStack.length) {
+      const leadIndent = (raw.match(/^(\s*)/) || [''])[0].length;
+      if (leadIndent > listStack[listStack.length - 1].indent) {
+        out.push('<div style="padding-left:18px;">' + mdInline(raw.trim()) + '</div>');
+        continue;
+      } else {
+        closeLists(-1);
+      }
+    }
+    buf.push(raw);
   }
-  flush();
+  flushAll();
   return out.join('').replace(/\x00B(\d+)\x00/g, (_, i) => {
     const b = blocks[+i]; const langLabel = b.lang ? '<span class="lang">' + esc(b.lang) + '</span>' : '';
     return '<pre>' + langLabel + '<button class="copy-btn" onclick="copyCode(this)">copy</button><code>' + b.code + '</code></pre>';
@@ -676,8 +796,7 @@ function appendMsgEl(m, idx) {
   const av = document.createElement('div'); av.className = 'avatar'; av.textContent = m.role === 'assistant' ? 'S' : 'U';
   const body = document.createElement('div'); body.className = 'msg-body';
   const bubble = document.createElement('div'); bubble.className = 'bubble';
-  if (m.role === 'assistant') { bubble.innerHTML = m.content ? renderMd(m.content) : ''; }
-  else bubble.textContent = m.content;
+  bubble.innerHTML = m.content ? renderMd(m.content) : '';
   body.appendChild(bubble);
   if (m.meta && m.meta.length) { const meta = document.createElement('div'); meta.className = 'msg-meta'; m.meta.forEach(t => { const s = document.createElement('span'); s.className = 'tag'; s.textContent = t; meta.appendChild(s); }); body.appendChild(meta); }
   if (m.trace) { const tb = document.createElement('div'); tb.className = 'trace-box'; tb.innerHTML = '<button>trace</button><pre>' + esc(JSON.stringify(m.trace, null, 2)) + '</pre>'; tb.querySelector('button').addEventListener('click', () => { const pre = tb.querySelector('pre'); const show = pre.style.display === 'none'; pre.style.display = show ? 'block' : 'none'; tb.querySelector('button').textContent = show ? 'hide' : 'trace'; }); body.appendChild(tb); }

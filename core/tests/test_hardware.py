@@ -20,6 +20,7 @@ def test_scanner_returns_profile(temp_paths, container):
 
 def test_scan_is_independent_of_router(temp_paths):
     # The scanner must not import/require routing concepts.
-    import synapse.hardware  # noqa: F401
+    import synapse.hardware
 
-    assert "router" not in [f.name for f in (__import__("pathlib").Path("src/synapse/hardware").iterdir())]
+    hw_dir = __import__("pathlib").Path(synapse.hardware.__file__).parent
+    assert "router" not in [f.name for f in hw_dir.iterdir()]

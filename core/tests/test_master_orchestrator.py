@@ -70,7 +70,7 @@ class ScriptedProvider(ModelProvider):
         pass
 
     def list_models(self) -> list[ModelDescriptor]:
-        return [ModelDescriptor(id="qwen2.5:3b", provider_id=self.provider_id)]
+        return [ModelDescriptor(id="gemma3:4b", provider_id=self.provider_id)]
 
     def to_metadata(self, descriptor: ModelDescriptor) -> ModelMetadata | None:
         return None
@@ -150,13 +150,13 @@ def _make_orchestrator(
     provider: ScriptedProvider,
     *,
     models: list[ModelMetadata] | None = None,
-    available_gb: float = 16.0,
+    available_gb: float = 8.0,
     fallback: FallbackStub | None = None,
     **kwargs,
 ):
     return AIMasterOrchestrator(
         providers=FakeManager(provider),
-        registry=FakeRegistry(models if models is not None else [_model("qwen2.5:3b")]),
+        registry=FakeRegistry(models if models is not None else [_model("gemma3:4b")]),
         hardware=FakeHardware(available_gb),
         config=None,  # type: ignore[arg-type] - defaults suffice
         fallback_planner=fallback,
@@ -169,13 +169,13 @@ def _make_orchestrator(
 
 def test_valid_plan_produces_dag_and_picks_tier_model():
     provider = ScriptedProvider([json.dumps(_GOOD_PLAN)])
-    orch = _make_orchestrator(provider, available_gb=16.0)
+    orch = _make_orchestrator(provider, available_gb=8.0)
     intent, complexity, privacy = _results()
     dag = orch.plan("fix this bug in main.py and write an email", intent, complexity, privacy, DECISION)
 
     assert orch.used_ai is True
     assert orch.last_tier.value == "tier2"
-    assert orch.last_model == "qwen2.5:3b"
+    assert orch.last_model == "gemma3:4b"
     ids = [t.id for t in dag.tasks]
     assert ids == ["t1", "t2", "t-synthesis"]
     assert dag.get("t2").depends_on == ["t1"]
@@ -193,8 +193,8 @@ def test_schema_passed_as_structured_output_and_system_prompt_used():
     system = request.messages[0]
     assert system.role == "system"
     assert "Master AI Orchestrator" in system.content
-    assert "Do not solve the prompt" in system.content
-    assert request.messages[1].content.startswith("Decompose the following user prompt")
+    assert "NEVER directly solve" in system.content
+    assert "USER PROMPT:\nfix and email" in request.messages[1].content
     assert "fix and email" in request.messages[1].content
 
 
@@ -260,8 +260,8 @@ def test_unhealthy_provider_falls_back():
 
     orch = AIMasterOrchestrator(
         providers=UnhealthyManager(provider),
-        registry=FakeRegistry([_model("qwen2.5:3b")]),
-        hardware=FakeHardware(16.0),
+        registry=FakeRegistry([_model("gemma3:4b")]),
+        hardware=FakeHardware(8.0),
         config=None,  # type: ignore[arg-type]
         fallback_planner=FallbackStub(),
     )
@@ -281,17 +281,17 @@ def test_disabled_uses_fallback_directly():
 
 
 def test_tier_escalation_when_assigned_tier_missing():
-    # tier2 assigned (16GB) but only tier1 model installed -> tier1 selected.
+    # tier2 assigned (8GB) but only tier1 model installed -> tier1 selected.
     provider = ScriptedProvider([json.dumps(_GOOD_PLAN)])
     orch = _make_orchestrator(
         provider,
-        models=[_model("qwen2.5:1.5b")],
-        available_gb=16.0,
+        models=[_model("gemma3:1b")],
+        available_gb=8.0,
     )
     intent, complexity, privacy = _results()
     orch.plan("fix and email", intent, complexity, privacy, DECISION)
     assert orch.last_tier.value == "tier1"
-    assert orch.last_model == "qwen2.5:1.5b"
+    assert orch.last_model == "gemma3:1b"
 
 
 def test_cloud_fallback_tier_used_when_local_ram_tiny():
@@ -299,7 +299,7 @@ def test_cloud_fallback_tier_used_when_local_ram_tiny():
     orch = _make_orchestrator(
         provider,
         models=[_model("gpt-4o-mini", kind=ProviderKind.CLOUD)],
-        available_gb=4.0,
+        available_gb=0.3,
     )
     intent, complexity, privacy = _results()
     orch.plan("fix and email", intent, complexity, privacy, DECISION)
@@ -331,3 +331,70 @@ def test_extract_json_object_repairs_noise():
     assert extract_json_object("prefix {\"a\": [1,2]} suffix") == {"a": [1, 2]}
     with pytest.raises(ValueError):
         extract_json_object("no json here")
+
+
+def test_prompt_includes_dynamic_registry_and_hardware_context():
+    provider = ScriptedProvider([json.dumps(_GOOD_PLAN)])
+    meta = ModelMetadata(
+        id="qwen2.5-coder:7b",
+        provider_id="fake",
+        kind=ProviderKind.LOCAL,
+        role="Coding Specialist",
+        strengths=["Fast code", "clean syntax"],
+        weaknesses=["No vision"],
+        speed_tier="fast",
+        hardware_tier="tier2",
+        capabilities=ModelCapabilities(coding=0.9),
+    )
+    orch = _make_orchestrator(provider, models=[_model("gemma3:4b"), meta], available_gb=8.0)
+    intent, complexity, privacy = _results()
+    orch.plan("build an app", intent, complexity, privacy, DECISION)
+    prompt = provider.requests[0].messages[1].content
+    assert "SYSTEM HARDWARE CONTEXT:" in prompt
+    assert "REGISTERED SPECIALIST MODELS & TOOLS" in prompt
+    assert "qwen2.5-coder:7b" in prompt
+    assert "Strengths: Fast code; clean syntax" in prompt
+    assert "Weaknesses: No vision" in prompt
+
+
+def test_qwen_32b_guardrail_downgrades_on_tier2():
+    plan_with_32b = {
+        "execution_strategy": "SEQUENTIAL",
+        "tasks": [
+            {
+                "task_id": 1,
+                "intent": "CHAT",
+                "sub_prompt": "hello",
+                "assigned_model": "qwen2.5:32b",
+                "reasoning": "simple chat",
+                "dependencies": [],
+            }
+        ],
+    }
+    provider = ScriptedProvider([json.dumps(plan_with_32b)])
+    orch = _make_orchestrator(provider, available_gb=8.0)
+    intent, complexity, privacy = _results()
+    dag = orch.plan("hello", intent, complexity, privacy, DECISION)
+    assert dag.get("t1").preferred_model != "qwen2.5:32b"
+    assert dag.get("t1").preferred_model == "gemma3:4b"
+
+
+def test_qwen_32b_allowed_on_tier3_plus_for_deep_reasoning():
+    plan_with_32b = {
+        "execution_strategy": "SEQUENTIAL",
+        "tasks": [
+            {
+                "task_id": 1,
+                "intent": "DEEP_REASONING",
+                "sub_prompt": "prove this mathematical theorem",
+                "assigned_model": "qwen2.5:32b",
+                "reasoning": "deep mathematical theorem proof required",
+                "dependencies": [],
+            }
+        ],
+    }
+    provider = ScriptedProvider([json.dumps(plan_with_32b)])
+    orch = _make_orchestrator(provider, available_gb=36.0)
+    intent, complexity, privacy = _results()
+    dag = orch.plan("prove theorem", intent, complexity, privacy, DECISION)
+    assert dag.get("t1").preferred_model == "qwen2.5:32b"

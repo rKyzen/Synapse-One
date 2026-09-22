@@ -6,7 +6,12 @@
     "service_url": "http://localhost:11434/api/tags"
   },
   "hardware": {
-    "tier2_min_ram_gb": 8,
+    "tier2_min_available_ram_gb": 6,
+    "tier3_min_available_ram_gb": 16,
+    "tier3_min_vram_gb": 12,
+    "tier3_plus_min_available_ram_gb": 32,
+    "tier3_plus_min_vram_gb": 20,
+    "tier2_min_ram_gb": 6,
     "tier2_min_cpu_patterns": [
       "Ryzen [3579] (PRO )?[3-9]\\d{3}",
       "Ryzen (AI|Threadripper)",
@@ -17,23 +22,44 @@
   },
   "tiers": {
     "tier1": {
-      "display": "Tier 1 - Lightweight (low RAM or older CPU)",
+      "display": "Tier 1 - Lightweight (<6GB available RAM or older CPU)",
       "models": [
-        { "id": "llama3.2:1b", "role": "chat" },
-        { "id": "qwen2.5:3b", "role": "chat" },
+        { "id": "gemma3:1b", "role": "master_and_chat" },
         { "id": "qwen2.5-coder:1.5b", "role": "code" },
-        { "id": "qwen3:1.7b", "role": "chat" },
-        { "id": "all-minilm", "role": "embeddings" },
-        { "id": "moondream", "role": "vision" }
+        { "id": "qwen3:1.7b", "role": "planning" },
+        { "id": "moondream", "role": "vision" },
+        { "id": "all-minilm", "role": "embeddings" }
       ]
     },
     "tier2": {
-      "display": "Tier 2 - Standard (8GB+ RAM, modern CPU)",
+      "display": "Tier 2 - Standard (6-16GB available RAM, modern CPU)",
       "models": [
-        { "id": "llama3.1:8b", "role": "chat" },
-        { "id": "qwen2.5:7b", "role": "chat" },
+        { "id": "gemma3:4b", "role": "master_and_chat" },
         { "id": "qwen2.5-coder:7b", "role": "code" },
-        { "id": "qwen3:4b", "role": "chat" },
+        { "id": "qwen3:4b", "role": "planning" },
+        { "id": "qwen2.5:7b", "role": "technical" },
+        { "id": "qwen2.5vl:7b", "role": "vision" },
+        { "id": "nomic-embed-text", "role": "embeddings" }
+      ]
+    },
+    "tier3": {
+      "display": "Tier 3 - High-End (>=16GB available RAM or >=12GB VRAM)",
+      "models": [
+        { "id": "gemma3:4b", "role": "master" },
+        { "id": "gemma3:12b", "role": "chat_and_math" },
+        { "id": "qwen2.5-coder:14b", "role": "code" },
+        { "id": "qwen2.5:14b", "role": "agent_technical" },
+        { "id": "qwen2.5vl:7b", "role": "vision" },
+        { "id": "nomic-embed-text", "role": "embeddings" }
+      ]
+    },
+    "tier3_plus": {
+      "display": "Tier 3+ - Ultra / AI Workstation (>=32GB available RAM or >=20GB VRAM)",
+      "models": [
+        { "id": "gemma3:4b", "role": "master" },
+        { "id": "qwen2.5:32b", "role": "deep_reasoning" },
+        { "id": "qwen2.5-coder:14b", "role": "code" },
+        { "id": "qwen2.5:14b", "role": "agent_technical" },
         { "id": "qwen2.5vl:7b", "role": "vision" },
         { "id": "nomic-embed-text", "role": "embeddings" }
       ]

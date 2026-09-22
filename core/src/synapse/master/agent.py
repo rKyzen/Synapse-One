@@ -82,7 +82,7 @@ from synapse.domain.tasks import TaskDAG
 from synapse.events import EventBus, Events
 from synapse.execution import Executor, ProviderUnavailable
 from synapse.providers.manager import ProviderManager
-from synapse.router import Router as ConcreteRouter
+from synapse.master.schemas import ExecutionMode, MasterAnalysis, ReasoningComplexity
 from synapse.workspace.brief import build_workspace_brief
 from synapse.workspace.manifest import (
     MANIFEST_INSTRUCTION,
@@ -200,6 +200,12 @@ class MasterAgent:
         self._citations = citation_engine
         self._grounding = grounding_validator
 
+    def _analyze_request(self, prompt: str) -> MasterAnalysis:
+        if self._task_planner is not None and hasattr(self._task_planner, "analyze"):
+            return self._task_planner.analyze(prompt)
+        from synapse.master.orchestrator import AIMasterOrchestrator
+        return AIMasterOrchestrator._fallback_analysis(prompt, "direct fallback")
+
     # -- public entry -------------------------------------------------------
 
     def process(
@@ -227,22 +233,56 @@ class MasterAgent:
     ) -> AgentResponse:
         start = time.perf_counter()
         self._events.publish(Events.REQUEST_RECEIVED, {"prompt_length": len(prompt)})
-        # Phase 7 — every request is classified into one of the seven kinds so
-        # the execution path can be chosen before any model is consulted.
+
+        # 1. Master Model Analysis First (runs before touching workspace or tools)
+        analysis_start = time.perf_counter()
+        master_analysis: MasterAnalysis = self._analyze_request(prompt)
+        if files:
+            master_analysis.files_needed = True
+            master_analysis.workspace_needed = True
+        master_analysis_ms = (time.perf_counter() - analysis_start) * 1000
+
+        self._publish_timeline("master_analysis", "Master Model analyzing request…")
+        self._publish_timeline("intent_decision", f"Intent: {master_analysis.intent.replace('_', ' ').title()}")
+        self._publish_timeline("domain_decision", f"Domain: {master_analysis.domain.replace('_', ' ').title()}")
+        self._publish_timeline("artifact_decision", f"Artifact required: {'Yes' if master_analysis.artifact_required else 'No'}")
+        self._publish_timeline("files_decision", f"Files required: {'Yes' if master_analysis.files_needed else 'No'}")
+        self._publish_timeline("workspace_decision", f"Workspace required: {'Yes' if master_analysis.workspace_needed else 'No'}")
+        caps_label = " + ".join([c.replace("_", " ").title() for c in master_analysis.required_capabilities]) or "General"
+        self._publish_timeline("capability_decision", f"Capability: {caps_label}")
+
         kind = classify_request(prompt)
-        # AI Operating Workspace — the Intent Router gates the pipeline BEFORE
-        # any planning: conversation and question answering are answered by
-        # the selected language model directly and never touch the workspace
-        # planner, the artifact pipeline, folders, manifests, files, or JSON.
+        if master_analysis.artifact_required or master_analysis.execution_mode in (
+            ExecutionMode.ARTIFACT_GENERATION, ExecutionMode.WORKSPACE_AGENT
+        ):
+            if kind not in (
+                RequestKind.FILE_CREATION,
+                RequestKind.PROJECT_GENERATION,
+                RequestKind.FILE_MODIFICATION,
+                RequestKind.DOCUMENTATION,
+            ):
+                kind = (
+                    RequestKind.PROJECT_GENERATION
+                    if "project" in master_analysis.domain or "web" in master_analysis.domain
+                    else RequestKind.FILE_CREATION
+                )
+
         intent_kind = IntentRouter().route(prompt)
+        if master_analysis.artifact_required:
+            intent_kind = IntentKind.FILE_GENERATION
+
         log.info(
             "request_classified",
             kind=kind.value,
             intent=intent_kind.value,
+            master_intent=master_analysis.intent,
+            domain=master_analysis.domain,
+            artifact_required=master_analysis.artifact_required,
+            files_needed=master_analysis.files_needed,
+            workspace_needed=master_analysis.workspace_needed,
             prompt=prompt[:120],
         )
-        # Resolve per-project scoped workspace/memory (Phase 5), else fall back
-        # to the globally bound defaults.
+
         ws = workspace if workspace is not None else self._workspace
         mem = memory if memory is not None else self._memory
 
@@ -250,8 +290,35 @@ class MasterAgent:
         self._registry.sync(self._providers.all())
         registry_models = self._registry.all()
 
-        intent = self._intent.analyze(prompt)
+        complexity_map = {
+            ReasoningComplexity.TRIVIAL: 10,
+            ReasoningComplexity.EASY: 30,
+            ReasoningComplexity.MEDIUM: 55,
+            ReasoningComplexity.HARD: 82,
+            ReasoningComplexity.VERY_HARD: 95,
+        }
+        master_complexity_score = complexity_map.get(master_analysis.reasoning_complexity, 30)
+
         complexity = self._complexity.analyze(prompt)
+        if master_analysis.reasoning_complexity in (ReasoningComplexity.HARD, ReasoningComplexity.VERY_HARD):
+            complexity = complexity.model_copy(
+                update={"score": max(complexity.score, master_complexity_score)}
+            )
+        elif master_analysis.reasoning_complexity == ReasoningComplexity.TRIVIAL:
+            complexity = complexity.model_copy(
+                update={"score": min(complexity.score, master_complexity_score)}
+            )
+
+        intent = self._intent.analyze(prompt)
+        if master_analysis.domain in ("mathematics", "math"):
+            intent = intent.model_copy(update={"primary": IntentType.RESEARCH})
+        elif master_analysis.domain in ("logic", "reasoning", "puzzle"):
+            intent = intent.model_copy(update={"primary": IntentType.RESEARCH})
+        elif master_analysis.artifact_required or master_analysis.coding_needed:
+            intent = intent.model_copy(update={"primary": IntentType.CODING})
+        elif not master_analysis.coding_needed and intent.primary is IntentType.CODING:
+            intent = intent.model_copy(update={"primary": IntentType.CONVERSATION})
+
         privacy = self._privacy.analyze(
             prompt,
             complexity,
@@ -262,24 +329,8 @@ class MasterAgent:
         )
         self._events.publish(Events.REQUEST_ANALYZED, {"intent": intent.primary.value, "complexity": complexity.score})
 
-        # AI Operating Workspace — conversation/question answering short-circuit.
-        # Everything below (workspace prepare, decision overrides, planner,
-        # brief, Action Engine context, task DAG, file outputs, manifests,
-        # action log) is artifact-pipeline machinery and must never run for
-        # chat intents: a greeting or factual question is answered by the
-        # selected language model directly — no folders, no files, no JSON.
-        #
-        # Phase XVII — conversational wording can still be workspace intent.
-        # Inside an active project, follow-ups ("fix the bugs", "continue",
-        # "change the UI", "add search", "why isn't this working?") carry no
-        # explicit artifact, so the router alone would classify them as pure
-        # chat and answer without the planner or tools. When the wording
-        # reads as a continuation of the project work AND the workspace state
-        # proves project activity (prior conversation turns, prior recorded
-        # actions, or existing project files), the chat-only verdict is
-        # overridden and the request enters the workspace pipeline instead.
         follow_up_override = False
-        if intent_kind.is_chat_only:
+        if intent_kind.is_chat_only and not master_analysis.artifact_required and not master_analysis.files_needed:
             if (
                 is_follow_up(prompt)
                 and not _is_scratch_project(project_id)
@@ -302,10 +353,12 @@ class MasterAgent:
                     prompt, intent, complexity, privacy, hardware, registry_models,
                     model=model, temperature=temperature, max_tokens=max_tokens,
                     files=files, ws=ws, memory=mem, conversation_id=conversation_id,
-                    start=start,
+                    start=start, master_analysis=master_analysis,
+                    master_analysis_ms=master_analysis_ms, context_retrieval_ms=0.0,
                 )
         elif (
             intent_kind is IntentKind.FILE_EDITING
+            and not master_analysis.artifact_required
             and not _EXPLICIT_FILE_TARGET_RE.search(prompt)
             and (
                 _is_scratch_project(project_id)
@@ -317,33 +370,39 @@ class MasterAgent:
                 )
             )
         ):
-            # Phase XVIII — the mirror rule of follow-ups: artifact wording
-            # WITHOUT any workspace state and WITHOUT an explicit file target
-            # ("HI fix the issue") has nothing to edit — it is conversation.
-            # Forcing it into the file pipeline would pin a coding specialist
-            # for a plain conversational ask (the scratch project's generated
-            # README is not a workspace to edit). In a user-adopted project,
-            # workspace state (files, turns, actions) keeps it in the pipeline.
-            log.info(
-                "editing_wording_without_context_resolved_as_chat",
-                prompt=prompt[:120],
-            )
             intent_kind = IntentKind.QUESTION_ANSWERING
             return self._chat_direct(
                 prompt, intent, complexity, privacy, hardware, registry_models,
                 model=model, temperature=temperature, max_tokens=max_tokens,
                 files=files, ws=ws, memory=mem, conversation_id=conversation_id,
-                start=start,
+                start=start, master_analysis=master_analysis,
+                master_analysis_ms=master_analysis_ms, context_retrieval_ms=0.0,
             )
 
-        # Phase 4 — attach workspace files (vision/RAG/code scan) and build context.
+        # Context loading (strictly opt-in based on Master Analysis)
+        context_retrieval_start = time.perf_counter()
         workspace_outcome: WorkspaceOutcome | None = None
-        if ws is not None and ws.enabled:
+        if (master_analysis.workspace_needed or master_analysis.files_needed) and ws is not None and ws.enabled:
             if files:
                 self._events.publish(Events.FILE_ATTACHED, {"file_ids": files})
             context_text, workspace_outcome = ws.prepare(prompt, files)
 
         decision = self._decision.decide(intent, complexity, privacy, hardware, registry_models)
+        req_caps = list(decision.required_capabilities or [])
+        if master_analysis.domain in ("mathematics", "math") or master_analysis.reasoning_complexity in (
+            ReasoningComplexity.HARD, ReasoningComplexity.VERY_HARD
+        ):
+            if Capability.REASONING not in req_caps:
+                req_caps.append(Capability.REASONING)
+            if Capability.MATH not in req_caps and master_analysis.domain in ("mathematics", "math"):
+                req_caps.append(Capability.MATH)
+        if (master_analysis.coding_needed or master_analysis.artifact_required) and Capability.CODING not in req_caps:
+            req_caps.append(Capability.CODING)
+        if not master_analysis.coding_needed and not master_analysis.artifact_required and Capability.CODING in req_caps:
+            req_caps = [c for c in req_caps if c != Capability.CODING]
+
+        decision = decision.model_copy(update={"required_capabilities": req_caps})
+
         if workspace_outcome is not None and workspace_outcome.local_only and (
             workspace_outcome.context_chars > 0 or workspace_outcome.vision_descriptions
         ):
@@ -366,25 +425,9 @@ class MasterAgent:
         available = self._provider_available_models()
         perf_stats = self._performance.stats() if self._performance else None
 
-
-        # Phase X — the Action Engine feeds EVERY agent real filesystem
-        # context (the backend reads; the model edits). Workspace access is
-        # universal: any request kind may read and write inside the project
-        # folder, exactly like the coding agents. The context is appended to
-        # each task's description AFTER planning so it never interferes with
-        # prompt decomposition.
-        #
-        # Phase XIII — workspace-first: a compact awareness brief (project
-        # identity, path, tools, defaults, file tree, recently modified files,
-        # current chat summary) is injected into EVERY task description —
-        # including the reviewer and the final synthesis — so no model call
-        # ever forgets it is operating inside the user's project. Full file
-        # excerpts (``build_context``) are reserved for requests that actually
-        # touch the workspace (the deterministic workspace-access gate);
-        # pure-chat requests still get the brief, but not the whole tree read.
         brief = None
         context = None
-        if file_operator is not None:
+        if file_operator is not None and (master_analysis.workspace_needed or follow_up_override):
             self._publish_timeline("read_workspace", "Reading workspace…")
             brief = build_workspace_brief(
                 project_id=project_id,
@@ -395,14 +438,12 @@ class MasterAgent:
                 conversation_id=conversation_id,
             )
             if requires_workspace_access(prompt) or follow_up_override:
-                # Phase XVII — a resolved follow-up always inspects the
-                # workspace first (files + prior results), never answers on
-                # the bare message alone.
                 context = ActionEngine(file_operator).build_context(
                     on_file=lambda p: self._publish_timeline("read_file", f"Reading {p}")
                 )
+        context_retrieval_ms = (time.perf_counter() - context_retrieval_start) * 1000
 
-        dag = self._plan_tasks(prompt, intent, complexity, privacy, decision)
+        dag = self._plan_tasks(prompt, intent, complexity, privacy, decision, master_analysis=master_analysis)
         log.info(
             "task_plan",
             kind=kind.value,
@@ -442,12 +483,15 @@ class MasterAgent:
         backend_only = bool(backend_ops)
         actions: list[FileAction] = []
         validations: list[ValidationResult] = []
+        worker_inference_start = time.perf_counter()
         if backend_only:
             lines, actions = ActionEngine(file_operator).run_workspace_ops(
                 backend_ops, on_step=self._timeline_for_op
             )
             final_response = "\n".join(lines)
             graph, executed, primary_routing = ExecutionGraph(), [], None
+            worker_inference_ms = 0.0
+            tools_ms = (time.perf_counter() - worker_inference_start) * 1000
         else:
             # Execute DAG with Phase 4 quality checks
             graph, executed, primary_routing = self._execute_dag_with_quality(
@@ -455,10 +499,12 @@ class MasterAgent:
                 workspace_outcome, files, temperature=temperature, max_tokens=max_tokens,
                 workspace=ws, memory=mem, conversation_id=conversation_id,
             )
+            worker_inference_ms = (time.perf_counter() - worker_inference_start) * 1000
 
             # Phase 6/7 — apply generated files to the project workspace via
             # the Action Engine and validate them. ``actions`` drive the
             # summary block and the action log.
+            tools_start = time.perf_counter()
             if file_operator is not None:
                 actions, validations = self._apply_file_outputs(dag, executed, file_operator, kind=kind)
                 # Phase XIII — write → verify → index → remember: confirm the
@@ -470,6 +516,7 @@ class MasterAgent:
                     project_index=project_index, change_panel=change_panel,
                     diagnostics=diagnostics,
                 )
+            tools_ms = (time.perf_counter() - tools_start) * 1000
 
             # Synthesize final response (excluding raw file manifests, which
             # are replaced by the action summary).
@@ -586,13 +633,22 @@ class MasterAgent:
         self._save_memory(prompt, final_response, memory=mem, conversation_id=conversation_id)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
+        timings = {
+            "master_analysis_ms": round(master_analysis_ms, 2),
+            "context_retrieval_ms": round(context_retrieval_ms, 2),
+            "worker_inference_ms": round(worker_inference_ms, 2),
+            "tools_ms": round(tools_ms, 2),
+            "total_ms": round(elapsed_ms, 2),
+        }
         routing = primary_routing or RoutingDecision(reason="no task routed")
         if primary_routing is None and not backend_only:
             final_response = _NO_ROUTE_GUIDANCE
         self._events.publish(Events.REQUEST_ROUTED, {"provider": routing.provider_id, "model": routing.model_id})
         graph.total_latency_ms = round(elapsed_ms, 1)
         trace = self._build_trace(
-            intent, complexity, privacy, decision, routing, hardware, elapsed_ms, response=None
+            intent, complexity, privacy, decision, routing, hardware, elapsed_ms, response=None,
+            master_analysis=master_analysis,
+            timings=timings,
         )
         self._events.publish(Events.REQUEST_COMPLETED, {"latency_ms": round(elapsed_ms, 1), "tasks": len(dag.tasks)})
         log.info(
@@ -641,6 +697,9 @@ class MasterAgent:
         memory=None,
         conversation_id: str | None = None,
         start: float,
+        master_analysis: MasterAnalysis | None = None,
+        master_analysis_ms: float = 0.0,
+        context_retrieval_ms: float = 0.0,
     ) -> AgentResponse:
         """Chat-only request path (AI Operating Workspace Intent Router).
 
@@ -672,6 +731,16 @@ class MasterAgent:
                 }
             )
         decision = self._decision.decide(intent, complexity, privacy, hardware, registry_models)
+        req_caps = list(decision.required_capabilities or [])
+        if master_analysis is not None:
+            if master_analysis.domain in ("mathematics", "math") or master_analysis.reasoning_complexity in (
+                ReasoningComplexity.HARD, ReasoningComplexity.VERY_HARD
+            ):
+                if Capability.REASONING not in req_caps:
+                    req_caps.append(Capability.REASONING)
+                if Capability.MATH not in req_caps and master_analysis.domain in ("mathematics", "math"):
+                    req_caps.append(Capability.MATH)
+        decision = decision.model_copy(update={"required_capabilities": req_caps})
         # Chat never invokes the (workspace/artifact) planner: the execution
         # plan is a static empty shell so the response envelope stays complete
         # without running any planning machinery for conversation.
@@ -687,7 +756,8 @@ class MasterAgent:
         # folders/files/actions, and a failing workspace must never break chat.
         workspace_outcome = None
         chat_context = ""
-        if ws is not None and ws.enabled:
+        if (master_analysis is None or master_analysis.workspace_needed or master_analysis.files_needed) and ws is not None and ws.enabled:
+            ctx_start = time.perf_counter()
             try:
                 context_text, workspace_outcome = ws.prepare(prompt, files)
                 if context_text:
@@ -695,12 +765,14 @@ class MasterAgent:
             except Exception as exc:  # noqa: BLE001 - chat resilience is paramount
                 log.warning("chat_workspace_prepare_failed", error=str(exc)[:200])
                 workspace_outcome = None
+            context_retrieval_ms = (time.perf_counter() - ctx_start) * 1000
 
         provider_ids = sorted({m.provider_id for m in registry_models} | set(self._providers.provider_ids()))
         health = {pid: self._providers.health(pid) for pid in provider_ids}
         available = self._provider_available_models()
         perf_stats = self._performance.stats() if self._performance else None
 
+        worker_start = time.perf_counter()
         routing = self._route_chat(
             decision, hardware, registry_models, health, available,
             complexity=complexity.score, prompt=prompt, perf_stats=perf_stats,
@@ -718,15 +790,25 @@ class MasterAgent:
             self._events.publish(
                 Events.REQUEST_ROUTED, {"provider": routing.provider_id, "model": routing.model_id}
             )
+        worker_inference_ms = (time.perf_counter() - worker_start) * 1000
 
         self._save_memory(prompt, final_response, memory=memory, conversation_id=conversation_id)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
+        timings = {
+            "master_analysis_ms": round(master_analysis_ms, 2),
+            "context_retrieval_ms": round(context_retrieval_ms, 2),
+            "worker_inference_ms": round(worker_inference_ms, 2),
+            "tools_ms": 0.0,
+            "total_ms": round(elapsed_ms, 2),
+        }
         graph = ExecutionGraph()
         graph.total_latency_ms = round(elapsed_ms, 1)
         trace_routing = routing or RoutingDecision(reason="no chat route")
         trace = self._build_trace(
-            intent, complexity, privacy, decision, trace_routing, hardware, elapsed_ms, response=None
+            intent, complexity, privacy, decision, trace_routing, hardware, elapsed_ms, response=None,
+            master_analysis=master_analysis,
+            timings=timings,
         )
         self._events.publish(
             Events.REQUEST_COMPLETED, {"latency_ms": round(elapsed_ms, 1), "tasks": 0, "chat": True}
@@ -782,17 +864,37 @@ class MasterAgent:
             performance=perf_stats,
         )
 
-    def _plan_tasks(self, prompt, intent, complexity, privacy, decision) -> TaskDAG:
+    def _plan_tasks(
+        self, prompt, intent, complexity, privacy, decision, master_analysis: MasterAnalysis | None = None
+    ) -> TaskDAG:
         if self._task_planner is not None:
-            return self._task_planner.plan(prompt, intent, complexity, privacy, decision)
+            dag = self._task_planner.plan(prompt, intent, complexity, privacy, decision)
+            if master_analysis is not None and master_analysis.artifact_required:
+                file_tasks = [t for t in dag.tasks if t.file_output and t.kind != TaskKind.SYNTHESIS]
+                if not file_tasks:
+                    non_synth = [t for t in dag.tasks if t.kind != TaskKind.SYNTHESIS]
+                    if non_synth:
+                        first = non_synth[0]
+                        first.file_output = True
+                        if Capability.CODING not in first.required_capabilities:
+                            first.required_capabilities.append(Capability.CODING)
+            return dag
+
+        file_output = False
+        caps = list(decision.required_capabilities or [Capability.CHAT])
+        if master_analysis is not None and master_analysis.artifact_required:
+            file_output = True
+            if Capability.CODING not in caps:
+                caps.append(Capability.CODING)
         return TaskDAG(
             tasks=[
                 Task(
                     id="t1",
-                    kind=TaskKind.GENERAL,
+                    kind=TaskKind.CODING if (master_analysis and (master_analysis.coding_needed or master_analysis.artifact_required)) else TaskKind.GENERAL,
                     description=prompt,
-                    required_capabilities=list(decision.required_capabilities or [Capability.CHAT]),
+                    required_capabilities=caps,
                     preferred_capabilities=list(decision.preferred_capabilities),
+                    file_output=file_output,
                 )
             ]
         )
@@ -1606,15 +1708,33 @@ class MasterAgent:
 
     def _resolve_task_model(self, task: Task, registry_models, health, available):
         """Planner-level model selection: REVIEW → strongest reasoning model;
-        otherwise honor ``task.model_hint`` when available. Returns None to
-        let the router decide."""
+        otherwise honor ``task.preferred_model`` or ``task.model_hint`` when
+        available and safe. Returns None to let the router decide."""
         if task.kind == TaskKind.REVIEW:
             return self._strongest_reasoning_model(registry_models, health, available)
-        hint = task.model_hint
+        hint = task.preferred_model or task.model_hint
         if not hint:
             return None
         for m in registry_models:
-            if m.id == hint and health.get(m.provider_id) and (m.id in available.get(m.provider_id, set())):
+            avail_set = available.get(m.provider_id) or set()
+            if m.id == hint and health.get(m.provider_id) and (m.id in avail_set):
+                # Deterministic hardware safety check
+                try:
+                    hw = self._hardware.scan()
+                    avail = float(hw.memory.available_gb or 0.0)
+                    vram = float(hw.gpu.vram_gb) if hw.gpu and hw.gpu.vram_gb else 0.0
+                    # If model requires more RAM than available (and cannot fit in VRAM), reject it
+                    if m.required_ram_gb > avail and (vram <= 0 or m.required_ram_gb > vram):
+                        log.warning(
+                            "model_hint_rejected_hardware_safety",
+                            model_id=m.id,
+                            required_ram=m.required_ram_gb,
+                            available_ram=avail,
+                            vram=vram,
+                        )
+                        return None
+                except Exception:
+                    pass
                 return m
         return None
 
@@ -1629,7 +1749,8 @@ class MasterAgent:
                 continue
             if not health.get(m.provider_id):
                 continue
-            if m.id not in available.get(m.provider_id, set()):
+            avail_set = available.get(m.provider_id) or set()
+            if m.id not in avail_set:
                 continue
             if score > best_score or (score == best_score and best is not None and m.id < best.id):
                 best = m
@@ -1717,6 +1838,8 @@ class MasterAgent:
         hardware,
         elapsed_ms: float,
         response: ChatResponse | None,
+        master_analysis: MasterAnalysis | None = None,
+        timings: dict[str, float] | None = None,
     ) -> DecisionTrace:
         return DecisionTrace(
             intent=intent.primary,
@@ -1744,4 +1867,9 @@ class MasterAgent:
             complexity_reasoning=complexity.reasoning,
             privacy_reasoning=privacy.reasoning,
             hardware_reasoning=decision.reasoning,
+            master_analysis=master_analysis.model_dump() if master_analysis else None,
+            workspace_needed=master_analysis.workspace_needed if master_analysis else None,
+            reasoning_complexity=master_analysis.reasoning_complexity.value if master_analysis else None,
+            domain=master_analysis.domain if master_analysis else None,
+            timings=timings or {},
         )

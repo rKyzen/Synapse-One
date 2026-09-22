@@ -48,16 +48,19 @@ max_retries = 1
 max_tasks = 8
 
 [master_agent.tiers]
-tier1 = ["qwen2.5:1.5b", "llama3.2:1b"]
-tier2 = ["qwen2.5:3b", "llama3.2:3b"]
-tier3 = ["qwen2.5:7b", "llama3.1:8b"]
+tier1 = ["gemma3:1b"]
+tier2 = ["gemma3:4b"]
+tier3 = ["gemma3:4b"]
+tier3_plus = ["gemma3:4b"]
 cloud = ["gpt-4o-mini", "gemini-2.5-flash"]
 
 [master_agent.resolver]
-tier2_min_ram_gb = 12.0
-tier3_min_ram_gb = 24.0
-tier3_min_vram_gb = 8.0
-cloud_max_ram_gb = 6.0
+tier2_min_ram_gb = 6.0
+tier3_min_ram_gb = 16.0
+tier3_min_vram_gb = 12.0
+tier3_plus_min_ram_gb = 32.0
+tier3_plus_min_vram_gb = 20.0
+cloud_max_ram_gb = 0.5
 
 # Workspace Memory — scoped (conversation/project/global) semantic memory.
 #   embedding_model : model used for embeddings (must be installed in Ollama)
@@ -148,7 +151,7 @@ enabled = true
 base_url = "http://localhost:11434"
 # Installed per hardware tier by SetupModels.bat (see models.json). When this
 # model is not installed the provider falls back to the first installed model.
-default_model = "qwen2.5:3b"
+default_model = "gemma3:4b"
 
 # Timeouts (seconds). Local CPU inference is slow — generous defaults.
 #   connect    : time to establish the TCP connection
@@ -185,182 +188,356 @@ default_model = "gemini-1.5-flash"
 # name-based defaults. Either hardware tier therefore routes correctly.
 # ---------------------------------------------------------------------------
 
-# General chat specialist — the everyday model.
-[models."qwen2.5:3b"]
+# ---------------------------------------------------------------------------
+# Tier 1 Specialists (< 6 GB Available RAM)
+# ---------------------------------------------------------------------------
+
+# Master Model (Tier 1) / General Chat & Math
+[models."gemma3:1b"]
 provider = "ollama"
 kind = "local"
-display_name = "Qwen 2.5 3B (general chat)"
+display_name = "Gemma 3 1B"
+role = "Master Model (Tier 1) / General Chat & Math"
+strengths = ["Fast routing and decomposition", "clean instruction following", "basic math and reasoning"]
+weaknesses = ["Complex multi-step code synthesis", "deep architectural reasoning"]
+speed_tier = "fast"
+hardware_tier = "tier1"
+modalities = ["text"]
+tools_supported = false
 context_window = 32768
-required_ram_gb = 2
+required_ram_gb = 1.0
 latency = "fast"
 privacy_score = 1.0
-priority = 90
-preferred_tasks = ["chat", "writing", "translation", "summaries", "light reasoning"]
-capabilities = { chat = 1.0, writing = 0.95, translation = 0.9, planning = 0.75, reasoning = 0.7, coding = 0.4, math = 0.6, vision = false, tools = false }
+priority = 85
+preferred_tasks = ["planning", "chat", "writing", "math", "reasoning"]
+capabilities = { chat = 0.9, math = 0.85, reasoning = 0.75, planning = 0.7, writing = 0.8, coding = 0.4, vision = false, tools = false }
 
-# ---------------------------------------------------------------------------
-# Tier 1 (low RAM / older CPU) specialists — installed only on Tier 1
-# machines by SetupModels.bat. Routed exactly like the Tier 2 profiles;
-# harmless on machines that never install them.
-# ---------------------------------------------------------------------------
-
-# Small chat specialist (Tier 1).
-[models."llama3.2:1b"]
-provider = "ollama"
-kind = "local"
-display_name = "Llama 3.2 1B (light chat)"
-context_window = 131072
-required_ram_gb = 2
-latency = "fast"
-privacy_score = 1.0
-priority = 70
-preferred_tasks = ["chat", "writing", "summaries", "translation"]
-capabilities = { chat = 0.85, writing = 0.7, translation = 0.7, planning = 0.5, reasoning = 0.45, coding = 0.4, math = 0.4, vision = false, tools = false }
-
-# Lightweight coding specialist (Tier 1).
+# Coding Specialist (Tier 1)
 [models."qwen2.5-coder:1.5b"]
 provider = "ollama"
 kind = "local"
-display_name = "Qwen 2.5 Coder 1.5B (light coding)"
+display_name = "Qwen 2.5 Coder 1.5B"
+role = "Coding Specialist (Tier 1)"
+strengths = ["Fast code completion", "syntax fixes", "lightweight scripting"]
+weaknesses = ["Large-scale architecture", "complex algorithmic proofs"]
+speed_tier = "fast"
+hardware_tier = "tier1"
+modalities = ["text"]
+tools_supported = true
 context_window = 32768
-required_ram_gb = 1
+required_ram_gb = 1.5
 latency = "fast"
 privacy_score = 1.0
 priority = 85
 preferred_tasks = ["coding", "debugging", "json", "function calling"]
-capabilities = { coding = 0.9, debugging = 0.85, architecture = 0.6, reasoning = 0.6, writing = 0.4, math = 0.5, json_capability = 0.9, terminal = 0.6, chat = 0.5, vision = false, tools = true }
+capabilities = { coding = 0.88, debugging = 0.85, architecture = 0.6, reasoning = 0.6, writing = 0.4, math = 0.5, json_capability = 0.9, terminal = 0.6, chat = 0.5, vision = false, tools = true }
 
-# Lightweight Qwen3 chat/reasoning specialist (Tier 1).
+# Agent Planning Specialist (Tier 1)
 [models."qwen3:1.7b"]
 provider = "ollama"
 kind = "local"
-display_name = "Qwen3 1.7B (light chat)"
+display_name = "Qwen3 1.7B"
+role = "Agent Planning Specialist (Tier 1)"
+strengths = ["Fast multi-step subtask decomposition", "concise execution planning"]
+weaknesses = ["Heavy code generation", "deep mathematical proofs"]
+speed_tier = "fast"
+hardware_tier = "tier1"
+modalities = ["text"]
+tools_supported = true
 context_window = 40960
-required_ram_gb = 2
+required_ram_gb = 1.5
 latency = "fast"
 privacy_score = 1.0
 priority = 80
-preferred_tasks = ["chat", "writing", "reasoning", "summaries"]
-capabilities = { chat = 0.95, writing = 0.8, translation = 0.8, planning = 0.6, reasoning = 0.65, coding = 0.5, math = 0.6, vision = false, tools = false }
+preferred_tasks = ["planning", "reasoning", "chat", "writing"]
+capabilities = { planning = 0.88, reasoning = 0.75, chat = 0.8, writing = 0.7, coding = 0.5, math = 0.6, vision = false, tools = true }
 
-# Lightweight embeddings specialist (Tier 1).
-[models."all-minilm"]
-provider = "ollama"
-kind = "local"
-display_name = "All-MiniLM (embeddings)"
-context_window = 4096
-required_ram_gb = 1
-latency = "fast"
-privacy_score = 1.0
-priority = 10
-preferred_tasks = ["embeddings", "semantic search", "memory retrieval"]
-capabilities = { embeddings = 1.0, chat = 0.0, writing = 0.0, coding = 0.0, reasoning = 0.0, math = 0.0, vision = false, tools = false }
-
-# Lightweight vision specialist (Tier 1).
+# Vision Specialist (Tier 1)
 [models."moondream"]
 provider = "ollama"
 kind = "local"
-display_name = "Moondream (vision)"
+display_name = "Moondream"
+role = "Vision Specialist (Tier 1)"
+strengths = ["Ultra-lightweight image understanding", "fast visual question answering"]
+weaknesses = ["Limited high-resolution OCR", "no complex coding or text reasoning"]
+speed_tier = "fast"
+hardware_tier = "tier1"
+modalities = ["text", "image"]
+tools_supported = false
 context_window = 2048
-required_ram_gb = 2
+required_ram_gb = 1.5
 latency = "fast"
 privacy_score = 1.0
 priority = 80
 preferred_tasks = ["vision", "ocr", "image analysis"]
-capabilities = { vision = true, ocr = 0.8, pdf = 0.5, chat = 0.5, coding = 0.1, reasoning = 0.3, writing = 0.4, math = 0.2, tools = false }
+capabilities = { vision = true, ocr = 0.75, pdf = 0.5, chat = 0.5, coding = 0.1, reasoning = 0.3, writing = 0.4, math = 0.2, tools = false }
 
-# Tier 2 chat specialist — hybrid thinking/non-thinking Qwen3.
-[models."qwen3:4b"]
+# Embeddings Specialist (Tier 1)
+[models."all-minilm"]
 provider = "ollama"
 kind = "local"
-display_name = "Qwen3 4B (chat)"
-context_window = 40960
-required_ram_gb = 6
-latency = "fast"
-privacy_score = 1.0
-priority = 88
-preferred_tasks = ["chat", "writing", "reasoning", "translation", "summaries"]
-capabilities = { chat = 1.0, writing = 0.9, translation = 0.85, planning = 0.7, reasoning = 0.8, coding = 0.6, math = 0.7, vision = false, tools = true }
-
-# Coding specialist.
-[models."qwen2.5-coder:7b"]
-provider = "ollama"
-kind = "local"
-display_name = "Qwen 2.5 Coder 7B"
-context_window = 32768
-required_ram_gb = 8
-latency = "medium"
-privacy_score = 1.0
-priority = 95
-preferred_tasks = ["coding", "debugging", "algorithms", "architecture", "terminal", "json", "function calling"]
-capabilities = { coding = 1.0, debugging = 1.0, architecture = 0.95, reasoning = 0.8, writing = 0.4, math = 0.6, json_capability = 1.0, terminal = 0.7, chat = 0.5, vision = false, tools = true }
-
-# Long reasoning / research specialist.
-[models."llama3.1:8b"]
-provider = "ollama"
-kind = "local"
-display_name = "Llama 3.1 8B (reasoning)"
-context_window = 131072
-required_ram_gb = 8
-latency = "medium"
-privacy_score = 1.0
-priority = 85
-preferred_tasks = ["planning", "reasoning", "research", "math", "long-form analysis"]
-capabilities = { reasoning = 1.0, planning = 1.0, math = 0.9, coding = 0.7, writing = 0.75, chat = 0.6, translation = 0.6, vision = false, tools = false }
-
-# Vision specialist — excluded (zero score) for text-only tasks.
-[models."qwen2.5vl:7b"]
-provider = "ollama"
-kind = "local"
-display_name = "Qwen 2.5 VL 7B (vision)"
-context_window = 32768
-required_ram_gb = 8
-latency = "medium"
-privacy_score = 1.0
-priority = 80
-preferred_tasks = ["vision", "ocr", "pdfs", "screenshots", "image analysis"]
-capabilities = { vision = true, ocr = 1.0, pdf = 1.0, chat = 0.6, coding = 0.25, reasoning = 0.5, writing = 0.5, math = 0.4, tools = false }
-
-# Embeddings specialist — can never serve text generation (chat = 0).
-[models."nomic-embed-text"]
-provider = "ollama"
-kind = "local"
-display_name = "Nomic Embed Text"
-context_window = 8192
-required_ram_gb = 1
+display_name = "All-MiniLM"
+role = "Embeddings Specialist (Tier 1)"
+strengths = ["Minimal RAM usage", "fast CPU vector encoding"]
+weaknesses = ["Cannot generate text"]
+speed_tier = "fast"
+hardware_tier = "tier1"
+modalities = ["text"]
+tools_supported = false
+context_window = 4096
+required_ram_gb = 0.5
 latency = "fast"
 privacy_score = 1.0
 priority = 10
 preferred_tasks = ["embeddings", "semantic search", "memory retrieval"]
 capabilities = { embeddings = 1.0, chat = 0.0, writing = 0.0, coding = 0.0, reasoning = 0.0, math = 0.0, vision = false, tools = false }
 
-# Legacy catalog entries (kept for reference; discover-based sync adds more).
-[models."llama3.2"]
+# ---------------------------------------------------------------------------
+# Tier 2 Specialists (6 - 16 GB Available RAM)
+# ---------------------------------------------------------------------------
+
+# Master Model (Tier 2/3/3+) / General Chat & Math
+[models."gemma3:4b"]
 provider = "ollama"
 kind = "local"
-display_name = "Meta Llama 3.2 3B"
-context_window = 131072
-required_ram_gb = 4
+display_name = "Gemma 3 4B"
+role = "Master Model (Tier 2/3/3+) / General Chat & Math"
+strengths = ["Strong structured planning and JSON routing", "math reasoning", "general conversation", "high speed"]
+weaknesses = ["Massive codebase refactoring", "very deep multi-system analysis"]
+speed_tier = "fast"
+hardware_tier = "tier2"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 4.0
 latency = "fast"
 privacy_score = 1.0
-capabilities = { chat = 0.8, reasoning = 0.5, coding = 0.5, writing = 0.6, math = 0.5, vision = false }
+priority = 92
+preferred_tasks = ["planning", "chat", "math", "reasoning", "writing"]
+capabilities = { chat = 0.95, math = 0.9, reasoning = 0.88, planning = 0.9, writing = 0.9, coding = 0.65, vision = false, tools = true }
+
+# Coding Specialist (Tier 2)
+[models."qwen2.5-coder:7b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 Coder 7B"
+role = "Coding Specialist (Tier 2)"
+strengths = ["Professional code generation", "debugging", "API integration", "refactoring"]
+weaknesses = ["Non-coding creative writing"]
+speed_tier = "medium"
+hardware_tier = "tier2"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 6.0
+latency = "medium"
+privacy_score = 1.0
+priority = 95
+preferred_tasks = ["coding", "debugging", "algorithms", "architecture", "terminal", "json", "function calling"]
+capabilities = { coding = 1.0, debugging = 1.0, architecture = 0.95, reasoning = 0.8, writing = 0.4, math = 0.6, json_capability = 0.95, terminal = 0.8, chat = 0.5, vision = false, tools = true }
+
+# Agent Planning Specialist (Tier 2)
+[models."qwen3:4b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen3 4B"
+role = "Agent Planning Specialist (Tier 2)"
+strengths = ["Strong structured workflow execution", "agentic tool coordination"]
+weaknesses = ["Complex kernel-level code implementation"]
+speed_tier = "fast"
+hardware_tier = "tier2"
+modalities = ["text"]
+tools_supported = true
+context_window = 40960
+required_ram_gb = 4.0
+latency = "fast"
+privacy_score = 1.0
+priority = 88
+preferred_tasks = ["planning", "reasoning", "chat", "writing", "translation"]
+capabilities = { planning = 0.95, reasoning = 0.88, chat = 0.9, writing = 0.85, coding = 0.65, math = 0.75, vision = false, tools = true }
+
+# Technical & Multilingual Specialist (Tier 2)
+[models."qwen2.5:7b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 7B"
+role = "Technical & Multilingual Specialist (Tier 2)"
+strengths = ["Technical explanations", "cross-lingual queries", "detailed summaries"]
+weaknesses = ["Very high latency on low-end CPUs"]
+speed_tier = "medium"
+hardware_tier = "tier2"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 6.0
+latency = "medium"
+privacy_score = 1.0
+priority = 88
+preferred_tasks = ["chat", "writing", "translation", "summaries", "technical explanation"]
+capabilities = { chat = 0.9, writing = 0.92, translation = 0.95, planning = 0.82, reasoning = 0.85, coding = 0.7, math = 0.75, vision = false, tools = true }
+
+# Vision Specialist (Tier 2, Tier 3, Tier 3+)
+[models."qwen2.5vl:7b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 VL 7B"
+role = "Vision Specialist (Tier 2, Tier 3, Tier 3+)"
+strengths = ["Document understanding", "diagram and UI parsing", "dense OCR", "multimodal reasoning"]
+weaknesses = ["Requires ~8 GB RAM"]
+speed_tier = "medium"
+hardware_tier = "tier2"
+modalities = ["text", "image"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 8.0
+latency = "medium"
+privacy_score = 1.0
+priority = 80
+preferred_tasks = ["vision", "ocr", "pdfs", "screenshots", "image analysis"]
+capabilities = { vision = true, ocr = 1.0, pdf = 1.0, chat = 0.7, coding = 0.3, reasoning = 0.6, writing = 0.6, math = 0.5, tools = true }
+
+# Embeddings Specialist (Tier 2, Tier 3, Tier 3+)
+[models."nomic-embed-text"]
+provider = "ollama"
+kind = "local"
+display_name = "Nomic Embed Text"
+role = "Embeddings Specialist (Tier 2, Tier 3, Tier 3+)"
+strengths = ["High retrieval precision", "8k context length for dense documents"]
+weaknesses = ["Cannot generate text"]
+speed_tier = "fast"
+hardware_tier = "tier2"
+modalities = ["text"]
+tools_supported = false
+context_window = 8192
+required_ram_gb = 1.0
+latency = "fast"
+privacy_score = 1.0
+priority = 10
+preferred_tasks = ["embeddings", "semantic search", "memory retrieval"]
+capabilities = { embeddings = 1.0, chat = 0.0, writing = 0.0, coding = 0.0, reasoning = 0.0, math = 0.0, vision = false, tools = false }
+
+# ---------------------------------------------------------------------------
+# Tier 3 Specialists (>= 16 GB Available RAM or >= 12 GB VRAM)
+# ---------------------------------------------------------------------------
+
+# Chat & Math/Reasoning (Tier 3)
+[models."gemma3:12b"]
+provider = "ollama"
+kind = "local"
+display_name = "Gemma 3 12B"
+role = "General Chat & Math/Reasoning (Tier 3)"
+strengths = ["Advanced reasoning", "deep math problem solving", "nuanced dialogue and analysis"]
+weaknesses = ["Higher memory footprint than 4B", "moderate latency on CPU"]
+speed_tier = "medium"
+hardware_tier = "tier3"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 10.0
+latency = "medium"
+privacy_score = 1.0
+priority = 96
+preferred_tasks = ["chat", "math", "reasoning", "planning", "writing", "analysis"]
+capabilities = { chat = 1.0, math = 0.95, reasoning = 0.95, planning = 0.92, writing = 0.95, coding = 0.75, vision = false, tools = true }
+
+# Advanced Coding Specialist (Tier 3 & Tier 3+)
+[models."qwen2.5-coder:14b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 Coder 14B"
+role = "Advanced Coding Specialist (Tier 3 & Tier 3+)"
+strengths = ["Enterprise-grade software engineering", "full-stack architecture", "advanced refactoring"]
+weaknesses = ["High RAM/VRAM footprint (~14 GB)"]
+speed_tier = "medium"
+hardware_tier = "tier3"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 14.0
+latency = "medium"
+privacy_score = 1.0
+priority = 98
+preferred_tasks = ["coding", "debugging", "algorithms", "architecture", "terminal", "json", "function calling"]
+capabilities = { coding = 1.0, debugging = 1.0, architecture = 1.0, reasoning = 0.92, writing = 0.6, math = 0.82, json_capability = 1.0, terminal = 0.95, chat = 0.7, vision = false, tools = true }
+
+# Agent & Technical Specialist (Tier 3)
+[models."qwen2.5:14b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 14B"
+role = "Agent & Technical Specialist (Tier 3)"
+strengths = ["Complex multi-stage orchestration", "deep technical synthesis", "multilingual"]
+weaknesses = ["Heavy resource consumption"]
+speed_tier = "medium"
+hardware_tier = "tier3"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 14.0
+latency = "medium"
+privacy_score = 1.0
+priority = 96
+preferred_tasks = ["chat", "writing", "translation", "planning", "reasoning", "summaries", "analysis"]
+capabilities = { chat = 1.0, writing = 1.0, translation = 0.98, planning = 0.95, reasoning = 0.95, coding = 0.85, math = 0.9, vision = false, tools = true }
+
+# ---------------------------------------------------------------------------
+# Tier 3+ Specialists (>= 32 GB Available RAM or >= 20 GB VRAM)
+# ---------------------------------------------------------------------------
+
+# Deep Reasoning Specialist (Tier 3+ Strictly On-Demand)
+[models."qwen2.5:32b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 32B"
+role = "Deep Reasoning Specialist (Tier 3+ Strictly On-Demand)"
+strengths = ["Ph.D.-level logical proofs", "exhaustive architectural verification", "deep reasoning"]
+weaknesses = ["Requires >=32 GB RAM/VRAM", "high latency", "must never be used for casual tasks"]
+speed_tier = "slow"
+hardware_tier = "tier3_plus"
+modalities = ["text"]
+tools_supported = true
+context_window = 32768
+required_ram_gb = 24.0
+latency = "slow"
+privacy_score = 1.0
+priority = 99
+preferred_tasks = ["reasoning", "planning", "math", "long-form analysis", "architecture"]
+capabilities = { reasoning = 1.0, planning = 1.0, math = 1.0, coding = 0.92, writing = 0.95, chat = 0.9, translation = 0.92, vision = false, tools = true }
+
+# ---------------------------------------------------------------------------
+# Cloud Fallbacks
+# ---------------------------------------------------------------------------
 
 [models."gpt-4o-mini"]
 provider = "openai"
 kind = "cloud"
 display_name = "GPT-4o mini"
+role = "Cloud Fallback (OpenAI)"
+strengths = ["Broad capability", "fast response", "large context"]
+weaknesses = ["Non-local", "cloud API key required"]
+speed_tier = "fast"
+hardware_tier = "cloud"
+modalities = ["text", "image"]
+tools_supported = true
 context_window = 128000
 estimated_cost_per_1k = 0.00015
 latency = "fast"
 privacy_score = 0.0
 capabilities = { chat = 1.0, reasoning = 0.85, coding = 0.85, writing = 0.9, math = 0.8, translation = 0.9, planning = 0.8, vision = true, tools = true }
 
-[models."gemini-1.5-flash"]
+[models."gemini-2.5-flash"]
 provider = "gemini"
 kind = "cloud"
-display_name = "Gemini 1.5 Flash"
+display_name = "Gemini 2.5 Flash"
+role = "Cloud Fallback (Google)"
+strengths = ["Massive context window", "multimodal", "fast reasoning"]
+weaknesses = ["Non-local", "cloud API key required"]
+speed_tier = "fast"
+hardware_tier = "cloud"
+modalities = ["text", "image"]
+tools_supported = true
 context_window = 1000000
 estimated_cost_per_1k = 0.000075
 latency = "fast"
 privacy_score = 0.0
-capabilities = { chat = 1.0, reasoning = 0.8, coding = 0.8, writing = 0.85, math = 0.8, translation = 0.85, planning = 0.75, vision = true, tools = true }
+capabilities = { chat = 1.0, reasoning = 0.85, coding = 0.85, writing = 0.9, math = 0.85, translation = 0.9, planning = 0.85, vision = true, tools = true }
