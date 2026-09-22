@@ -3,6 +3,9 @@
 Produces an immutable HardwareProfile. Contains NO routing/heuristic logic —
 the router consumes this profile later. Uses psutil with graceful fallbacks so
 a scanner never crashes on an unusual machine.
+
+The tier resolver (Master Agent model role) is also exported here: it is pure
+hardware knowledge — no providers, no models beyond configured candidates.
 """
 
 from __future__ import annotations
@@ -23,6 +26,14 @@ from synapse.domain.hardware import (
     RecommendedModelLimits,
     StorageInfo,
 )
+from synapse.hardware.tier_resolver import HardwareTier, TierAssignment, TierResolver
+
+__all__ = [
+    "HardwareScanner",
+    "HardwareTier",
+    "TierAssignment",
+    "TierResolver",
+]
 
 
 def _recommend(memory: MemoryInfo) -> RecommendedModelLimits:

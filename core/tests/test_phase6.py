@@ -388,6 +388,28 @@ class TestFileOperator:
     def test_read_missing(self, operator: FileOperator):
         assert operator.read("nope.txt") is None
 
+    def test_read_utf16_fallback(self, operator: FileOperator):
+        # Write a file with UTF-16 LE BOM (0xFF 0xFE) — the exact byte
+        # pattern that caused the 'utf-8 codec can't decode byte 0xff' crash.
+        path = operator.root / "bad.txt"
+        path.write_bytes(b"\xff\xfe\x00\x04\xe7\x00\x00\x04")  # UTF-16 LE
+        result = operator.read("bad.txt")
+        assert result is not None
+        assert isinstance(result, str)
+
+    def test_read_latin1_fallback(self, operator: FileOperator):
+        path = operator.root / "latin1.txt"
+        path.write_bytes(b"\xe9\xe8\xea")  # latin-1 encoded e-accents
+        result = operator.read("latin1.txt")
+        assert result == "\xe9\xe8\xea"
+
+    def test_read_replace_fallback(self, operator: FileOperator):
+        path = operator.root / "garbage.bin"
+        path.write_bytes(bytes(range(256)))
+        result = operator.read("garbage.bin")
+        assert result is not None
+        assert isinstance(result, str)
+
     def test_rename(self, operator: FileOperator):
         operator.write("old.txt", "data")
         result = operator.rename("old.txt", "new.txt")
@@ -656,19 +678,20 @@ class TestEndToEnd:
         assert {"index.html", "style.css"} <= paths  # README.md is the seed file
         assert len(paths) == 3
 
-    def test_chat_agent_can_write_when_model_emits_manifest(self, client):
-        # Phase X universal workspace tool — chat requests now carry the
-        # workspace context, and any agent that answers with a manifest gets
-        # those files written. (The fake reacts to the injected README.md
-        # listing with a manifest, so the file lands in the workspace.)
+    def test_chat_agent_never_writes_even_when_model_emits_manifest(self, client):
+        # Intent Router separation: a chat/QA prompt ("explain the weather") is
+        # answered by the model directly and must NEVER create files — even if
+        # the model output happens to look like a manifest. Workspace changes
+        # require an explicit work intent (create/build/write/generate/...).
         c, _ = client
         pid = c.post("/projects", json={"name": "Prose"}).json()["id"]
         resp = c.post("/request", json={"prompt": "explain the weather", "project_id": pid})
         assert resp.status_code == 200
         body = resp.json()
-        assert any(a["path"] == "README.md" for a in body["actions"])
+        assert body["response"], "QA must be answered in natural language"
+        assert body["actions"] == [], "chat must not create files"
         paths = {f["path"] for f in c.get(f"/projects/{pid}/work").json()}
-        assert "README.md" in paths
+        assert paths == {"README.md"}, f"workspace mutated: {paths}"
 
     def test_interruption_recovers_partial_work(self, client):
         """A failing sub-task must not lose the files the successful one wrote."""

@@ -1223,6 +1223,45 @@ two-step delete (keep files / erase files).
 
 ---
 
+# Adaptive Model Installation (SetupModels.bat)
+
+Synapse installs Ollama models **hardware-aware**: machines with <8 GB RAM or
+older CPUs (Tier 1) get only lightweight models; machines with ≥8 GB RAM and
+modern CPUs (Tier 2) get the standard set. No unnecessary model is ever
+downloaded.
+
+| File | Role |
+|---|---|
+| `models.json` | **Single source of truth** — Ollama URL, hardware thresholds, and the per-tier model lists. Change model recommendations here, never in code. |
+| `SetupModels.bat` | Windows installer: checks/installs Ollama (silently), waits for the service, detects hardware, picks the tier, pulls **only missing** models, prints a summary (installed / skipped / failed). |
+| `setup_models.ps1` | Shared helper (tier detection + installed-model status) used by the bat and the launchers. |
+| `core/start.ps1`, `core/start.bat` | Onboarding gate: at launch, missing models trigger *"Synapse needs to install AI models before first use."* → prompt → `SetupModels.bat` → normal startup continues. Skip with `SYNAPSE_SKIP_MODEL_SETUP=1`. |
+
+```powershell
+# from the repo root
+.\SetupModels.bat            # interactive install
+.\SetupModels.bat --yes      # install and exit without pausing
+.\SetupModels.bat --check    # report only; exit 0=ready 2=no Ollama 3=missing
+```
+
+**Tier rules (configurable in `models.json`):**
+
+| Tier | Condition | Models |
+|---|---|---|
+| 1 | RAM < 8 GB **or** older CPU (e.g. pre-Ryzen-3000 / pre-Intel-10th-gen) | `llama3.2:1b`, `qwen2.5:3b`, `qwen2.5-coder:1.5b`, `qwen3:1.7b`, `all-minilm`, `moondream` — **no 7B/8B models** |
+| 2 | RAM ≥ 8 GB **and** modern CPU (Ryzen 3000+, Intel 10th gen+, Core Ultra) | `llama3.1:8b`, `qwen2.5:7b`, `qwen2.5-coder:7b`, `qwen3:4b`, `qwen2.5vl:7b`, `nomic-embed-text` |
+
+The router automatically works with whichever set was installed: the registry
+syncs live-installed models into the catalog every request, `config.toml`
+carries capability profiles for both tiers (uninstalled profiles are ignored),
+and the embedding/vision engines fall back to the installed embedding/vision
+models (`all-minilm` / `moondream` on Tier 1, `nomic-embed-text` /
+`qwen2.5vl:7b` on Tier 2) when the configured one is absent. The Ollama
+provider also skips an uninstalled configured default model and uses the first
+installed one instead.
+
+---
+
 ## Phase Roadmap
 
 | Phase | Scope |
@@ -1240,6 +1279,7 @@ two-step delete (keep files / erase files).
 | **11 (done)** | **Live Execution Timeline: `/request/stream` SSE streams real agent activity (request analysis → workspace/file reads → model load → task generation → file writes → finished) while the UI renders a live emoji timeline instead of a generic "thinking…" loader, removing it once the reply is ready** |
 | **12 (done)** | **Per-chat isolation + auto-rename: conversation memory is scoped to the owning chat (isolated history, context, memory, title), and chats auto-title from the conversation's first message with clean whitespace handling** |
 | **13 (done)** | **Workspace-First Operating Environment: every model call (including synthesis and review) is prefixed with a compact workspace brief (project identity, folder path, available file tools, default operation, file tree, recent modifications, current-chat summary); a deterministic access gate (`requires_workspace_access`) decides which prompts get ActionEngine excerpts while greetings stay chat-only; default dev-task verbs now target real files; the write→verify→index→remember loop confirms every created/modified file on disk, syntax-checks Python/JSON, refreshes the project index, and records the write in project memory (🛡️ verified / 🗂️ index timeline steps)** |
+| **14 (done)** | **Adaptive Model Installation: hardware-tier-aware Ollama model setup (`SetupModels.bat` + `models.json` single source of truth — Tier 1 lightweight set for <8 GB RAM/older CPUs, Tier 2 standard set otherwise), automatic silent Ollama install with service wait, pull-only-missing with installed/skipped/failed summary, first-launch onboarding gate in `start.ps1`/`start.bat` ("Synapse needs to install AI models before first use." → SetupModels.bat → continue), tier-1 model profiles in the catalog, and tier-adaptive embedding/vision/default-model fallbacks so the router works with whichever set was installed** |
 | **8** | Plugin framework + internal plugins |
 | **9** | Workspace Engine hardening, multi-agent, voice |
 | Later | Rust perf modules, marketplace |

@@ -136,8 +136,14 @@ class ChatStore:
         meta: list[str] | None = None,
         trace: dict | None = None,
         files: list[str] | None = None,
+        project_name: str | None = None,
     ) -> StoredMessage | None:
-        """Append a message and write the chat file immediately."""
+        """Append a message and write the chat file immediately.
+
+        ``project_name`` — the owning project's name; when supplied it seeds
+        the auto-renamed title as ``"<Project>: <first message>"`` so chats
+        carry their project context.
+        """
         message = StoredMessage(
             role=role,
             content=content,
@@ -152,14 +158,15 @@ class ChatStore:
                 return None
             record.messages.append(message)
             record.updated_at = message.created_at
-            # Auto-rename from conversation context: the first meaningful user
-            # message seeds the chat's title (works for every default
-            # placeholder — "New chat", the "General Discussion" created by
-            # ``ensure_chat``, or an empty title). Whitespace is collapsed so
-            # a multi-line prompt becomes a clean one-line title. A title the
-            # user set explicitly is never overwritten.
+            # Auto-rename from conversation + project context: the first
+            # meaningful user message seeds the chat's title (works for every
+            # default placeholder — "New chat", the UI's "new", the "General
+            # Discussion" created by ``ensure_chat``, or an empty title).
+            # Whitespace is collapsed so a multi-line prompt becomes a clean
+            # one-line title. A title the user set explicitly is never
+            # overwritten.
             if message.role == "user" and self._default_title(record.title):
-                record.title = self._title_from(message.content)
+                record.title = self._title_from(message.content, project_name)
             self._write(record)
             log.info(
                 "message_recorded",
@@ -172,16 +179,26 @@ class ChatStore:
 
     @staticmethod
     def _default_title(title: str) -> bool:
-        return title.strip().lower() in ("", "new chat", "general discussion")
+        return title.strip().lower() in ("", "new", "new chat", "general discussion")
 
     @staticmethod
-    def _title_from(content: str) -> str:
-        """A clean one-line title derived from the conversation's first message."""
+    def _title_from(content: str, project_name: str | None = None) -> str:
+        """A clean one-line title derived from the conversation's first
+        message, prefixed with the project context when available:
+        ``"<Project>: <first message>"``."""
         text = re.sub(r"\s+", " ", content).strip()
         text = text.lstrip("#>*-\t ")
         if not text:
             return "Chat"
-        return text if len(text) <= 50 else text[:50].rstrip() + "..."
+        if len(text) > 50:
+            text = text[:50].rstrip() + "..."
+        if project_name:
+            prefix = re.sub(r"\s+", " ", project_name).strip()
+            if prefix and not ChatStore._default_title(prefix):
+                if len(prefix) > 24:
+                    prefix = prefix[:24].rstrip() + "..."
+                text = f"{prefix}: {text}"
+        return text if len(text) <= 60 else text[:57].rstrip() + "..."
 
     @staticmethod
     def _to_info(record: ChatRecord) -> ChatInfo:

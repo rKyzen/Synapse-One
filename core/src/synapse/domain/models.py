@@ -39,40 +39,74 @@ class ModelCapabilities(BaseModel):
 
     def score_for(self, capability: Capability) -> float:
         """Profile strength for a capability: 0.0..1.0 (booleans map to 0/1)."""
-        if capability == Capability.REASONING:
+        cap_val = capability.value if hasattr(capability, "value") else str(capability)
+        if cap_val in self.extra:
+            val = self.extra[cap_val]
+            if isinstance(val, bool):
+                return 1.0 if val else 0.0
+            if isinstance(val, (int, float)):
+                return max(0.0, min(1.0, float(val)))
+
+        if capability in (Capability.REASONING,):
             return self.reasoning
-        if capability == Capability.CODING:
+        if capability in (Capability.CODING, Capability.FILE_EDITING):
             return self.coding
-        if capability == Capability.WRITING:
+        if capability in (Capability.WRITING, Capability.PDF_CREATION, Capability.DOCX_CREATION, Capability.PPT_CREATION):
             return self.writing
-        if capability == Capability.MATH:
+        if capability in (Capability.MATH,):
             return self.math
-        if capability == Capability.CHAT:
+        if capability in (Capability.CHAT, Capability.CONVERSATION):
             return self.chat
-        if capability == Capability.TRANSLATION:
+        if capability in (Capability.TRANSLATION,):
             return self.translation
-        if capability == Capability.PLANNING:
+        if capability in (Capability.PLANNING, Capability.TASK_MANAGEMENT):
             return self.planning
-        if capability == Capability.DEBUGGING:
-            return self.debugging
-        if capability == Capability.ARCHITECTURE:
+        if capability in (Capability.DEBUGGING, Capability.TESTING):
+            return self.debugging or self.coding
+        if capability in (Capability.ARCHITECTURE,):
             return self.architecture
-        if capability == Capability.OCR:
+        if capability in (Capability.OCR,):
             return self.ocr
-        if capability == Capability.PDF:
-            return self.pdf
-        if capability == Capability.JSON:
+        if capability in (Capability.PDF, Capability.PDF_READING):
+            return self.pdf or (1.0 if self.vision else self.ocr)
+        if capability in (Capability.JSON,):
             return self.json_capability
-        if capability == Capability.TERMINAL:
+        if capability in (Capability.TERMINAL,):
             return self.terminal
-        if capability == Capability.EMBEDDINGS:
+        if capability in (Capability.EMBEDDINGS, Capability.MEMORY, Capability.KNOWLEDGE_RETRIEVAL):
             return self.embeddings
-        if capability == Capability.VISION:
+        if capability in (Capability.VISION, Capability.IMAGE_UNDERSTANDING):
             return 1.0 if self.vision else 0.0
-        if capability == Capability.TOOLS:
-            return 1.0 if self.tools else 0.0
-        if capability == Capability.LANGUAGES:
+        if capability in (Capability.TOOLS, Capability.AUTOMATION):
+            return 1.0 if self.tools else max(self.terminal, self.coding)
+        if capability in (Capability.LANGUAGES,):
             return 1.0 if self.extra.get("languages") else 0.0
+        if capability in (Capability.LONG_CONTEXT,):
+            return 1.0 if self.extra.get("long_context") else 0.0
+        if capability in (Capability.SUMMARIZATION,):
+            return max(self.writing, self.chat, self.reasoning)
+        if capability in (Capability.RESEARCH,):
+            return max(self.reasoning, self.chat)
+        if capability in (Capability.CODE_ANALYSIS,):
+            return max(self.coding, self.reasoning, self.architecture)
+        if capability in (Capability.FILE_READING,):
+            return 1.0 if self.tools else max(self.coding, self.chat, 0.5)
+        if capability in (Capability.FILE_CREATION,):
+            return max(self.coding, self.writing, self.reasoning)
+        if capability in (Capability.DOCUMENT_ANALYSIS,):
+            return max(self.pdf, self.writing, self.reasoning)
+        if capability in (Capability.SPREADSHEET_CREATION,):
+            return max(self.math, self.json_capability, self.writing)
+        if capability in (Capability.DATA_ANALYSIS,):
+            return max(self.math, self.reasoning, self.coding)
+        if capability in (Capability.PROJECT_CREATION,):
+            return max(self.coding, self.architecture, self.planning)
+        if capability in (Capability.PROJECT_ANALYSIS,):
+            return max(self.architecture, self.coding, self.reasoning)
+        if capability in (Capability.CITATIONS,):
+            return max(self.reasoning, self.writing)
+        if capability in (Capability.WEB_SEARCH,):
+            return 1.0 if self.tools else max(self.reasoning, self.chat)
         return 0.0
 
 

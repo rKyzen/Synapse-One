@@ -26,6 +26,11 @@ from synapse.domain.workspace import WorkspaceFileInfo
 from synapse.execution import ProviderUnavailable
 from synapse.logging import get_logger
 from synapse.projects.system import WorkspaceSystem
+from synapse.tasks.queue import TaskQueue
+
+
+#: Per-project background task queues (Phase XV).
+_project_queues: dict[str, TaskQueue] = {}
 
 
 class ProviderStatus(BaseModel):
@@ -122,10 +127,25 @@ def build_app(boot: Boot | None = None) -> FastAPI:
 
     def _perform_request(body: AgentRequest) -> tuple[AgentResponse, list[str]]:
         pid = body.project_id or system.session().get("project_id") or "general"
+        info = system.get_project(pid)
         chat = system.ensure_chat(pid, body.chat_id)
         chat_store = system.chat_store(pid)
-        chat_store.append(chat.id, role="user", content=body.prompt, files=body.files)
-        info = system.get_project(pid)
+        chat_store.append(
+            chat.id,
+            role="user",
+            content=body.prompt,
+            files=body.files,
+            project_name=info.name if info else None,
+        )
+        # Phase A — a chat turn is a conversation INSIDE a goal: link the chat
+        # to the workspace's most recent active goal when one exists.
+        try:
+            for goal in system.goals(pid):
+                if goal.status.value == "active":
+                    system.goal_store(pid).link(goal.id, chat_id=chat.id)
+                    break
+        except Exception:  # noqa: BLE001 - goal linking never breaks a request
+            log.debug("goal_link_failed", project_id=pid)
         resp = boot.master.process(
             body.prompt,
             files=body.files or None,
@@ -143,6 +163,10 @@ def build_app(boot: Boot | None = None) -> FastAPI:
             # inside every model prompt via the workspace brief.
             project_name=info.name if info else None,
             project_path=info.workspace_path if info else None,
+            # Phase XV — per-project indexing, change tracking, diagnostics.
+            project_index=system.project_index(pid),
+            change_panel=system.change_panel(pid),
+            diagnostics=system.diagnostics(pid),
         )
         meta = []
         if resp.provider:
@@ -440,6 +464,182 @@ def build_app(boot: Boot | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="file not found")
         return {"deleted": path}
 
+    # -- Phase XV: project index, search, changes, diagnostics, terminal, tasks --
+
+    @app.get("/projects/{project_id}/index")
+    def get_project_index(project_id: str) -> dict:
+        """Project code index: files, symbols, imports, structure."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        index = system.project_index(project_id)
+        structure = index.scan()  # always fresh on read
+        return {
+            "project_id": project_id,
+            "total_files": structure.total_files,
+            "total_folders": structure.total_folders,
+            "languages": structure.languages,
+            "main_language": structure.main_language,
+            "has_tests": structure.has_tests,
+            "has_docs": structure.has_docs,
+            "entry_points": structure.entry_points,
+            "config_files": structure.config_files,
+            "dependencies_file": structure.dependencies_file,
+            "files": {
+                f.path: {
+                    "name": f.name,
+                    "language": f.language,
+                    "size": f.size,
+                    "symbols": [s.name for s in f.symbols[:10]],
+                    "imports": f.imports[:10],
+                }
+                for f in index.get_all_files()
+            },
+        }
+
+    @app.post("/projects/{project_id}/index/refresh")
+    def refresh_project_index(project_id: str) -> dict:
+        """Force a full re-scan of the workspace into the code index."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return system.refresh_project_index(project_id)
+
+    @app.get("/projects/{project_id}/search")
+    def search_workspace(project_id: str, q: str, max_results: int = 20) -> dict:
+        """Semantic + keyword + symbol search across project files."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return system.search_workspace(project_id, q, max_results=max_results)
+
+    @app.get("/projects/{project_id}/changes")
+    def get_project_changes(project_id: str) -> dict:
+        """File change panel: created/modified/deleted/renamed this session."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return system.change_panel(project_id).to_dict()
+    @app.delete("/projects/{project_id}/changes")
+    def clear_project_changes(project_id: str) -> dict:
+        """Reset the change panel."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        system.change_panel(project_id).clear()
+        return {"cleared": True}
+
+    @app.post("/projects/{project_id}/terminal")
+    def run_terminal_command(project_id: str, body: dict) -> dict:
+        """Run a command in the project's workspace. Returns the result."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        command = (body.get("command") or "").strip()
+        if not command:
+            raise HTTPException(status_code=400, detail="command required")
+        timeout = body.get("timeout") or None
+        result = system.terminal(project_id).run(command, timeout=timeout)
+        return result.to_dict()
+
+    @app.post("/projects/{project_id}/terminal/async")
+    def run_terminal_command_async(project_id: str, body: dict) -> dict:
+        """Run a command in the background; returns the command id."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        command = (body.get("command") or "").strip()
+        if not command:
+            raise HTTPException(status_code=400, detail="command required")
+        entry_id = system.terminal(project_id).run_async(command)
+        return {"command_id": entry_id}
+
+    @app.get("/projects/{project_id}/terminal/history")
+    def terminal_history(project_id: str, limit: int = 50) -> list[dict]:
+        """Recent command history for the project."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return [
+            {
+                "id": e.id,
+                "command": e.command,
+                "status": e.status,
+                "started_at": e.started_at,
+                "completed_at": e.completed_at,
+                "result": e.result.to_dict() if e.result else None,
+            }
+            for e in system.terminal(project_id).get_history(limit=limit)
+        ]
+
+    @app.get("/projects/{project_id}/diagnostics")
+    def project_diagnostics(project_id: str) -> dict:
+        """Diagnostics report: syntax errors, unused imports, style warnings."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        report = system.diagnostics(project_id).analyze_all()
+        return {
+            "files_analyzed": report.files_analyzed,
+            "errors": report.errors,
+            "warnings": report.warnings,
+            "info": report.info,
+            "diagnostics": [
+                {
+                    "file": d.file,
+                    "line": d.line,
+                    "severity": d.severity,
+                    "code": d.code,
+                    "message": d.message,
+                    "fixable": d.fixable,
+                    "fix_suggestion": d.fix_suggestion,
+                }
+                for d in report.diagnostics
+            ],
+            "summary": report.summary(),
+        }
+
+    @app.get("/projects/{project_id}/tasks")
+    def list_project_tasks(project_id: str, limit: int = 50) -> list[dict]:
+        """Recent background tasks for the project."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        queue = _project_queues.get(project_id)
+        if queue is None:
+            return []
+        return [t.__dict__ for t in queue.list_tasks(limit=limit)]
+
+    @app.post("/projects/{project_id}/tasks")
+    def create_project_task(project_id: str, body: dict) -> dict:
+        """Submit a background task (e.g. terminal command)."""
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        command = (body.get("command") or "").strip()
+        if not command:
+            raise HTTPException(status_code=400, detail="command required")
+        queue = _project_queues.setdefault(project_id, TaskQueue())
+        task_id = queue.submit(
+            f"terminal: {command[:60]}",
+            system.terminal(project_id).run,
+            command,
+        )
+        return {"task_id": task_id}
+
+    @app.get("/projects/{project_id}/tasks/{task_id}")
+    def get_project_task(project_id: str, task_id: str) -> dict:
+        queue = _project_queues.get(project_id)
+        if queue is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        info = queue.get_task(task_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return info.__dict__
+
+    @app.post("/projects/{project_id}/tasks/{task_id}/cancel")
+    def cancel_project_task(project_id: str, task_id: str) -> dict:
+        queue = _project_queues.get(project_id)
+        if queue is None or not queue.cancel(task_id):
+            raise HTTPException(status_code=404, detail="task not found")
+        return {"cancelled": task_id}
+
+    @app.post("/projects/{project_id}/tasks/{task_id}/retry")
+    def retry_project_task(project_id: str, task_id: str) -> dict:
+        queue = _project_queues.get(project_id)
+        if queue is None or not queue.retry(task_id):
+            raise HTTPException(status_code=404, detail="task not found")
+        return {"retried": task_id}
+
     @app.get("/projects/{project_id}/actions")
     def list_actions(project_id: str, limit: int = 50) -> list[dict]:
         """Phase 6 audit trail: plans, models, tools, files, failures."""
@@ -455,12 +655,360 @@ def build_app(boot: Boot | None = None) -> FastAPI:
     def set_session(body: dict) -> dict:
         project_id = body.get("project_id")
         chat_id = body.get("chat_id")
+        view = body.get("view")
         if project_id:
             system.switch_project(project_id)
         if chat_id:
             current = system.session()
             system.switch_chat(current.get("project_id") or "general", chat_id)
+        if view:
+            system.switch_view(str(view))
         return system.session()
+
+    @app.post("/session/view")
+    def set_session_view(body: dict) -> dict:
+        """Switch the workspace UI view (home/goals/files/notes/tasks/chats/...)."""
+        view = str(body.get("view") or "home").strip()
+        return system.switch_view(view)
+
+    # -- goals + workspace home (AI Operating Workspace redesign, Phase A) ----
+
+    @app.post("/projects/{project_id}/goals")
+    def create_goal(project_id: str, body: dict) -> dict:
+        """Primary intake point: create a goal from an outcome statement.
+
+        The user states what they want to accomplish; the workspace tracks
+        progress, steps, and linked artifacts around it. ``/request`` remains
+        for chat-scoped turns and links to the active goal.
+        """
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        outcome = (body.get("outcome") or body.get("prompt") or "").strip()
+        if not outcome:
+            raise HTTPException(status_code=400, detail="outcome required")
+        info = system.goal_store(project_id).create(
+            outcome, deadline=body.get("deadline") or None
+        )
+        return info.model_dump()
+
+    @app.get("/projects/{project_id}/goals")
+    def list_goals(project_id: str, include_archived: bool = False) -> list[dict]:
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return [g.model_dump() for g in system.goals(project_id, include_archived=include_archived)]
+
+    @app.get("/projects/{project_id}/goals/{goal_id}")
+    def get_goal(project_id: str, goal_id: str) -> dict:
+        info = system.goal_store(project_id).get(goal_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return info.model_dump()
+
+    @app.patch("/projects/{project_id}/goals/{goal_id}")
+    def update_goal(project_id: str, goal_id: str, body: dict) -> dict:
+        """Update a goal: rename, change status, or set progress."""
+        store = system.goal_store(project_id)
+        info = store.get(goal_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        if body.get("title"):
+            store.rename(goal_id, str(body["title"]))
+        if body.get("status"):
+            from synapse.domain.enums import GoalStatus
+
+            try:
+                store.update_status(goal_id, GoalStatus(body["status"]))
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid goal status")
+        if body.get("progress") is not None:
+            store.set_progress(goal_id, int(body["progress"]))
+        return store.get(goal_id).model_dump()
+
+    @app.post("/projects/{project_id}/goals/{goal_id}/link")
+    def link_goal_artifact(project_id: str, goal_id: str, body: dict) -> dict:
+        """Link an artifact (chat/file/note/task) to a goal. Idempotent."""
+        info = system.goal_store(project_id).link(
+            goal_id,
+            chat_id=body.get("chat_id"),
+            file_id=body.get("file_id"),
+            note_id=body.get("note_id"),
+            task_id=body.get("task_id"),
+        )
+        if info is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return info.model_dump()
+
+    @app.delete("/projects/{project_id}/goals/{goal_id}")
+    def delete_goal(project_id: str, goal_id: str) -> dict:
+        if not system.goal_store(project_id).delete(goal_id):
+            raise HTTPException(status_code=404, detail="goal not found")
+        return {"deleted": goal_id}
+
+    @app.post("/projects/{project_id}/goals/{goal_id}/plan")
+    def plan_goal(project_id: str, goal_id: str) -> dict:
+        """Plan a goal: decompose the outcome into capability-labeled steps.
+
+        The planner never names a model — model selection happens at
+        execution time by the Router (capabilities first, models second).
+        """
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        store = system.goal_store(project_id)
+        record = store.get(goal_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        from synapse.planner.goal_planner import GoalPlanner
+
+        steps = GoalPlanner().plan(record.outcome, system.workspace_type(project_id))
+        info = store.set_steps(goal_id, steps)
+        return info.model_dump()
+
+    @app.post("/projects/{project_id}/goals/{goal_id}/execute")
+    def execute_goal(project_id: str, goal_id: str) -> dict:
+        """Execute the planned steps of a goal, one model per step.
+
+        Each step is routed by capability through the same Router contract
+        chain as the legacy pipeline; results are recorded onto the goal.
+        """
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        from synapse.planner.goal_executor import GoalExecutor
+
+        executor = GoalExecutor(
+            system=system,
+            router=boot.master._router,
+            providers=boot.master._providers,
+            registry=boot.master._registry,
+            hardware=boot.master._hardware,
+            executor=boot.master._executor,
+            events=boot.events,
+            performance=boot.master._performance,
+            lifecycle=boot.master._lifecycle,
+            memory=boot.master._memory,
+        )
+        return executor.execute(project_id, goal_id)
+
+    # -- notes / documents / todos (AI Operating Workspace redesign, Phase B) --
+
+    def _require_project(project_id: str) -> None:
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+
+    @app.get("/projects/{project_id}/notes")
+    def list_notes(project_id: str) -> list[dict]:
+        _require_project(project_id)
+        return [n.model_dump() for n in system.notes(project_id)]
+
+    @app.post("/projects/{project_id}/notes")
+    def create_note(project_id: str, body: dict) -> dict:
+        """Create a scratch note; optionally link it to a goal."""
+        _require_project(project_id)
+        note = system.note_store(project_id).create(
+            str(body.get("title") or ""),
+            content=str(body.get("content") or ""),
+            goal_id=body.get("goal_id") or None,
+            tags=body.get("tags"),
+        )
+        if note.goal_id:
+            system.goal_store(project_id).link(note.goal_id, note_id=note.id)
+        return note.model_dump()
+
+    @app.get("/projects/{project_id}/notes/{note_id}")
+    def get_note(project_id: str, note_id: str) -> dict:
+        note = system.note_store(project_id).get(note_id)
+        if note is None:
+            raise HTTPException(status_code=404, detail="note not found")
+        return note.model_dump()
+
+    @app.patch("/projects/{project_id}/notes/{note_id}")
+    def update_note(project_id: str, note_id: str, body: dict) -> dict:
+        note = system.note_store(project_id).update(
+            note_id,
+            title=body.get("title"),
+            content=body.get("content"),
+            tags=body.get("tags"),
+            goal_id=body.get("goal_id"),
+        )
+        if note is None:
+            raise HTTPException(status_code=404, detail="note not found")
+        return note.model_dump()
+
+    @app.delete("/projects/{project_id}/notes/{note_id}")
+    def delete_note(project_id: str, note_id: str) -> dict:
+        if not system.note_store(project_id).delete(note_id):
+            raise HTTPException(status_code=404, detail="note not found")
+        return {"deleted": note_id}
+
+    @app.get("/projects/{project_id}/documents")
+    def list_documents(project_id: str) -> list[dict]:
+        _require_project(project_id)
+        return [d.model_dump() for d in system.documents(project_id)]
+
+    @app.post("/projects/{project_id}/documents")
+    def create_document(project_id: str, body: dict) -> dict:
+        """Create a typed document (report/essay/plan/...); goal-linkable."""
+        _require_project(project_id)
+        doc = system.document_store(project_id).create(
+            str(body.get("title") or ""),
+            doc_type=str(body.get("doc_type") or "document"),
+            content=str(body.get("content") or ""),
+            goal_id=body.get("goal_id") or None,
+        )
+        if doc.goal_id:
+            system.goal_store(project_id).link(doc.goal_id, note_id=doc.id)
+        return doc.model_dump()
+
+    @app.get("/projects/{project_id}/documents/{document_id}")
+    def get_document(project_id: str, document_id: str) -> dict:
+        doc = system.document_store(project_id).get(document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        return doc.model_dump()
+
+    @app.patch("/projects/{project_id}/documents/{document_id}")
+    def update_document(project_id: str, document_id: str, body: dict) -> dict:
+        doc = system.document_store(project_id).update(
+            document_id,
+            title=body.get("title"),
+            doc_type=body.get("doc_type"),
+            content=body.get("content"),
+            status=body.get("status"),
+            goal_id=body.get("goal_id"),
+        )
+        if doc is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        return doc.model_dump()
+
+    @app.delete("/projects/{project_id}/documents/{document_id}")
+    def delete_document(project_id: str, document_id: str) -> dict:
+        if not system.document_store(project_id).delete(document_id):
+            raise HTTPException(status_code=404, detail="document not found")
+        return {"deleted": document_id}
+
+    @app.get("/projects/{project_id}/todos")
+    def list_todos(project_id: str) -> list[dict]:
+        _require_project(project_id)
+        return [t.model_dump() for t in system.todos(project_id)]
+
+    @app.post("/projects/{project_id}/todos")
+    def create_todo(project_id: str, body: dict) -> dict:
+        """Create a workspace todo item; goal-linkable, prioritized."""
+        _require_project(project_id)
+        todo = system.todo_store(project_id).create(
+            str(body.get("title") or ""),
+            description=str(body.get("description") or ""),
+            status=body.get("status"),
+            priority=body.get("priority"),
+            due_date=body.get("due_date"),
+            goal_id=body.get("goal_id") or None,
+        )
+        if todo.goal_id:
+            system.goal_store(project_id).link(todo.goal_id, note_id=todo.id)
+        return todo.model_dump()
+
+    @app.get("/projects/{project_id}/todos/{todo_id}")
+    def get_todo(project_id: str, todo_id: str) -> dict:
+        todo = system.todo_store(project_id).get(todo_id)
+        if todo is None:
+            raise HTTPException(status_code=404, detail="todo not found")
+        return todo.model_dump()
+
+    @app.patch("/projects/{project_id}/todos/{todo_id}")
+    def update_todo(project_id: str, todo_id: str, body: dict) -> dict:
+        todo = system.todo_store(project_id).update(
+            todo_id,
+            title=body.get("title"),
+            description=body.get("description"),
+            status=body.get("status"),
+            priority=body.get("priority"),
+            due_date=body.get("due_date"),
+            goal_id=body.get("goal_id"),
+        )
+        if todo is None:
+            raise HTTPException(status_code=404, detail="todo not found")
+        return todo.model_dump()
+
+    @app.delete("/projects/{project_id}/todos/{todo_id}")
+    def delete_todo(project_id: str, todo_id: str) -> dict:
+        if not system.todo_store(project_id).delete(todo_id):
+            raise HTTPException(status_code=404, detail="todo not found")
+        return {"deleted": todo_id}
+
+    @app.post("/projects/{project_id}/type")
+    def set_workspace_type(project_id: str, body: dict) -> dict:
+        """Change the workspace type (general/student/research/business/...).
+
+        The type loads different tools/capabilities over the same core
+        infrastructure; coding is only one capability of ``developer``.
+        """
+        if system.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        workspace_type = (body.get("workspace_type") or "").strip().lower()
+        if not system.set_workspace_type(project_id, workspace_type):
+            raise HTTPException(status_code=422, detail="invalid workspace type")
+        return {"project_id": project_id, "workspace_type": workspace_type}
+
+    @app.get("/projects/{project_id}/home")
+    def workspace_home(project_id: str) -> dict:
+        """Workspace landing aggregate (goal-centric, not chat-centric).
+
+        Active goals, orchestrator progress, open state, and workspace stats —
+        the data a workspace home view renders. Chat is deliberately absent:
+        it is one view inside the workspace, not the product surface.
+        """
+        info = system.get_project(project_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        goals = system.goals(project_id)
+        store = system.goal_store(project_id)
+        active = [g for g in goals if g.status.value == "active"]
+        active_steps = sum(len(g.steps) for g in active)
+        done_steps = sum(
+            1 for g in active for s in g.steps if s.status in ("completed", "skipped")
+        )
+        ws = system.workspace_for(project_id)
+        files = ws.list_files()
+        recent = sorted(files, key=lambda f: f.created_at, reverse=True)[:8]
+        return {
+            "project_id": project_id,
+            "name": info.name,
+            "workspace_type": system.workspace_type(project_id),
+            "exists": info.exists,
+            "files_count": len(files),
+            "indexed_count": info.indexed_count,
+            "chunks": ws.vector_store.count(),
+            "chats_count": info.chats_count,
+            "notes_count": len(system.notes(project_id)),
+            "documents_count": len(system.documents(project_id)),
+            "todos_count": len(system.todos(project_id)),
+            "goals_count": len(goals),
+            "active_goals_count": len(active),
+            "goal_progress": {
+                "steps_total": active_steps,
+                "steps_done": done_steps,
+            },
+            "active_goals": [
+                {
+                    "id": g.id,
+                    "title": g.title,
+                    "progress": g.progress,
+                    "deadline": g.deadline,
+                    "steps": [s.model_dump() for s in g.steps],
+                }
+                for g in active
+            ],
+            "recent_files": [
+                {
+                    "id": f.id,
+                    "name": f.name,
+                    "extension": f.extension,
+                    "status": f.status,
+                    "indexed_chunks": f.indexed_chunks,
+                    "created_at": f.created_at,
+                }
+                for f in recent
+            ],
+        }
 
     # -- workspace endpoints (project-scoped via query param) ---------------
 

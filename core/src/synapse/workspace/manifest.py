@@ -65,7 +65,7 @@ real files you can read and edit, and you are allowed to create new files \
 anywhere inside the folder.
 
 If your answer produces or changes files, end it with ONE JSON object and \
-nothing else: {"folders": ["docs"], "files": [{"path": "docs/a.md", "content": "..."}]}
+nothing else: {"folders": ["src"], "files": [{"path": "src/main.py", "content": "..."}]}
 Each "files" item has "path" (relative to the project — no leading "/", no \
 "..", no absolute paths) and "content" (the complete file body). To change an \
 existing file use {"action":"edit","path":..., "old":"<exact snippet>", \
@@ -96,9 +96,28 @@ _FENCE_RE = re.compile(
 )
 _PATH_RE = re.compile(r"^[#]?\s*(?:FILE|PATH)?\s*[:=]?\s*([A-Za-z0-9_./\-]+\.\w+)\s*$")
 
+#: placeholder file bodies models produce when they echo the manifest
+#: instruction's example instead of writing real content ("...").
+_PLACEHOLDER_CONTENT_RE = re.compile(r"^[.…]{1,6}$")
 
-def _first_json(text: str) -> dict | None:
-    """Locate and parse the first balanced JSON object in ``text``."""
+
+def _is_placeholder_content(content: str) -> bool:
+    """True when ``content`` is only the dotted placeholder from the
+    instruction examples (``"content": "..."``, a fence body of ``...``).
+
+    Empty strings are NOT placeholders — creating an empty file is a real,
+    parseable intent.
+    """
+    return bool(_PLACEHOLDER_CONTENT_RE.match((content or "").strip()))
+
+
+def _json_objects(text: str) -> list[dict]:
+    """Every balanced JSON object in ``text``, in order of appearance.
+
+    Models frequently prefix their real manifest with an echo of the format
+    example; the LAST object is the most likely answer.
+    """
+    found: list[dict] = []
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -123,16 +142,31 @@ def _first_json(text: str) -> dict | None:
                 if depth == 0:
                     candidate = text[start : i + 1]
                     try:
-                        import json
-
                         value = json.loads(candidate)
-                        if isinstance(value, dict):
-                            return value
                     except Exception:  # noqa: BLE001
-                        pass
+                        value = None
+                    if isinstance(value, dict):
+                        found.append(value)
                     break
-        start = text.find("{", start + 1)
-    return None
+        # Resume after the balanced object so JSON nested INSIDE a manifest
+        # (e.g. an item of the "files" array) is not collected as a sibling.
+        start = text.find("{", i + 1)
+    return found
+
+
+def _filter_manifest_ops(ops: list[dict]) -> list[dict]:
+    """Drop instruction-example echoes before they reach the filesystem.
+
+    A manifest whose every file write is placeholder content ("...") creates
+    NOTHING — not even the example's folders (``{"folders": ["docs"],
+    "files": [{"path": "docs/a.md", "content": "..."}]}`` must not materialize
+    a phantom ``docs/a.md`` or an empty ``docs/``). Mixed manifests keep their
+    real files; only the placeholder writes are dropped.
+    """
+    file_ops = [o for o in ops if o.get("action") == "write"]
+    if file_ops and all(_is_placeholder_content(o.get("content")) for o in file_ops):
+        return []
+    return [o for o in ops if not _is_placeholder_content(o.get("content"))]
 
 
 def _payload_to_ops(payload: dict) -> list[dict]:
@@ -211,7 +245,7 @@ def _parse_strict_manifest(text: str) -> list[dict]:
         return []
     if not isinstance(payload, dict):
         return []
-    return _dedupe_ops(_payload_to_ops(payload))
+    return _filter_manifest_ops(_dedupe_ops(_payload_to_ops(payload)))
 
 
 def parse_file_manifest(
@@ -237,9 +271,13 @@ def parse_file_manifest(
     if strict:
         return _parse_strict_manifest(text)
 
-    payload = _first_json(text)
-    if payload is not None and isinstance(payload, dict):
-        ops = _dedupe_ops(_payload_to_ops(payload))
+    # Phase XVI — prefer the LAST JSON object: models commonly open their
+    # answer with an echo of the instruction example and put the real
+    # manifest at the end. Candidate echoes are rejected by
+    # ``_filter_manifest_ops``; earlier objects are tried only when the last
+    # one produced nothing.
+    for payload in reversed(_json_objects(text)):
+        ops = _filter_manifest_ops(_dedupe_ops(_payload_to_ops(payload)))
         if ops:
             return ops
 
@@ -300,6 +338,8 @@ _LANG_DEFAULT_PATH: dict[str, str] = {
     "shell": "script.sh", "bash": "script.sh", "sh": "script.sh",
     "go": "main.go", "rust": "main.rs", "ruby": "main.rb",
     "sql": "query.sql", "json": "data.json",
+    "requirements": "requirements.txt", "pip": "requirements.txt",
+    "dockerfile": "Dockerfile", "docker": "Dockerfile",
 }
 
 #: header line inside a fence naming the destination file, e.g.
@@ -308,10 +348,97 @@ _LANG_DEFAULT_PATH: dict[str, str] = {
 #: header line (code that merely starts with a comment still matches the
 #: extension requirement below).
 _PATH_HEADER_RE = re.compile(
-    r"^\s*(?:#|//|/\*|<!--|--|%;|['\"])\s*(?:FILE|PATH)?\s*[:=]?\s*"
+    r"^\s*(?:#|//|/\*|<!--|--|%;|['\"])\s*(?:FILE|PATH|filepath)?\s*[:=]?\s*"
     r"([A-Za-z0-9_./\-]+\.\w+)\s*(?:\*/|-->)?\s*$",
     re.IGNORECASE,
 )
+
+_PRECEDING_PATH_RES = [
+    # Explicit prefix: File: `path/to/file.ext` or File: path/to/file.ext
+    re.compile(
+        r"(?:file|path|filename|filepath|destination)\s*[:=]\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"']?",
+        re.IGNORECASE,
+    ),
+    # Markdown heading: ### `path/to/file.ext` or ### path/to/file.ext
+    re.compile(
+        r"^#+\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"':]?",
+        re.IGNORECASE,
+    ),
+    # List item: - `path/to/file.ext` or 1. `path/to/file.ext`
+    re.compile(
+        r"^(?:[-*+]|\d+[\.\)])\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"':]?",
+        re.IGNORECASE,
+    ),
+    # Standalone path line or path with colon: `path/to/file.ext` or requirements.txt:
+    re.compile(
+        r"^\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"':]?\s*$",
+        re.IGNORECASE,
+    ),
+    # Backticked or bold anywhere on the line
+    re.compile(
+        r"[`*]([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*]",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _is_valid_extracted_path(cand: str) -> bool:
+    if not cand or not is_safe_relative_path(cand):
+        return False
+    cand_lower = cand.lower().strip()
+    if cand_lower in ("e.g.", "i.e.", "etc.", "version.1"):
+        return False
+    if cand_lower in ("dockerfile", "makefile", "procfile", ".gitignore", ".env", ".env.example"):
+        return True
+    if "." not in cand:
+        return False
+    ext = cand.rsplit(".", 1)[-1].lower()
+    if len(ext) < 1 or len(ext) > 12:
+        return False
+    if ext.isdigit():
+        return False
+    return True
+
+
+def _extract_preceding_path(preceding_text: str) -> str:
+    """Find a filename or file path in the lines immediately preceding a code fence."""
+    lines = [line.strip() for line in preceding_text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    candidates_to_check = lines[-5:][::-1]
+    for line in candidates_to_check:
+        if "```" in line:
+            break
+        for rx in _PRECEDING_PATH_RES:
+            match = rx.search(line)
+            if match:
+                cand = match.group(1).strip().strip("`*\"':")
+                if _is_valid_extracted_path(cand):
+                    return cand
+    return ""
+
+
+def _sanitize_hint(hint: str, lang: str = "") -> str:
+    """Normalize a planner hint into a valid relative file path."""
+    if not hint or not isinstance(hint, str):
+        return ""
+    h = hint.strip().replace("\\", "/")
+    if not is_safe_relative_path(h):
+        return ""
+    # If hint already has a valid file extension (e.g. "src/app.py", "README.md")
+    if "." in h and not h.endswith("."):
+        ext = h.rsplit(".", 1)[-1]
+        if not ext.isdigit() and 1 <= len(ext) <= 10:
+            return h
+    clean_lang = _LANG_EXT.get(lang.strip().lower(), "") or "txt"
+    if h.lower() in _LANG_EXT:
+        ext = _LANG_EXT[h.lower()]
+        return f"README.{ext}" if ext == "md" else f"main.{ext}"
+    if h.endswith("_") or h.endswith("/"):
+        stem = h.rstrip("/_")
+        target_ext = clean_lang if clean_lang != "txt" else "py"
+        return f"test/test_{stem or 'app'}.{target_ext}" if "test" in h else f"{h}main.{target_ext}"
+    return f"{h}.{clean_lang}"
 
 
 def _fences_to_ops(text: str, hint: str) -> list[dict]:
@@ -319,35 +446,53 @@ def _fences_to_ops(text: str, hint: str) -> list[dict]:
 
     Order is preserved. A block naming its destination in the first line
     (``file: path`` in any comment style, or a bare ``path.ext:`` line) keeps
-    that path; otherwise the planner hint or the language's default name is
-    used. Colliding names get a numeric suffix so no content is lost.
+    that path; otherwise preceding markdown context, the planner hint, or the
+    language's default name is used. Colliding names get a numeric suffix.
     """
-    blocks = _FENCE_RE.findall(text)
-    if not blocks:
+    if not text:
+        return []
+    matches = list(_FENCE_RE.finditer(text))
+    if not matches:
         return []
     used: set[str] = set()
     ops: list[dict] = []
-    for lang, body in blocks:
+    for m in matches:
+        lang = m.group("lang") or ""
+        body = m.group("body") or ""
         raw = body.rstrip("\n")
         if not raw or not raw.strip():
             continue
-        path, body = _fence_destination(raw, lang, hint)
+        preceding_text = text[: m.start()]
+        preceding_path = _extract_preceding_path(preceding_text)
+        path, body_content = _fence_destination(
+            raw, lang, hint, preceding_path=preceding_path
+        )
+        if _is_placeholder_content(body_content):
+            continue
         path = _unique_path(path, used)
         if not is_safe_relative_path(path):
             path = "output.txt"
-        ops.append({"action": "write", "path": path, "content": body})
+        ops.append({"action": "write", "path": path, "content": body_content})
     return ops
 
 
-def _fence_destination(body: str, lang: str, hint: str) -> tuple[str, str]:
+def _fence_destination(
+    body: str, lang: str, hint: str, preceding_path: str = ""
+) -> tuple[str, str]:
     """Return (path, body-without-header) for one fenced block."""
     first_line, _, rest = body.partition("\n")
     head = first_line.strip()
     m = _PATH_HEADER_RE.match(head) or _PATH_RE.match(head)
     if m:
-        return m.group(1), rest.strip("\n")
+        cand = m.group(1).strip()
+        if _is_valid_extracted_path(cand):
+            return cand, rest.strip("\n")
+    if preceding_path and _is_valid_extracted_path(preceding_path):
+        return preceding_path, body
     if hint:
-        return hint, body
+        sanitized = _sanitize_hint(hint, lang)
+        if sanitized:
+            return sanitized, body
     default = _LANG_DEFAULT_PATH.get(lang.strip().lower(), "")
     if default:
         return default, body

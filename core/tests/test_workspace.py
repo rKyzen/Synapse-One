@@ -485,3 +485,61 @@ def test_master_integrates_workspace_files(workspace_boot):
     img = boot.workspace.upload("graph.png", png)
     response2 = boot.master.process("what does this graph show?", files=[img.id])
     assert response2.workspace.vision_descriptions
+
+
+# -- embedding engine (adaptive model resolution) ------------------------------
+
+
+class RecordingEmbedProvider(FakeProvider):
+    """FakeProvider that records the model id passed to embed()."""
+
+    def __init__(self, installed: list[str] | None = None) -> None:
+        super().__init__()
+        self.installed = installed or ["all-minilm:latest"]
+        self.embed_models: list[str | None] = []
+
+    def list_models(self) -> list[ModelDescriptor]:
+        return [ModelDescriptor(id=m, provider_id="fake") for m in self.installed]
+
+    def to_metadata(self, descriptor: ModelDescriptor) -> ModelMetadata | None:
+        return ModelMetadata(
+            id=descriptor.id,
+            provider_id="fake",
+            kind=self.kind,
+            privacy_score=1.0,
+            capabilities={"embeddings": 1.0},
+        )
+
+    def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]] | None:
+        self.embed_models.append(model)
+        return [fake_vector(t) for t in texts]
+
+
+class EmbedProviders:
+    def __init__(self, *providers) -> None:
+        self._providers = list(providers)
+
+    def all(self):
+        return self._providers
+
+
+def test_embedding_engine_uses_configured_model_when_installed():
+    from synapse.workspace.embeddings import EmbeddingEngine
+
+    provider = RecordingEmbedProvider(installed=["nomic-embed-text"])
+    engine = EmbeddingEngine(EmbedProviders(provider), "nomic-embed-text", batch_size=2)
+    vectors = engine.embed(["alpha", "beta"])
+    assert vectors is not None
+    assert provider.embed_models == ["nomic-embed-text"]
+
+
+def test_embedding_engine_falls_back_when_configured_model_missing():
+    from synapse.workspace.embeddings import EmbeddingEngine
+
+    provider = RecordingEmbedProvider(installed=["all-minilm:latest"])
+    engine = EmbeddingEngine(EmbedProviders(provider), "nomic-embed-text", batch_size=2)
+    vectors = engine.embed(["alpha", "beta"])
+    assert vectors is not None
+    # the configured model is not installed; None lets the provider
+    # auto-resolve the installed embedding model (tier-adaptive)
+    assert provider.embed_models == [None]

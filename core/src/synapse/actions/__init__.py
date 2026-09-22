@@ -21,10 +21,13 @@ from synapse.actions.classifier import (
     requires_workspace_access,
 )
 from synapse.actions.engine import ActionEngine
-from synapse.domain.enums import RequestKind
+from synapse.actions.intent_router import IntentRouter
+from synapse.domain.enums import IntentKind, RequestKind
 
 __all__ = [
     "ActionEngine",
+    "IntentKind",
+    "IntentRouter",
     "RequestKind",
     "classify_request",
     "extract_workspace_ops",

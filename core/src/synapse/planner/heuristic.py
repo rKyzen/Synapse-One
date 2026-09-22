@@ -113,8 +113,21 @@ _SPLIT_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
+_PLANNER_KWARGS = (
+    "enabled",
+    "min_split_complexity",
+    "max_tasks",
+    "min_part_length",
+    "file_output_enabled",
+    "model_hints",
+    "add_review",
+)
+
+
 class HeuristicTaskPlanner(TaskPlanner):
     """Deterministic decomposition planner with per-task capability profiles."""
+
+    _ACCEPTED_KWARGS = frozenset(_PLANNER_KWARGS)
 
     def __init__(
         self,
@@ -126,6 +139,7 @@ class HeuristicTaskPlanner(TaskPlanner):
         file_output_enabled: bool = True,
         model_hints: dict[str, str] | None = None,
         add_review: bool = True,
+        **extra,  # future config keys (e.g. goal_mode) are accepted, not fatal
     ) -> None:
         self._enabled = enabled
         self._min_split_complexity = min_split_complexity
@@ -148,6 +162,14 @@ class HeuristicTaskPlanner(TaskPlanner):
     ) -> TaskDAG:
         if not self._enabled:
             return self._single_task(prompt, decision)
+
+        is_explicit_list = bool(re.search(r"^\s*1[\.\)]\s+", prompt, re.MULTILINE)) or bool(re.search(r"\n\s*\d+[\.\)]\s+", prompt))
+        if not is_explicit_list:
+            # Check for compound full-lifecycle software requests (architecture, app, tests, docs, validation)
+            compound = self._try_compound_plan(prompt)
+            if compound is not None:
+                return compound
+
         parts = self._split(prompt, complexity.score)
         # Bare path fragments ("script.js" from "with index.html and style.css
         # and script.js") are absorbed into the previous task — they are not
@@ -157,7 +179,13 @@ class HeuristicTaskPlanner(TaskPlanner):
         if len(parts) <= 1:
             return self._single_task(prompt, decision)
 
-        tasks = [self._task_for_part(f"t{i+1}", part) for i, part in enumerate(parts)]
+        tasks = []
+        for i, part in enumerate(parts):
+            t = self._task_for_part(f"t{i+1}", part)
+            t.inputs = {"prompt": part}
+            t.validation_state = "pending"
+            tasks.append(t)
+
         tasks = tasks[: self._max_tasks]
         has_file_output = any(t.file_output for t in tasks)
         if has_file_output and self._add_review:
@@ -168,6 +196,10 @@ class HeuristicTaskPlanner(TaskPlanner):
                 required_capabilities=list(_TASK_PROFILES[TaskKind.REVIEW][0]),
                 preferred_capabilities=list(_TASK_PROFILES[TaskKind.REVIEW][1]),
                 depends_on=[t.id for t in tasks if t.file_output],
+                required_tools=["file_operator", "terminal"],
+                inputs={"scope": "review_generated_files"},
+                outputs=["review_summary"],
+                validation_state="pending",
             )
             tasks.append(review)
         if len(tasks) > 1:
@@ -178,6 +210,9 @@ class HeuristicTaskPlanner(TaskPlanner):
                 required_capabilities=list(_TASK_PROFILES[TaskKind.SYNTHESIS][0]),
                 preferred_capabilities=list(_TASK_PROFILES[TaskKind.SYNTHESIS][1]),
                 depends_on=[t.id for t in tasks],
+                inputs={"task_count": len(tasks)},
+                outputs=["final_response"],
+                validation_state="pending",
             )
             tasks.append(synthesis)
 
@@ -190,6 +225,132 @@ class HeuristicTaskPlanner(TaskPlanner):
             intent=intent.primary.value,
             file_output=has_file_output,
         )
+        return dag
+
+    def _try_compound_plan(self, prompt: str) -> TaskDAG | None:
+        """Decompose compound requests (e.g. 'Create an expense tracker with documentation and tests')."""
+        if re.search(r"\b(?:then|first|second|1[\.\)]|2[\.\)])\b", prompt, re.IGNORECASE):
+            return None
+        lowered = prompt.lower()
+        has_create = any(w in lowered for w in ("create", "build", "make", "develop", "implement", "scaffold"))
+        has_tests = any(w in lowered for w in ("test", "tests", "testing", "unit test", "pytest"))
+        has_docs = any(w in lowered for w in ("doc", "docs", "documentation", "readme", "guide"))
+
+        if not (has_create and (has_tests or has_docs)):
+            return None
+
+        # Extract target subject
+        subject = prompt
+        match = re.search(r"(?:create|build|make|develop|implement)\s+(?:an?\s+)?(.+?)(?:\s+with\s+|\s+and\s+with\s+|\s*,\s*with\s*|\.|$)", prompt, re.IGNORECASE)
+        if match:
+            subject = match.group(1).strip()
+
+        clean_subj = re.sub(r"[^\w]+", "_", subject.lower()).strip("_")
+        clean_subj = re.sub(r"^_+|_+$", "", clean_subj) or "app"
+
+        tasks: list[Task] = [
+            Task(
+                id="t1",
+                kind=TaskKind.PLANNING,
+                description=f"Plan architecture, components, and schema for {subject}",
+                required_capabilities=[Capability.PLANNING, Capability.REASONING],
+                preferred_capabilities=[Capability.CHAT],
+                required_tools=["workspace"],
+                inputs={"prompt": prompt, "stage": "architecture_planning"},
+                outputs=["architecture_plan"],
+                validation_state="pending",
+            ),
+            Task(
+                id="t2",
+                kind=TaskKind.CODING,
+                description=f"Implement application code and project structure for {subject}",
+                required_capabilities=[Capability.CODING, Capability.FILE_CREATION],
+                preferred_capabilities=[Capability.DEBUGGING, Capability.JSON, Capability.TOOLS],
+                file_output=True,
+                file_hint=f"src/{clean_subj}.py",
+                depends_on=["t1"],
+                required_tools=["file_operator"],
+                inputs={"stage": "implementation", "depends_on": ["t1"]},
+                outputs=["source_files"],
+                validation_state="pending",
+                model_hint=self._model_hints.get("coding"),
+            ),
+        ]
+
+        if has_tests:
+            tasks.append(
+                Task(
+                    id="t3",
+                    kind=TaskKind.CODING,
+                    description=f"Create comprehensive tests and test suite for {subject}",
+                    required_capabilities=[Capability.TESTING, Capability.CODING],
+                    preferred_capabilities=[Capability.DEBUGGING, Capability.TERMINAL],
+                    file_output=True,
+                    file_hint=f"test/test_{clean_subj}.py",
+                    depends_on=["t2"],
+                    required_tools=["file_operator", "terminal"],
+                    inputs={"stage": "tests", "depends_on": ["t2"]},
+                    outputs=["test_files"],
+                    validation_state="pending",
+                    model_hint=self._model_hints.get("coding"),
+                )
+            )
+
+        if has_docs:
+            doc_id = f"t{len(tasks) + 1}"
+            tasks.append(
+                Task(
+                    id=doc_id,
+                    kind=TaskKind.WRITING,
+                    description=f"Create complete documentation, guides, and README for {subject}",
+                    required_capabilities=[Capability.WRITING, Capability.DOCX_CREATION],
+                    preferred_capabilities=[Capability.CHAT, Capability.PLANNING],
+                    file_output=True,
+                    file_hint="docs/architecture.md",
+                    depends_on=["t2"],
+                    required_tools=["file_operator"],
+                    inputs={"stage": "documentation", "depends_on": ["t2"]},
+                    outputs=["documentation"],
+                    validation_state="pending",
+                    model_hint=self._model_hints.get("writing"),
+                )
+            )
+
+        if self._add_review:
+            val_id = f"t{len(tasks) + 1}"
+            prev_ids = [t.id for t in tasks if t.id != "t1"]
+            tasks.append(
+                Task(
+                    id=val_id,
+                    kind=TaskKind.REVIEW,
+                    description=f"Validate everything: check architecture, tests, documentation, and files for {subject}",
+                    required_capabilities=[Capability.REASONING, Capability.CODE_ANALYSIS],
+                    preferred_capabilities=[Capability.CHAT, Capability.JSON],
+                    depends_on=prev_ids,
+                    required_tools=["file_operator", "terminal"],
+                    inputs={"stage": "validation", "depends_on": prev_ids},
+                    outputs=["validation_report"],
+                    validation_state="pending",
+                )
+            )
+
+        synth_id = "t-synthesis"
+        tasks.append(
+            Task(
+                id=synth_id,
+                kind=TaskKind.SYNTHESIS,
+                description=_SYNTHESIS_INSTRUCTION,
+                required_capabilities=[Capability.CHAT],
+                preferred_capabilities=[Capability.WRITING, Capability.REASONING],
+                depends_on=[t.id for t in tasks],
+                inputs={"stage": "synthesis"},
+                outputs=["final_response"],
+                validation_state="pending",
+            )
+        )
+
+        dag = TaskDAG(tasks=tasks)
+        dag.topological_order()
         return dag
 
     # -- decomposition ------------------------------------------------------

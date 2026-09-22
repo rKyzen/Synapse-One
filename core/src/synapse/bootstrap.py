@@ -161,10 +161,38 @@ def create_container(paths: SynapsePaths | None = None, env: dict | None = None)
         ),
     )
     # Phase 3 — task orchestration, workspace memory, result synthesis.
-    container.register(
-        TaskPlanner,
-        lambda: HeuristicTaskPlanner(**config.settings.planner),
-    )
+    # The task planner is the AI Master Orchestrator (model-backed task
+    # divider) when ``master_agent.enabled`` is true; otherwise the
+    # deterministic heuristic planner. Either way the heuristic planner is the
+    # built-in fallback of the AI orchestrator, so disabling the feature (or
+    # any Master AI failure) degrades to today's behavior exactly.
+    def _build_task_planner() -> None:
+        fallback = HeuristicTaskPlanner(
+            **{
+                k: v for k, v in config.settings.planner.items()
+                if k in HeuristicTaskPlanner._ACCEPTED_KWARGS
+            }
+        )
+        if not bool(config.get("master_agent.enabled", False)):
+            return fallback
+        from synapse.hardware import TierResolver
+        from synapse.master import AIMasterOrchestrator
+
+        return AIMasterOrchestrator(
+            providers=container.resolve(ProviderManager),
+            registry=container.resolve(ModelRegistry),
+            hardware=container.resolve(HardwareProvider),
+            config=config,
+            resolver=TierResolver(config),
+            fallback_planner=fallback,
+            enabled=True,
+            temperature=float(config.get("master_agent.temperature", 0.1)),
+            max_retries=int(config.get("master_agent.max_retries", 1)),
+            max_tasks=int(config.get("master_agent.max_tasks", 8)),
+            events=events,
+        )
+
+    container.register(TaskPlanner, lambda: _build_task_planner())
     container.register(
         MemoryStore,
         lambda: WorkspaceMemory(

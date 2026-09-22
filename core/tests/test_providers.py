@@ -204,6 +204,30 @@ def test_ollama_without_routed_model_uses_first_installed(ollama):
     assert response.model_id == "llama3.2:latest"
 
 
+def test_ollama_default_model_falls_back_when_not_installed(tmp_path):
+    toml = '[providers.ollama]\ndefault_model = "qwen2.5:3b"\n'
+    provider = OllamaProvider(_config(tmp_path, toml), EventBus(), _ep())
+    provider._client = FakeClient(
+        {"get": FakeResponse(200, {"models": [{"name": "llama3.2:latest", "size": 123}]})}
+    )
+    provider._ready = True
+    response = provider.chat(ChatRequest(messages=[ChatMessage(role="user", content="ping")]))
+    assert response.model_id == "llama3.2:latest"
+
+
+def test_ollama_default_model_matches_untagged_installed(tmp_path):
+    toml = '[providers.ollama]\ndefault_model = "llama3.2"\n'
+    provider = OllamaProvider(_config(tmp_path, toml), EventBus(), _ep())
+    provider._client = FakeClient(
+        {"get": FakeResponse(200, {"models": [{"name": "llama3.2:latest", "size": 123}]})}
+    )
+    provider._ready = True
+    response = provider.chat(ChatRequest(messages=[ChatMessage(role="user", content="ping")]))
+    # the configured default matches the installed :latest tag; the real
+    # installed name is sent (never an uninstalled tag)
+    assert response.model_id == "llama3.2:latest"
+
+
 def test_ollama_health(ollama):
     assert ollama.health() is True
 

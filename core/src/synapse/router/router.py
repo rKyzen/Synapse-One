@@ -53,7 +53,30 @@ _REQUIRED_WEIGHTS: dict[Capability, float] = {
     Capability.JSON: 0.20,
     Capability.TERMINAL: 0.15,
     Capability.CHAT: 0.15,
+    Capability.CONVERSATION: 0.15,
     Capability.LANGUAGES: 0.15,
+    Capability.RESEARCH: 0.40,
+    Capability.SUMMARIZATION: 0.35,
+    Capability.CODE_ANALYSIS: 0.45,
+    Capability.FILE_READING: 0.25,
+    Capability.FILE_CREATION: 0.40,
+    Capability.FILE_EDITING: 0.45,
+    Capability.TESTING: 0.40,
+    Capability.IMAGE_UNDERSTANDING: 0.55,
+    Capability.PDF_READING: 0.40,
+    Capability.PDF_CREATION: 0.35,
+    Capability.DOCX_CREATION: 0.35,
+    Capability.DOCUMENT_ANALYSIS: 0.40,
+    Capability.PPT_CREATION: 0.35,
+    Capability.SPREADSHEET_CREATION: 0.35,
+    Capability.DATA_ANALYSIS: 0.45,
+    Capability.PROJECT_CREATION: 0.45,
+    Capability.PROJECT_ANALYSIS: 0.45,
+    Capability.TASK_MANAGEMENT: 0.30,
+    Capability.MEMORY: 0.25,
+    Capability.KNOWLEDGE_RETRIEVAL: 0.30,
+    Capability.CITATIONS: 0.25,
+    Capability.AUTOMATION: 0.35,
 }
 
 #: PREFERRED capabilities contribute at this fraction of the required weight.
@@ -252,11 +275,14 @@ class Router(Router):
         if available_models is not None:
             installed = available_models.get(m.provider_id)
             # Ollama reports tags ("llama3.2:latest"); config keys are untagged.
-            matched = bool(installed) and (
-                m.id in installed or f"{m.id}:latest" in installed
-            )
-            if not matched:
-                return f"not reported installed by {m.provider_id}"
+            # None = provider couldn't report (transient failure) — don't
+            # exclude; empty set = genuinely no models — exclude.
+            if installed is not None:
+                if len(installed) == 0:
+                    return f"no models installed on {m.provider_id}"
+                matched = m.id in installed or f"{m.id}:latest" in installed
+                if not matched:
+                    return f"not reported installed by {m.provider_id}"
 
         if decision.preferred_kind == ProviderKind.LOCAL and m.kind != ProviderKind.LOCAL:
             return f"privacy requires local execution, model is {m.kind.value}"
@@ -330,6 +356,123 @@ class Router(Router):
             "timeout_rate": history.get("timeout_rate"),
             "failure_rate": history.get("failure_rate"),
         }
+
+    def explain_routing(
+        self,
+        decision: Decision,
+        hardware: HardwareProfile,
+        registry: list[ModelMetadata],
+        provider_health: dict[str, bool],
+        available_models: dict[str, set[str]] | None = None,
+        *,
+        performance: dict[str, dict] | None = None,
+    ) -> list[dict]:
+        """Return detailed routing analysis for all models.
+
+        Each entry contains:
+            - model: model id
+            - suitable: whether it passes all hard constraints
+            - exclusion_reason: why it was excluded (if applicable)
+            - capability_score: raw capability match score
+            - adjusted_score: after reliability/performance adjustments
+            - rank: position in final ranking (1 = best)
+            - scoring_breakdown: detailed scoring components
+        """
+        results = []
+        candidates, excluded = self._filter(
+            registry, hardware, decision, provider_health, available_models
+        )
+
+        # Add excluded models
+        for exc in excluded:
+            results.append({
+                "model": exc["model"],
+                "suitable": False,
+                "exclusion_reason": exc["reason"],
+                "capability_score": 0,
+                "adjusted_score": 0,
+                "rank": None,
+                "scoring_breakdown": {},
+            })
+
+        # Score candidates
+        required = set(decision.required_capabilities)
+        preferred = [c for c in decision.preferred_capabilities if c not in required]
+        scored = []
+        for m in candidates:
+            raw_score = self._score(m, decision, required, preferred, 0)
+            adjusted = self._reliability_adjust(raw_score, m, performance)
+            breakdown = self._score_breakdown(m, decision, required, preferred)
+            scored.append({
+                "model": m.id,
+                "suitable": True,
+                "exclusion_reason": None,
+                "capability_score": round(raw_score, 3),
+                "adjusted_score": round(adjusted, 3),
+                "rank": None,
+                "scoring_breakdown": breakdown,
+            })
+
+        # Sort and rank
+        scored.sort(key=lambda x: x["adjusted_score"], reverse=True)
+        for i, entry in enumerate(scored):
+            entry["rank"] = i + 1
+
+        results.extend(scored)
+        return results
+
+    def _score_breakdown(
+        self,
+        m: ModelMetadata,
+        decision: Decision,
+        required: set[Capability],
+        preferred: list[Capability],
+    ) -> dict:
+        """Detailed breakdown of scoring components."""
+        breakdown = {
+            "required_capabilities": {},
+            "preferred_capabilities": {},
+            "penalties": {},
+            "bonuses": {},
+        }
+
+        # Required capability scores
+        for cap in required:
+            score = m.capabilities.score_for(cap)
+            weight = _REQUIRED_WEIGHTS.get(cap, 0.0)
+            breakdown["required_capabilities"][cap.value] = {
+                "score": round(score, 3),
+                "weight": weight,
+                "contribution": round(score * weight, 3),
+            }
+
+        # Preferred capability scores
+        for cap in preferred:
+            score = m.capabilities.score_for(cap)
+            weight = _REQUIRED_WEIGHTS.get(cap, 0.0) * _PREFERRED_MULTIPLIER
+            breakdown["preferred_capabilities"][cap.value] = {
+                "score": round(score, 3),
+                "weight": round(weight, 3),
+                "contribution": round(score * weight, 3),
+            }
+
+        # Penalties
+        if Capability.VISION not in required:
+            if m.capabilities.vision:
+                breakdown["penalties"]["vision_unused"] = _VISION_UNUSED_PENALTY
+            if m.capabilities.ocr > 0:
+                breakdown["penalties"]["ocr_unused"] = _OCR_UNUSED_PENALTY
+            if m.capabilities.pdf > 0:
+                breakdown["penalties"]["pdf_unused"] = _PDF_UNUSED_PENALTY
+
+        # Bonuses
+        breakdown["bonuses"]["local"] = _LOCAL_BIAS if m.kind == ProviderKind.LOCAL else 0
+        breakdown["bonuses"]["privacy"] = round(m.privacy_score * _PRIVACY_BIAS, 3)
+        breakdown["bonuses"]["latency"] = round(
+            _LATENCY_WEIGHT.get(m.latency, 0.5) * _LATENCY_BONUS, 3
+        )
+
+        return breakdown
 
     def _reliability_note(self, m: ModelMetadata, performance: dict[str, dict] | None) -> str:
         summary = self._reliability_summary(m, performance)

@@ -91,14 +91,54 @@ class TimelineHub:
             return {"kind": "understand", "text": "Understanding request…"}
         if name == Events.REQUEST_ANALYZED:
             return {"kind": "analyze", "text": "Analyzing the request…"}
+        if name == Events.TASK_PLANNED:
+            count = payload.get("task_count", "")
+            return {"kind": "plan_tasks", "text": f"Planning tasks ({count} task{'s' if count != 1 else ''})…"}
         if name == Events.RETRIEVAL_RAN:
-            return {"kind": "search", "text": "Searching workspace…"}
+            return {"kind": "search", "text": "Reading workspace knowledge…"}
+        if name == Events.CAPABILITY_SELECTED:
+            cap = payload.get("capability", "general")
+            return {"kind": "select_capability", "text": f"Selecting capability: {cap}"}
+        if name == Events.TASK_ROUTED:
+            model = payload.get("model", "model")
+            task_id = payload.get("task_id", "")
+            return {"kind": "routing", "text": f"Routing task {task_id} to {model}…"}
         if name == Events.MODEL_LOADED:
             return {"kind": "model", "text": f"Loading {payload.get('model_id', 'model')}…"}
         if name == Events.MODEL_REUSED:
-            return {"kind": "model", "text": f"Using {payload.get('model_id', 'model')}…"}
+            return {"kind": "model", "text": f"Using loaded model {payload.get('model_id', 'model')}…"}
+        if name == Events.TASK_STARTED:
+            desc = payload.get("description", payload.get("task_id", "task"))
+            return {"kind": "execute_task", "text": f"Executing: {desc[:50]}…"}
+        if name == Events.TASK_WAITING:
+            task_id = payload.get("task_id", "")
+            deps = ", ".join(payload.get("depends_on", []))
+            return {"kind": "waiting", "text": f"Task {task_id} waiting for {deps}…"}
+        if name == Events.FILE_WRITTEN:
+            return {"kind": "create_file", "text": f"Creating file: {payload.get('path', 'file')}…"}
+        if name == Events.FILE_EDITED:
+            return {"kind": "edit_file", "text": f"Editing file: {payload.get('path', 'file')}…"}
+        if name == Events.FILE_READ:
+            return {"kind": "read_files", "text": f"Reading file: {payload.get('path', 'file')}…"}
+        if name == Events.TESTS_RUN:
+            return {"kind": "run_tests", "text": f"Running tests: {payload.get('suite', 'test suite')}…"}
+        if name == Events.RESULT_VALIDATED:
+            status = payload.get("status", "valid")
+            return {"kind": "validate_result", "text": f"Validating result: {status}…"}
+        if name == Events.TASK_COMPLETED:
+            task_id = payload.get("task_id", "")
+            ms = payload.get("latency_ms", 0)
+            return {"kind": "complete", "text": f"Task {task_id} completed ({ms:.0f}ms)" if task_id else f"Step completed ({ms:.0f}ms)"}
         if name == Events.TASK_FAILED:
-            return {"kind": "error", "text": "A task failed"}
+            return {"kind": "error", "text": f"Task failed: {payload.get('reason', 'unknown error')}"}
+        if name == Events.PIPELINE_STARTED:
+            return {"kind": "pipeline", "text": "Starting multi-agent pipeline…"}
+        if name == Events.PIPELINE_STAGE_STARTED:
+            return {"kind": "stage", "text": f"Stage: {payload.get('description', 'processing')}…"}
+        if name == Events.PIPELINE_STAGE_COMPLETED:
+            return {"kind": "stage_done", "text": f"Completed: {payload.get('description', 'stage')}"}
+        if name == Events.TOOL_CALLED:
+            return {"kind": "tool", "text": f"Using tool: {payload.get('tool_name', 'tool')}…"}
         if name == Events.REQUEST_COMPLETED:
             return {"kind": "finished", "text": "Finished"}
         return None

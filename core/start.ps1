@@ -14,10 +14,40 @@
 $ErrorActionPreference = "Stop"
 
 $Root = $PSScriptRoot
+$VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
 Push-Location $Root
 try {
     & (Join-Path $Root "bootstrap.ps1")
     if ($LASTEXITCODE -ne 0) { exit 1 }
+
+    # --- Adaptive model installation (onboarding gate) ---------------------
+    # First launch (and every launch with missing models): detect, prompt,
+    # run SetupModels.bat, then continue startup. Skip with
+    # $env:SYNAPSE_SKIP_MODEL_SETUP = "1".
+    $SetupBat = Join-Path (Split-Path $Root -Parent) "SetupModels.bat"
+    if ($env:SYNAPSE_SKIP_MODEL_SETUP -ne "1" -and (Test-Path -LiteralPath $SetupBat)) {
+        Write-Host "Checking AI models ..."
+        & $SetupBat --check
+        $modelStatus = $LASTEXITCODE
+        if ($modelStatus -ne 0) {
+            Write-Host ""
+            Write-Host "Synapse needs to install AI models before first use." -ForegroundColor Yellow
+            if ($modelStatus -eq 2) {
+                Write-Host "  Ollama is not installed. SetupModels.bat will install it from the bundled OllamaSetup.exe (or download it)."
+            } else {
+                Write-Host "  Models for this machine's hardware tier are missing and will be downloaded."
+            }
+            $choice = Read-Host "Proceed with model installation? [Y/n]"
+            if ($choice -notmatch "^n") {
+                & $SetupBat
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "[WARN] Model installation did not fully complete - starting anyway (some features may be limited)." -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "[WARN] Skipping model installation - starting anyway (AI features may be limited)." -ForegroundColor Yellow
+            }
+        }
+    }
 
     # uvicorn writes its normal INFO logs to stderr. Under PowerShell 5.1 a
     # "Stop" preference would turn that stderr output into a fatal error and
@@ -32,9 +62,9 @@ try {
     Write-Host ""
 
     if ($args -contains "--reload") {
-        & .\.venv\Scripts\python.exe -m uvicorn synapse.api:app --host 127.0.0.1 --port 8000 --reload
+        & $VenvPy -m uvicorn synapse.api:app --host 127.0.0.1 --port 8000 --reload
     } else {
-        & .\.venv\Scripts\python.exe -m uvicorn synapse.api:app --host 127.0.0.1 --port 8000
+        & $VenvPy -m uvicorn synapse.api:app --host 127.0.0.1 --port 8000
     }
 } finally {
     Pop-Location

@@ -499,6 +499,35 @@ class TestManifestFallbackPhase7:
         ops = parse_file_manifest("```python\nprint(1)\n```", hint="main.py")
         assert ops == [{"action": "write", "path": "main.py", "content": "print(1)"}]
 
+    def test_fence_with_preceding_heading_or_label(self):
+        text = (
+            "Here is the project:\n\n"
+            "### `src/expense_tracker.py`\n"
+            "```python\nclass ExpenseTracker:\n    pass\n```\n\n"
+            "**test/test_expense_tracker.py**:\n"
+            "```python\ndef test_tracker():\n    pass\n```\n\n"
+            "File: docs/architecture.md\n"
+            "```markdown\n# Architecture\n```\n\n"
+            "requirements.txt\n"
+            "```text\npytest\n```"
+        )
+        ops = parse_file_manifest(text)
+        assert [o["path"] for o in ops] == [
+            "src/expense_tracker.py",
+            "test/test_expense_tracker.py",
+            "docs/architecture.md",
+            "requirements.txt",
+        ]
+
+    def test_fence_sanitizes_bare_hints(self):
+        # Bare hints without extensions (e.g. "test_" or "md") must never create bare files
+        ops = parse_file_manifest("```python\nprint(1)\n```", hint="test_")
+        assert ops[0]["path"] == "test/test_test.py" or ops[0]["path"] == "test/test_app.py"
+        assert "." in ops[0]["path"]
+
+        ops_doc = parse_file_manifest("```markdown\n# Doc\n```", hint="md")
+        assert ops_doc[0]["path"] == "README.md"
+
     def test_colliding_names_get_suffix_not_lost(self):
         text = "```html\n# file: index.html\nA\n```\n```html\n# file: index.html\nB\n```"
         ops = parse_file_manifest(text)

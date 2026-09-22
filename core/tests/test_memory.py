@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from synapse.domain import ModelDescriptor
-from synapse.domain.enums import MemoryScope
+from synapse.domain import ModelDescriptor, ModelMetadata
+from synapse.domain.enums import MemoryScope, ProviderKind
 from synapse.memory import WorkspaceMemory
 
 
@@ -149,3 +149,40 @@ def test_embedding_failure_degrades_to_keyword(memory):
     memory._providers._providers[0].embed = boom
     hits = memory.search(MemoryScope.CONVERSATION, "deploy the server")
     assert len(hits) == 1  # degraded search still returns the entry
+
+
+class MinimalEmbedProvider(EmbedProvider):
+    """Embedding provider whose only installed model differs from the
+    configured embedding model (tier-adaptive scenario)."""
+
+    def list_models(self):
+        return [ModelDescriptor(id="all-minilm:latest", provider_id="ollama")]
+
+    def to_metadata(self, descriptor):
+        return ModelMetadata(
+            id=descriptor.id,
+            provider_id="ollama",
+            kind=ProviderKind.LOCAL,
+            privacy_score=1.0,
+            capabilities={"embeddings": 1.0},
+        )
+
+
+def test_embedding_provider_falls_back_when_configured_model_missing(temp_paths):
+    provider = MinimalEmbedProvider()
+    memory = WorkspaceMemory(
+        temp_paths, None, FakeProviders(provider), embedding_model="nomic-embed-text"
+    )
+    resolved_provider, resolved_model = memory._embedding_provider()
+    assert resolved_provider is provider
+    assert resolved_model is None  # provider auto-resolves the installed model
+
+
+def test_embedding_provider_uses_configured_model_when_installed(temp_paths):
+    provider = EmbedProvider()
+    memory = WorkspaceMemory(
+        temp_paths, None, FakeProviders(provider), embedding_model="nomic-embed-text"
+    )
+    resolved_provider, resolved_model = memory._embedding_provider()
+    assert resolved_provider is provider
+    assert resolved_model == "nomic-embed-text"

@@ -94,17 +94,20 @@ class FileOperator:
 
     # -- write ---------------------------------------------------------------
 
-    def write(self, rel: str, content: str) -> dict:
+    def write(self, rel: str, content: str | bytes) -> dict:
         """Create or overwrite a file atomically. Returns metadata."""
-        if not isinstance(content, str):
-            raise TypeError("content must be str")
+        if not isinstance(content, (str, bytes)):
+            raise TypeError("content must be str or bytes")
         path = self.path_for(rel)
         with self._lock:
             existed = path.exists()
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_name(f".{path.name}.tmp")
-                tmp.write_text(content, encoding="utf-8")
+                if isinstance(content, bytes):
+                    tmp.write_bytes(content)
+                else:
+                    tmp.write_text(content, encoding="utf-8")
                 tmp.replace(path)
             except OSError as exc:
                 log.warning("work_write_failed", path=rel, error=str(exc)[:160])
@@ -114,11 +117,24 @@ class FileOperator:
         log.info("work_file_written", path=rel, action=action, bytes=size)
         return {"path": rel, "action": action, "bytes": size}
 
+    def write_bytes(self, rel: str, data: bytes) -> dict:
+        """Write binary data atomically to a file."""
+        return self.write(rel, data)
+
     def read(self, rel: str) -> str | None:
         path = self.path_for(rel)
         if not path.is_file():
             return None
-        return path.read_text(encoding="utf-8")
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            data = path.read_bytes()
+            for enc in ("utf-16", "latin-1"):
+                try:
+                    return data.decode(enc)
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            return data.decode("utf-8", errors="replace")
 
     def rename(self, src: str, dst: str) -> dict:
         """Move a file (or empty directory) inside the root."""

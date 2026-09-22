@@ -425,7 +425,7 @@ class TestRequestStream:
 
     def test_stream_shows_workspace_reads_and_finished(self, client, temp_paths: SynapsePaths):
         pi, _ = self._adopted(client, temp_paths, "StreamProject")
-        events = self._events(client, project_id=pi)
+        events = self._events(client, project_id=pi, prompt="write the project overview to output.md")
         kinds = [e["kind"] for e in events]
         assert "read_workspace" in kinds
         assert "finished" in kinds
@@ -495,13 +495,52 @@ class TestAutoRename:
         store.append(chat.id, role="user", content="Analyze\n  our codebase   for bugs")
         assert store.get(chat.id).title == "Analyze our codebase for bugs"
 
+    def test_project_name_prefixes_renamed_chat(self, tmp_path):
+        from synapse.projects.chats import ChatStore
+
+        store = ChatStore("p", tmp_path / "chats")
+        chat = store.create("New chat")
+        store.append(
+            chat.id,
+            role="user",
+            content="build a landing page",
+            project_name="Portfolio Website",
+        )
+        assert store.get(chat.id).title == "Portfolio Website: build a landing page"
+
+    def test_project_name_truncated_in_renamed_chat(self, tmp_path):
+        from synapse.projects.chats import ChatStore
+
+        store = ChatStore("p", tmp_path / "chats")
+        chat = store.create("New chat")
+        store.append(
+            chat.id,
+            role="user",
+            content="x",
+            project_name="A very long project name that definitely exceeds the limit",
+        )
+        title = store.get(chat.id).title
+        assert title.startswith("A very long project name")
+        assert title.endswith(": x")
+        assert len(title) <= 60
+
+    def test_ui_new_title_is_treated_as_default(self, tmp_path):
+        from synapse.projects.chats import ChatStore
+
+        store = ChatStore("p", tmp_path / "chats")
+        chat = store.create("new")
+        store.append(chat.id, role="user", content="first prompt here")
+        assert store.get(chat.id).title == "first prompt here"
+
     def test_explicit_rename_is_never_overwritten(self, tmp_path):
         from synapse.projects.chats import ChatStore
 
         store = ChatStore("p", tmp_path / "chats")
         chat = store.create("New chat")
         store.rename(chat.id, "My custom title")
-        store.append(chat.id, role="user", content="something else")
+        store.append(
+            chat.id, role="user", content="something else", project_name="Portfolio Website"
+        )
         assert store.get(chat.id).title == "My custom title"
 
     def test_blank_message_falls_back(self, tmp_path):
@@ -664,3 +703,96 @@ class TestWorkspaceFirstRequest:
         assert "verified" in kinds
         assert "index" in kinds
         assert kinds[-1] == "done"
+
+
+class TestConversationNeverEntersPipeline:
+    """Permanent regression — chat and tool execution are completely separate.
+
+    A greeting, casual remark, or factual question must NEVER enter the
+    workspace artifact pipeline: no planner, no folders, no files, no
+    manifests, no action-log entries, no filesystem JSON. Only explicit work
+    requests may create artifacts. A bare "Hello" must be answered in natural
+    language and leave the workspace byte-for-byte untouched.
+    """
+
+    @staticmethod
+    def _project(client, name: str) -> str:
+        return client.post("/projects", json={"name": name}).json()["id"]
+
+    @staticmethod
+    def _assert_plain_chat(body: dict) -> None:
+        assert body["response"], "conversation must be answered by the model"
+        assert body["actions"] == [], "chat must not emit file actions"
+        assert "Actions (" not in body["response"]
+        assert '"files"' not in body["response"]
+
+    @staticmethod
+    def _work_untouched(client, project_id: str) -> None:
+        work = client.get(f"/projects/{project_id}/work").json()
+        paths = {f["path"] for f in work}
+        assert paths <= {"README.md"}, f"workspace mutated: {paths}"
+        assert client.get(f"/projects/{project_id}/actions").json() == []
+
+    def test_greeting_hello_creates_nothing(self, client):
+        pi = self._project(client, "ChatOnly")
+
+        resp = client.post("/request", json={"prompt": "Hello", "project_id": pi})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        self._assert_plain_chat(body)
+        assert body["intent"] in ("conversation", "question_answering")
+        self._work_untouched(client, pi)
+
+    def test_casual_chat_never_creates_artifacts(self, client):
+        pi = self._project(client, "Chat")
+        for prompt in ("How are you doing today?", "Nice to meet you!", "Tell me something interesting about space."):
+            resp = client.post("/request", json={"prompt": prompt, "project_id": pi})
+            assert resp.status_code == 200, resp.text
+            self._assert_plain_chat(resp.json())
+            self._work_untouched(client, pi)
+
+    def test_factual_questions_never_enter_workspace(self, client):
+        pi = self._project(client, "Q&A")
+        for prompt in ("What is the capital of France?", "Explain how photosynthesis works."):
+            resp = client.post("/request", json={"prompt": prompt, "project_id": pi})
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            self._assert_plain_chat(body)
+            self._work_untouched(client, pi)
+
+    def test_greeting_stream_emits_no_artifact_steps(self, client):
+        pi = self._project(client, "HelloStream")
+        events = []
+        with client.stream(
+            "POST", "/request/stream",
+            json={"prompt": "Hello", "project_id": pi},
+        ) as stream:
+            for line in stream.iter_lines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[len("data: ") :]))
+        kinds = [e["kind"] for e in events]
+        banned = {"file_write", "file_read", "pipeline", "stage", "stage_done", "tool", "routing", "complete", "search"}
+        assert not (set(kinds) & banned), f"chat leaked artifact steps: {kinds}"
+        assert kinds[-1] == "done"
+        payload = events[-1]["response"]
+        assert payload["intent"] == "conversation"
+        assert payload["actions"] == []
+        assert payload["execution_plan"]["steps"] == []
+
+    def test_explicit_file_request_still_writes(self, client, temp_paths: SynapsePaths):
+        """Guard the guard: an explicit file intent must still flow through."""
+        folder = _make_project_folder(temp_paths.home)
+        pi = client.post(
+            "/projects", json={"name": "Out", "workspace_path": str(folder)}
+        ).json()["id"]
+        client.post(f"/projects/{pi}/scan")
+        resp = client.post(
+            "/request",
+            json={"prompt": "write the project overview to output.md", "project_id": pi},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert any(
+            a["action"] == "created" and a["path"] == "output.md" for a in body["actions"]
+        )
+        assert (folder / "output.md").exists()

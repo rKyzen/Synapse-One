@@ -105,9 +105,15 @@ class Events:
 
     # Phase 3 — task orchestration, memory, synthesis
     TASK_PLANNED = "task.planned"
+    TASK_STARTED = "task.started"
     TASK_ROUTED = "task.routed"
     TASK_COMPLETED = "task.completed"
     TASK_FAILED = "task.failed"
+    TASK_WAITING = "task.waiting"
+    CAPABILITY_SELECTED = "capability.selected"
+    FILE_EDITED = "file.edited"
+    TESTS_RUN = "tests.run"
+    RESULT_VALIDATED = "result.validated"
     RESPONSE_SYNTHESIZED = "response.synthesized"
     MEMORY_WRITTEN = "memory.written"
 
@@ -118,5 +124,16 @@ class Events:
     FILE_INDEXED = "file.indexed"
     FILE_DELETED = "file.deleted"
     FILE_ATTACHED = "file.attached"
+    FILE_WRITTEN = "file.written"
+    FILE_READ = "file.read"
     RETRIEVAL_RAN = "retrieval.ran"
     VISION_PROCESSED = "vision.processed"
+
+    # Phase 15 — multi-agent pipeline
+    PIPELINE_STARTED = "pipeline.started"
+    PIPELINE_STAGE_STARTED = "pipeline.stage.started"
+    PIPELINE_STAGE_COMPLETED = "pipeline.stage.completed"
+    PIPELINE_STAGE_FAILED = "pipeline.stage.failed"
+    PIPELINE_COMPLETED = "pipeline.completed"
+    TOOL_CALLED = "tool.called"
+    TOOL_RESULT = "tool.result"

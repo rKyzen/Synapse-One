@@ -7,6 +7,7 @@ the order of execution. No behavior, no vendor logic.
 
 from __future__ import annotations
 
+from typing import Any
 from pydantic import BaseModel, Field
 
 from synapse.domain.enums import Capability, TaskKind, TaskStatus
@@ -25,6 +26,13 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.PENDING
     provider_id: str = ""
     model_id: str = ""
+    preferred_model: str | None = None
+    fallback_model: str | None = None
+    fallback_provider: str | None = None
+    required_tools: list[str] = Field(default_factory=list)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    outputs: list[str] = Field(default_factory=list)
+    validation_state: str | None = None
     capability_score: float = 0.0
     reason: str = ""
     result: str | None = None
@@ -118,6 +126,11 @@ class GraphNode(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     provider_id: str = ""
     model_id: str = ""
+    preferred_model: str | None = None
+    fallback_model: str | None = None
+    required_tools: list[str] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+    validation_state: str | None = None
     capability_score: float = 0.0
     reason: str = ""
     latency_ms: float = 0.0

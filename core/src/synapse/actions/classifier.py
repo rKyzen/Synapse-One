@@ -137,12 +137,37 @@ def classify_request(prompt: str) -> RequestKind:
 
 
 #: explicit-operation extractors: (action, regex) in priority order.
+# Conservative by design: prose verbs inside larger requests ("search and
+# filter expenses", "delete expenses") must NOT become backend operations —
+# search needs a quoted pattern (or an explicit non-stopword term) and delete
+# needs a real file target (extension or quoted path).
+_OP_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "for", "with", "by", "to", "of", "in",
+    "on", "at", "all", "any", "my", "your", "our", "their", "his", "her",
+    "its", "it", "this", "that", "these", "those", "each", "every", "some",
+    "no", "more", "most", "after", "before", "between", "but", "so", "if",
+    "can", "could", "should", "will", "would", "please", "then", "over",
+    "under", "from", "into", "them", "they", "we", "you", "me", "us",
+})
 _OP_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     ("list", re.compile(r"\b(list|show|display|print)\s+(the\s+)?(files|file\s*tree|tree|structure|folders|contents|workspace)\b", re.IGNORECASE)),
-    ("search", re.compile(r"\b(search|find|grep|locate)\s+(?:for\s+)?[\"']?([A-Za-z0-9_.*/?]+)[\"']?", re.IGNORECASE)),
+    (
+        "search",
+        re.compile(
+            r"\b(?:search|find|grep|locate)\s+(?:for\s+)?[\"']([^\"']+)[\"']"
+            r"|\b(?:search|find|grep|locate)\s+(?:for\s+)?([A-Za-z0-9_.*/?]+)",
+            re.IGNORECASE,
+        ),
+    ),
     ("read", re.compile(r"\b(?:read|cat|open|view|show|print)\s+(?:the\s+)?(?:file\s+|contents?\s+of\s+)?([A-Za-z0-9_\-/]*[A-Za-z0-9_\-]+\.[A-Za-z0-9]+)\b", re.IGNORECASE)),
     ("rename", re.compile(r"\b(?:rename|move)\s+([A-Za-z0-9_.\-/]+)\s+to\s+([A-Za-z0-9_.\-/]+)\b", re.IGNORECASE)),
-    ("delete", re.compile(r"\b(?:delete|remove|erase)\s+([A-Za-z0-9_.\-/]+(?:\.[A-Za-z0-9]+)?)\b", re.IGNORECASE)),
+    (
+        "delete",
+        re.compile(
+            r"\b(?:delete|remove|erase)\s+(?:[\"']([^\"']+)[\"']|([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]+))",
+            re.IGNORECASE,
+        ),
+    ),
     ("create_folder", re.compile(r"\bcreate\s+(?:a\s+|an\s+)?(?:folder|directory|subfolder)s?\s+(?:called|named)?\s*([A-Za-z0-9_.\-/]+)\b", re.IGNORECASE)),
 ]
 
@@ -161,13 +186,15 @@ def extract_workspace_ops(prompt: str) -> list[dict]:
             if action == "list":
                 ops.append({"action": "list"})
             elif action == "search":
-                ops.append({"action": "search", "pattern": match.group(2)})
+                term = match.group(1) or match.group(2)
+                if term.lower() not in _OP_STOPWORDS:
+                    ops.append({"action": "search", "pattern": term})
             elif action == "read":
                 ops.append({"action": "read", "path": match.group(1)})
             elif action == "rename":
                 ops.append({"action": "rename", "path": match.group(1), "to": match.group(2)})
             elif action == "delete":
-                ops.append({"action": "delete", "path": match.group(1), "confirmed": True})
+                ops.append({"action": "delete", "path": match.group(1) or match.group(2), "confirmed": True})
             elif action == "create_folder":
                 ops.append({"action": "create_folder", "path": match.group(1)})
     seen: set[tuple] = set()

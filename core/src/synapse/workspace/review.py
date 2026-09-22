@@ -23,11 +23,18 @@ from synapse.logging import get_logger
 log = get_logger("synapse.workspace.review")
 
 
-def _check_python(content: str) -> ValidationResult:
+def _as_text(content: str | bytes) -> str:
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    return str(content)
+
+
+def _check_python(content: str | bytes) -> ValidationResult:
     import ast
 
+    text = _as_text(content)
     try:
-        ast.parse(content)
+        ast.parse(text)
         return ValidationResult(path="", ok=True, checks=["python syntax ok"])
     except SyntaxError as exc:
         return ValidationResult(
@@ -36,11 +43,12 @@ def _check_python(content: str) -> ValidationResult:
         )
 
 
-def _check_json(content: str) -> ValidationResult:
+def _check_json(content: str | bytes) -> ValidationResult:
     import json
 
+    text = _as_text(content)
     try:
-        json.loads(content)
+        json.loads(text)
         return ValidationResult(path="", ok=True, checks=["json parses"])
     except json.JSONDecodeError as exc:
         return ValidationResult(
@@ -49,13 +57,14 @@ def _check_json(content: str) -> ValidationResult:
         )
 
 
-def _check_javascript(content: str) -> ValidationResult:
+def _check_javascript(content: str | bytes) -> ValidationResult:
+    text = _as_text(content)
     pairs = {"{": "}", "(": ")", "[": "]"}
     stack: list[str] = []
     in_str: str | None = None
     esc = False
     in_line_comment = False
-    for i, ch in enumerate(content):
+    for i, ch in enumerate(text):
         if in_line_comment:
             if ch == "\n":
                 in_line_comment = False
@@ -70,7 +79,7 @@ def _check_javascript(content: str) -> ValidationResult:
             continue
         if ch in ("'", '"', "`"):
             in_str = ch
-        elif ch == "/" and i + 1 < len(content) and content[i + 1] == "/":
+        elif ch == "/" and i + 1 < len(text) and text[i + 1] == "/":
             in_line_comment = True
         elif ch in pairs:
             stack.append(ch)
@@ -87,8 +96,9 @@ def _check_javascript(content: str) -> ValidationResult:
     return ValidationResult(path="", ok=True, checks=["bracket balance"])
 
 
-def _check_html(content: str) -> ValidationResult:
-    lowered = content.lower()
+def _check_html(content: str | bytes) -> ValidationResult:
+    text = _as_text(content)
+    lowered = text.lower()
     checks = ["non-empty"]
     if "<!doctype html" not in lowered and "<html" not in lowered:
         return ValidationResult(
@@ -100,10 +110,72 @@ def _check_html(content: str) -> ValidationResult:
     return ValidationResult(path="", ok=True, checks=[*checks, "document root present"])
 
 
-def _check_text(content: str) -> ValidationResult:
-    if not content.strip():
+def _check_pdf(content: str | bytes) -> ValidationResult:
+    data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
+    if not data or not data.startswith(b"%PDF"):
+        return ValidationResult(path="", ok=False, checks=["pdf header"], error="invalid pdf header")
+    return ValidationResult(path="", ok=True, checks=["pdf header ok", f"{len(data)} bytes"])
+
+
+def _check_zip_xml(content: str | bytes, member_name: str, format_name: str) -> ValidationResult:
+    import zipfile
+    import io
+
+    data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
+    if not data:
+        return ValidationResult(path="", ok=False, checks=[f"{format_name} content"], error="empty file")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+            if member_name not in names:
+                return ValidationResult(
+                    path="", ok=False, checks=[f"{format_name} package"],
+                    error=f"missing {member_name} in package",
+                )
+        return ValidationResult(path="", ok=True, checks=[f"{format_name} package ok", f"{len(data)} bytes"])
+    except Exception as exc:
+        return ValidationResult(
+            path="", ok=False, checks=[f"{format_name} zip"],
+            error=f"invalid {format_name} archive: {exc}",
+        )
+
+
+def _check_pptx(content: str | bytes) -> ValidationResult:
+    return _check_zip_xml(content, "ppt/presentation.xml", "pptx")
+
+
+def _check_xlsx(content: str | bytes) -> ValidationResult:
+    return _check_zip_xml(content, "xl/workbook.xml", "xlsx")
+
+
+def _check_text(content: str | bytes) -> ValidationResult:
+    if isinstance(content, bytes):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return ValidationResult(path="", ok=False, checks=["valid utf-8"], error="invalid utf-8 text")
+    else:
+        text = str(content)
+    if not text.strip():
         return ValidationResult(path="", ok=False, checks=["non-empty"], error="file is empty")
     return ValidationResult(path="", ok=True, checks=["non-empty", "valid utf-8"])
+
+
+def _check_docx(content: str | bytes) -> ValidationResult:
+    return _check_zip_xml(content, "word/document.xml", "docx")
+
+
+def _check_csv(content: str | bytes) -> ValidationResult:
+    import csv
+
+    text = content.decode("utf-8", "ignore") if isinstance(content, bytes) else str(content)
+    try:
+        rows = list(csv.reader(text.splitlines()))
+        if not rows:
+            return ValidationResult(path="", ok=False, checks=["csv rows"], error="empty csv")
+        return ValidationResult(path="", ok=True, checks=["csv format ok", f"{len(rows)} rows"])
+    except Exception as exc:
+        return ValidationResult(path="", ok=False, checks=["csv parses"], error=f"csv error: {exc}")
 
 
 _VALIDATORS = {
@@ -114,14 +186,25 @@ _VALIDATORS = {
     "cjs": _check_javascript,
     "html": _check_html,
     "htm": _check_html,
+    "pdf": _check_pdf,
+    "pptx": _check_pptx,
+    "ppt": _check_pptx,
+    "xlsx": _check_xlsx,
+    "xls": _check_xlsx,
+    "docx": _check_docx,
+    "doc": _check_docx,
+    "csv": _check_csv,
 }
 
 
-def validate_file(path: str, content: str) -> ValidationResult:
+def validate_file(path: str, content: str | bytes) -> ValidationResult:
     """Run the validator matching ``path``'s extension (default: text check)."""
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     checker = _VALIDATORS.get(ext, _check_text)
-    result = checker(content)
+    try:
+        result = checker(content)
+    except Exception as exc:
+        result = ValidationResult(path=path, ok=False, checks=["validation error"], error=str(exc))
     return result.model_copy(update={"path": path})
 
 

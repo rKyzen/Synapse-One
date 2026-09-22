@@ -61,6 +61,10 @@ class SynapsePaths:
             self.logs_dir,
             self.settings_dir,
             self.chats_dir,
+            self.goals_dir,
+            self.notes_dir,
+            self.documents_dir,
+            self.todos_dir,
             self.memory_dir,
             self.embeddings_dir,
             self.actions_dir,
@@ -95,6 +99,26 @@ class SynapsePaths:
     @property
     def chats_dir(self) -> Path:
         return self.data_dir / "chats"
+
+    @property
+    def goals_dir(self) -> Path:
+        """Per-project goal records (AI Operating Workspace, Phase A)."""
+        return self.data_dir / "goals"
+
+    @property
+    def notes_dir(self) -> Path:
+        """Per-project notes (AI Operating Workspace, Phase B)."""
+        return self.data_dir / "notes"
+
+    @property
+    def documents_dir(self) -> Path:
+        """Per-project documents (AI Operating Workspace, Phase B)."""
+        return self.data_dir / "documents"
+
+    @property
+    def todos_dir(self) -> Path:
+        """Per-project todo items (AI Operating Workspace, Phase B)."""
+        return self.data_dir / "todos"
 
     @property
     def memory_dir(self) -> Path:

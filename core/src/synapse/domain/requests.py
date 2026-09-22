@@ -53,6 +53,10 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = None
     stream: bool = False
     model: str | None = None
+    #: Optional structured-output hint: for Ollama this is the JSON-schema
+    #: object (``format``) forcing constrained decoding; cloud providers that
+    #: lack the feature simply ignore it. Never part of prompt text.
+    format: dict | None = None
 
 
 class ChatResponse(BaseModel):

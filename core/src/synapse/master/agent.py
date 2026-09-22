@@ -21,17 +21,20 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import time
 
 import structlog
 
 from synapse.actions import (
     ActionEngine,
+    IntentRouter,
     RequestKind,
     classify_request,
     extract_workspace_ops,
     requires_workspace_access,
 )
+from synapse.actions.followup import has_workspace_context, is_follow_up
 from synapse.analyzers import ComplexityAnalyzer, IntentAnalyzer, PrivacyAnalyzer
 from synapse.contracts import (
     CitationEngine,
@@ -73,6 +76,7 @@ from synapse.domain import (
     TaskStatus,
     WorkspaceOutcome,
 )
+from synapse.domain.enums import IntentKind, IntentType
 from synapse.domain.fileops import FileAction, ValidationResult
 from synapse.domain.tasks import TaskDAG
 from synapse.events import EventBus, Events
@@ -85,6 +89,7 @@ from synapse.workspace.manifest import (
     WORKSPACE_TOOL_INSTRUCTION,
     parse_file_manifest,
 )
+from synapse.workspace.operator import is_safe_relative_path
 
 log = structlog.get_logger("synapse.master")
 
@@ -94,6 +99,42 @@ _NO_ROUTE_GUIDANCE = (
     "Install or enable a matching provider/model in configuration, "
     "then retry."
 )
+
+#: claim verbs a model uses to assert it produced a file, followed by a path.
+#: Prose lines matching this for a path the action log did not verify are
+#: scrubbed from the final response (Phase XVI — responses reflect real
+#: execution only, never model claims).
+_FILE_CLAIM_RE = re.compile(
+    r"\b(?:created|wrote|written|saved|generated|added|updated|modified|deleted|renamed|built|writes|creates)\b"
+    r"[^.\n]{0,80}?\b([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]+)\b",
+    re.IGNORECASE,
+)
+
+#: a line that looks like a raw manifest the model echoed back (contains a
+#: ``"path":`` key plus file/folder keys) — never legitimate prose.
+_MANIFEST_FRAG_RE = re.compile(r'"path"\s*:\s*"')
+
+#: an explicit file operand (a name with an extension, e.g. ``main.py``) — the
+#: one signal that turns artifact wording into a real file-editing request even
+#: when no workspace context exists yet (Phase XVIII).
+_EXPLICIT_FILE_TARGET_RE = re.compile(r"(?:[\w\-/]+\.)[a-z0-9]+", re.IGNORECASE)
+
+
+def _manifest_paths(result: str) -> list[str]:
+    """Extract only the paths a file-manifest answer declares — never contents."""
+    paths: list[str] = []
+    for m in re.finditer(r'"path"\s*:\s*"([^"]+)"', result or ""):
+        if is_safe_relative_path(m.group(1)):
+            paths.append(m.group(1))
+    return list(dict.fromkeys(paths))
+
+
+def _is_scratch_project(project_id: str | None) -> bool:
+    """True when the request rides the automatic scratch project (id
+    ``general``, created at boot with only a generated README) instead of a
+    user-adopted project. Scratch auto-generated files are NOT workspace
+    context for follow-up resolution (Phases XVII–XVIII)."""
+    return not project_id or project_id == "general"
 
 
 class MasterAgent:
@@ -179,15 +220,25 @@ class MasterAgent:
         # Phase XIII — project identity surfaced inside every model prompt.
         project_name: str | None = None,
         project_path: str | None = None,
+        # Phase XV — per-project indexing, change tracking, diagnostics.
+        project_index=None,
+        change_panel=None,
+        diagnostics=None,
     ) -> AgentResponse:
         start = time.perf_counter()
         self._events.publish(Events.REQUEST_RECEIVED, {"prompt_length": len(prompt)})
         # Phase 7 — every request is classified into one of the seven kinds so
         # the execution path can be chosen before any model is consulted.
         kind = classify_request(prompt)
+        # AI Operating Workspace — the Intent Router gates the pipeline BEFORE
+        # any planning: conversation and question answering are answered by
+        # the selected language model directly and never touch the workspace
+        # planner, the artifact pipeline, folders, manifests, files, or JSON.
+        intent_kind = IntentRouter().route(prompt)
         log.info(
             "request_classified",
             kind=kind.value,
+            intent=intent_kind.value,
             prompt=prompt[:120],
         )
         # Resolve per-project scoped workspace/memory (Phase 5), else fall back
@@ -210,6 +261,80 @@ class MasterAgent:
             },
         )
         self._events.publish(Events.REQUEST_ANALYZED, {"intent": intent.primary.value, "complexity": complexity.score})
+
+        # AI Operating Workspace — conversation/question answering short-circuit.
+        # Everything below (workspace prepare, decision overrides, planner,
+        # brief, Action Engine context, task DAG, file outputs, manifests,
+        # action log) is artifact-pipeline machinery and must never run for
+        # chat intents: a greeting or factual question is answered by the
+        # selected language model directly — no folders, no files, no JSON.
+        #
+        # Phase XVII — conversational wording can still be workspace intent.
+        # Inside an active project, follow-ups ("fix the bugs", "continue",
+        # "change the UI", "add search", "why isn't this working?") carry no
+        # explicit artifact, so the router alone would classify them as pure
+        # chat and answer without the planner or tools. When the wording
+        # reads as a continuation of the project work AND the workspace state
+        # proves project activity (prior conversation turns, prior recorded
+        # actions, or existing project files), the chat-only verdict is
+        # overridden and the request enters the workspace pipeline instead.
+        follow_up_override = False
+        if intent_kind.is_chat_only:
+            if (
+                is_follow_up(prompt)
+                and not _is_scratch_project(project_id)
+                and has_workspace_context(
+                    memory=mem,
+                    conversation_id=conversation_id,
+                    file_operator=file_operator,
+                    action_log=action_log,
+                )
+            ):
+                follow_up_override = True
+                intent_kind = IntentKind.FILE_EDITING
+                log.info(
+                    "follow_up_context_resolved",
+                    prompt=prompt[:120],
+                    kind=kind.value,
+                )
+            else:
+                return self._chat_direct(
+                    prompt, intent, complexity, privacy, hardware, registry_models,
+                    model=model, temperature=temperature, max_tokens=max_tokens,
+                    files=files, ws=ws, memory=mem, conversation_id=conversation_id,
+                    start=start,
+                )
+        elif (
+            intent_kind is IntentKind.FILE_EDITING
+            and not _EXPLICIT_FILE_TARGET_RE.search(prompt)
+            and (
+                _is_scratch_project(project_id)
+                or not has_workspace_context(
+                    memory=mem,
+                    conversation_id=conversation_id,
+                    file_operator=file_operator,
+                    action_log=action_log,
+                )
+            )
+        ):
+            # Phase XVIII — the mirror rule of follow-ups: artifact wording
+            # WITHOUT any workspace state and WITHOUT an explicit file target
+            # ("HI fix the issue") has nothing to edit — it is conversation.
+            # Forcing it into the file pipeline would pin a coding specialist
+            # for a plain conversational ask (the scratch project's generated
+            # README is not a workspace to edit). In a user-adopted project,
+            # workspace state (files, turns, actions) keeps it in the pipeline.
+            log.info(
+                "editing_wording_without_context_resolved_as_chat",
+                prompt=prompt[:120],
+            )
+            intent_kind = IntentKind.QUESTION_ANSWERING
+            return self._chat_direct(
+                prompt, intent, complexity, privacy, hardware, registry_models,
+                model=model, temperature=temperature, max_tokens=max_tokens,
+                files=files, ws=ws, memory=mem, conversation_id=conversation_id,
+                start=start,
+            )
 
         # Phase 4 — attach workspace files (vision/RAG/code scan) and build context.
         workspace_outcome: WorkspaceOutcome | None = None
@@ -241,6 +366,7 @@ class MasterAgent:
         available = self._provider_available_models()
         perf_stats = self._performance.stats() if self._performance else None
 
+
         # Phase X — the Action Engine feeds EVERY agent real filesystem
         # context (the backend reads; the model edits). Workspace access is
         # universal: any request kind may read and write inside the project
@@ -268,7 +394,10 @@ class MasterAgent:
                 memory=mem,
                 conversation_id=conversation_id,
             )
-            if requires_workspace_access(prompt):
+            if requires_workspace_access(prompt) or follow_up_override:
+                # Phase XVII — a resolved follow-up always inspects the
+                # workspace first (files + prior results), never answers on
+                # the bare message alone.
                 context = ActionEngine(file_operator).build_context(
                     on_file=lambda p: self._publish_timeline("read_file", f"Reading {p}")
                 )
@@ -338,6 +467,8 @@ class MasterAgent:
                 self._verify_and_remember(
                     actions, file_operator,
                     workspace=ws, memory=mem, conversation_id=conversation_id,
+                    project_index=project_index, change_panel=change_panel,
+                    diagnostics=diagnostics,
                 )
 
             # Synthesize final response (excluding raw file manifests, which
@@ -493,6 +624,164 @@ class MasterAgent:
 
     # -- task orchestration -------------------------------------------------
 
+    def _chat_direct(
+        self,
+        prompt: str,
+        intent,
+        complexity,
+        privacy,
+        hardware,
+        registry_models,
+        *,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        files: list[str] | None = None,
+        ws=None,
+        memory=None,
+        conversation_id: str | None = None,
+        start: float,
+    ) -> AgentResponse:
+        """Chat-only request path (AI Operating Workspace Intent Router).
+
+        A conversation or question-answering intent never enters the workspace
+        pipeline: no planner, no brief, no Action Engine, no folders, no
+        manifests, no files, no JSON. One decision → one route → one model
+        call → the answer, plus conversation memory so chat continuity works.
+
+        Chat stays workspace-AWARE without becoming workspace-WRITING: when a
+        workspace exists, its index/vision retrieval is used read-only to
+        answer (e.g. "summarize the design notes", attached screenshots), but
+        nothing is planned, written, or recorded as an action.
+        """
+        # A chat path is by definition NOT an editing pipeline: when the
+        # wording analyzer still reports a coding primary (bug/fix/script
+        # words), demanding CODING capabilities would pin a coding specialist
+        # for a plain conversational ask. Reset to conversation so the routed
+        # model is a chat-capable one.
+        if intent.primary is IntentType.CODING:
+            intent = intent.model_copy(
+                update={
+                    "primary": IntentType.CONVERSATION,
+                    "secondary": intent.primary,
+                    "reasoning": [
+                        *intent.reasoning,
+                        "chat path with coding wording: required capabilities "
+                        "reset to conversation",
+                    ],
+                }
+            )
+        decision = self._decision.decide(intent, complexity, privacy, hardware, registry_models)
+        # Chat never invokes the (workspace/artifact) planner: the execution
+        # plan is a static empty shell so the response envelope stays complete
+        # without running any planning machinery for conversation.
+        plan = ExecutionPlan(
+            intent=intent.primary,
+            complexity=complexity.score,
+            privacy=privacy.mode,
+            steps=[],
+        )
+
+        # Read-only workspace context (RAG hits, vision descriptions, code
+        # scan markers). Purely informational: a chat must still never create
+        # folders/files/actions, and a failing workspace must never break chat.
+        workspace_outcome = None
+        chat_context = ""
+        if ws is not None and ws.enabled:
+            try:
+                context_text, workspace_outcome = ws.prepare(prompt, files)
+                if context_text:
+                    chat_context = f"{context_text}\n\n"
+            except Exception as exc:  # noqa: BLE001 - chat resilience is paramount
+                log.warning("chat_workspace_prepare_failed", error=str(exc)[:200])
+                workspace_outcome = None
+
+        provider_ids = sorted({m.provider_id for m in registry_models} | set(self._providers.provider_ids()))
+        health = {pid: self._providers.health(pid) for pid in provider_ids}
+        available = self._provider_available_models()
+        perf_stats = self._performance.stats() if self._performance else None
+
+        routing = self._route_chat(
+            decision, hardware, registry_models, health, available,
+            complexity=complexity.score, prompt=prompt, perf_stats=perf_stats,
+        )
+        if routing is None:
+            final_response = _NO_ROUTE_GUIDANCE
+        else:
+            try:
+                response = self._execute_with_lifecycle(
+                    routing, f"{chat_context}{prompt}", temperature=temperature, max_tokens=max_tokens
+                )
+                final_response = response.content
+            except ProviderUnavailable:
+                final_response = _NO_ROUTE_GUIDANCE
+            self._events.publish(
+                Events.REQUEST_ROUTED, {"provider": routing.provider_id, "model": routing.model_id}
+            )
+
+        self._save_memory(prompt, final_response, memory=memory, conversation_id=conversation_id)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        graph = ExecutionGraph()
+        graph.total_latency_ms = round(elapsed_ms, 1)
+        trace_routing = routing or RoutingDecision(reason="no chat route")
+        trace = self._build_trace(
+            intent, complexity, privacy, decision, trace_routing, hardware, elapsed_ms, response=None
+        )
+        self._events.publish(
+            Events.REQUEST_COMPLETED, {"latency_ms": round(elapsed_ms, 1), "tasks": 0, "chat": True}
+        )
+        log.info(
+            "chat_completed",
+            latency_ms=round(elapsed_ms, 1),
+            provider=trace_routing.provider_id,
+            model=trace_routing.model_id,
+        )
+        return AgentResponse(
+            response=final_response,
+            intent=intent.primary,
+            complexity=complexity.score,
+            privacy=privacy.mode,
+            provider=trace_routing.provider_id,
+            model=trace_routing.model_id,
+            execution_plan=plan,
+            decision_trace=trace,
+            latency_ms=round(elapsed_ms, 1),
+            execution_graph=graph,
+            workspace=workspace_outcome,
+            actions=[],
+        )
+
+    def _route_chat(
+        self,
+        decision: Decision,
+        hardware,
+        registry_models,
+        health,
+        available,
+        *,
+        complexity: int,
+        prompt: str,
+        perf_stats,
+    ) -> RoutingDecision | None:
+        """Route a chat-only request: loaded-model reuse first, then Router."""
+        if self._lifecycle is not None:
+            reuse = self._lifecycle.find_reuse(
+                decision, hardware, health, available, complexity=complexity
+            )
+            if reuse is not None:
+                return reuse
+        return self._router.route(
+            decision,
+            hardware,
+            registry_models,
+            health,
+            available,
+            complexity=complexity,
+            prompt=prompt,
+            performance=perf_stats,
+        )
+
     def _plan_tasks(self, prompt, intent, complexity, privacy, decision) -> TaskDAG:
         if self._task_planner is not None:
             return self._task_planner.plan(prompt, intent, complexity, privacy, decision)
@@ -565,7 +854,21 @@ class MasterAgent:
             if task.kind == TaskKind.SYNTHESIS:
                 continue  # synthesized by the Result Synthesizer, not a model
 
+            # Dependency gate
+            if task.depends_on:
+                incomplete_deps = [dep for dep in task.depends_on if not any(t.id == dep and t.status == TaskStatus.COMPLETED for t in executed)]
+                if incomplete_deps:
+                    task.status = TaskStatus.WAITING
+                    self._events.publish(Events.TASK_WAITING, {"task_id": task.id, "depends_on": incomplete_deps})
+
             task_decision = self._decision_for_task(task, decision)
+
+            # Publish capability selection
+            if task.required_capabilities:
+                self._events.publish(
+                    Events.CAPABILITY_SELECTED,
+                    {"task_id": task.id, "capability": ", ".join(c.value for c in task.required_capabilities)},
+                )
 
             # Phase 4: Build smart context using ContextBuilder
             effective_prompt = task.description
@@ -595,6 +898,16 @@ class MasterAgent:
                 )
                 effective_prompt = context_bundle.user_prompt
 
+            # Phase XVI — pass the previous model's output forward: every
+            # task (except the first) sees the result of its dependencies, or
+            # of the most recently executed step, as prompt context. File
+            # manifests are reduced to their paths — raw manifest contents are
+            # never re-fed to another model (the filesystem, after apply, is
+            # the source of truth).
+            prior = self._prior_context(task, executed)
+            if prior:
+                effective_prompt = f"{effective_prompt}\n\n{prior}"
+
             # Phase 7 fix — a file task model is told exactly what to return.
             # Without this real LLMs answer in prose/fenced code instead of a
             # manifest, so the backend would have nothing structured to apply.
@@ -616,6 +929,11 @@ class MasterAgent:
                 description=task.description,
                 status=task.status,
                 depends_on=list(task.depends_on),
+                preferred_model=task.preferred_model or task.model_hint,
+                fallback_model=task.fallback_model,
+                required_tools=list(task.required_tools),
+                outputs=list(task.outputs),
+                validation_state=task.validation_state,
                 order=order,
                 memory_context_used=mem is not None,
             )
@@ -655,6 +973,12 @@ class MasterAgent:
             )
 
             try:
+                task.status = TaskStatus.RUNNING
+                node.status = TaskStatus.RUNNING
+                self._events.publish(
+                    Events.TASK_STARTED,
+                    {"task_id": task.id, "description": task.description, "model": routing.model_id},
+                )
                 task_start = time.perf_counter()
                 response = self._execute_with_lifecycle(routing, effective_prompt, temperature=temperature, max_tokens=max_tokens)
                 task.latency_ms = (time.perf_counter() - task_start) * 1000
@@ -662,6 +986,19 @@ class MasterAgent:
                 task.status = TaskStatus.COMPLETED
                 node.status = TaskStatus.COMPLETED
                 node.latency_ms = round(task.latency_ms, 1)
+
+                if task.kind == TaskKind.REVIEW:
+                    self._events.publish(Events.RESULT_VALIDATED, {"task_id": task.id, "status": "verified"})
+                    task.validation_state = "verified"
+                    node.validation_state = "verified"
+                elif "test" in task.description.lower():
+                    self._events.publish(Events.TESTS_RUN, {"task_id": task.id, "suite": task.description})
+                    task.validation_state = "tested"
+                    node.validation_state = "tested"
+                else:
+                    task.validation_state = "completed"
+                    node.validation_state = "completed"
+
                 log.info(
                     "task_completed",
                     task_id=task.id,
@@ -787,6 +1124,38 @@ class MasterAgent:
             )
             graph.synthesized = True
         return graph, executed, primary
+
+    def _prior_context(
+        self,
+        task: Task,
+        executed: list[Task],
+    ) -> str:
+        """Context from previously executed models (Phase XVI).
+
+        Dependency results are preferred; when a task declares no deps, the
+        most recently executed task's result is passed instead, so consecutive
+        parts of a multi-model chain always see the previous step's output.
+        File-manifest results are reduced to their paths — raw manifest
+        contents are never re-fed to another model (the filesystem, after
+        apply, is the source of truth).
+        """
+        if not executed:
+            return ""
+        deps = [t for t in executed if t.id in task.depends_on]
+        if not deps:
+            deps = [executed[-1]]
+        parts: list[str] = []
+        for prior in deps[-2:]:
+            if prior.file_output:
+                paths = _manifest_paths(prior.result or "")
+                blob = f"[files produced in this step: {', '.join(paths) or 'none'}]"
+            else:
+                blob = (prior.result or "")[:2000]
+            parts.append(
+                f"--- Result from step {prior.id} "
+                f"(kind: {prior.kind.value}, model: {prior.model_id}) ---\n{blob}"
+            )
+        return "Context from the previous step(s):\n" + "\n\n".join(parts)
 
     def _decision_for_task(self, task: Task, base: Decision) -> Decision:
         return Decision(
@@ -996,14 +1365,18 @@ class MasterAgent:
         workspace=None,
         memory=None,
         conversation_id: str | None = None,
+        project_index=None,
+        change_panel=None,
+        diagnostics=None,
     ) -> None:
         """Phase XIII — the write→verify→index→remember close of every request.
 
         After files are applied: confirm each changed file exists on the
         workspace disk, syntax-check what we can, refresh the project index for
-        the written files (so grounding/search reflects the new state), and
-        record the write in project memory (so a later request can recall what
-        the agent produced without re-reading the folder). Never raises.
+        the written files (so grounding/search reflects the new state), record
+        the change in the change panel, run post-write diagnostics, and record
+        the write in project memory (so a later request can recall what the
+        agent produced without re-reading the folder). Never raises.
         """
         changed = [
             a for a in actions
@@ -1011,6 +1384,23 @@ class MasterAgent:
         ]
         if not changed:
             return
+
+        # Phase XV — file change panel: created / modified / renamed / deleted.
+        if change_panel is not None:
+            try:
+                for a in actions:
+                    if a.status != "ok":
+                        continue
+                    if a.action in ("created", "created_folder"):
+                        change_panel.record_created(a.path, size=a.bytes or None)
+                    elif a.action == "modified":
+                        change_panel.record_modified(a.path)
+                    elif a.action == "renamed":
+                        change_panel.record_renamed("(moved)", a.path)
+                    elif a.action == "deleted":
+                        change_panel.record_deleted(a.path)
+            except Exception:  # noqa: BLE001 - change tracking never breaks the request
+                log.debug("change_panel_record_failed", exc_info=True)
 
         rels = [a.path for a in changed if a.action in ("created", "modified")]
         verified = 0
@@ -1027,6 +1417,30 @@ class MasterAgent:
                 log.debug("work_verify_failed", path=rel, exc_info=True)
         if verified and workspace is not None:
             self._index_changed_files(workspace, file_operator, rels)
+
+        # Phase XV — keep the project code index in sync with what we wrote.
+        if project_index is not None:
+            try:
+                for rel in rels + [a.path for a in changed if a.action == "renamed"]:
+                    entry = project_index.update_file(rel)
+                    if entry is not None:
+                        self._publish_timeline("index", f"Indexed {rel}")
+            except Exception:  # noqa: BLE001 - index refresh is best-effort
+                log.debug("project_index_update_failed", exc_info=True)
+
+        # Phase XV — post-write diagnostics: surface syntax problems early.
+        if diagnostics is not None:
+            try:
+                for rel in rels:
+                    diags = diagnostics.analyze_file(rel)
+                    for d in diags:
+                        if d.severity == "error":
+                            self._publish_timeline(
+                                "diagnostic",
+                                f"{rel}:{d.line or 0} {d.message}",
+                            )
+            except Exception:  # noqa: BLE001 - diagnostics never break the request
+                log.debug("diagnostics_after_write_failed", exc_info=True)
 
         if memory is not None:
             try:
@@ -1095,6 +1509,7 @@ class MasterAgent:
         When nothing could be parsed for a file kind, a short notice is shown
         instead of the raw model text.
         """
+        prose = self._scrub_unverified_claims(prose, actions)
         if not actions:
             if summary_only:
                 return (
@@ -1102,7 +1517,13 @@ class MasterAgent:
                     "could not be converted into file actions. Check the action "
                     "log for details."
                 )
-            return prose or _NO_ROUTE_GUIDANCE
+            if prose:
+                return prose
+            return (
+                "The model produced no answer for this request — its output "
+                "contained no statements that could be verified. Check the "
+                "action log for details."
+            )
         review_text = ""
         review_task = dag.get("t-review")
         if review_task is not None and review_task.result:
@@ -1113,6 +1534,33 @@ class MasterAgent:
         if prose and prose != _NO_ROUTE_GUIDANCE:
             return f"{block}\n\n{prose}"
         return block
+
+    def _scrub_unverified_claims(self, prose: str, actions: list[FileAction]) -> str:
+        """Remove model-prose statements that claim filesystem work the
+        verified action log does not back.
+
+        Phase XVI — the final response must reflect actual execution. Lines
+        asserting a file was created/written/modified/deleted/renamed without
+        a matching ok action, and raw manifest echoes, are dropped.
+        """
+        if not prose:
+            return prose
+        verified = {a.path for a in actions if a.status == "ok"}
+        kept: list[str] = []
+        for line in prose.splitlines():
+            if self._line_is_unverified_claim(line, verified):
+                continue
+            kept.append(line)
+        return "\n".join(kept)
+
+    @staticmethod
+    def _line_is_unverified_claim(line: str, verified: set[str]) -> bool:
+        for m in _FILE_CLAIM_RE.finditer(line):
+            if m.group(1) not in verified:
+                return True
+        return bool(_MANIFEST_FRAG_RE.search(line)) and any(
+            key in line for key in ("content", "folders", '"files"')
+        )
 
     def _record_action_log(
         self,
@@ -1205,14 +1653,18 @@ class MasterAgent:
         kinds = {pid: self._providers.get(pid).kind.value for pid in self._providers.provider_ids()}
         return {"local": "local" in kinds.values(), "cloud": "cloud" in kinds.values()}
 
-    def _provider_available_models(self) -> dict[str, set[str]]:
-        """provider_id -> set of model ids the provider reports as installed."""
-        available: dict[str, set[str]] = {}
+    def _provider_available_models(self) -> dict[str, set[str] | None]:
+        """provider_id -> set of model ids the provider reports as installed.
+
+        Returns ``None`` for a provider whose ``list_models()`` raised,
+        distinguishing transient failures from genuinely empty installs.
+        """
+        available: dict[str, set[str] | None] = {}
         for provider in self._providers.all():
             try:
                 ids = {d.id for d in provider.list_models()}
             except Exception:  # noqa: BLE001 - a failing provider never blocks routing
-                ids = set()
+                ids = None
             available[provider.provider_id] = ids
         return available
 

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "description": "Synapse One - adaptive model installation (single source of truth)",
+  "ollama": {
+    "install_url": "https://ollama.com/download/OllamaSetup.exe",
+    "service_url": "http://localhost:11434/api/tags"
+  },
+  "hardware": {
+    "tier2_min_ram_gb": 8,
+    "tier2_min_cpu_patterns": [
+      "Ryzen [3579] (PRO )?[3-9]\\d{3}",
+      "Ryzen (AI|Threadripper)",
+      "EPYC",
+      "[iI][3579]-1\\d{4}",
+      "Core Ultra"
+    ]
+  },
+  "tiers": {
+    "tier1": {
+      "display": "Tier 1 - Lightweight (low RAM or older CPU)",
+      "models": [
+        { "id": "llama3.2:1b", "role": "chat" },
+        { "id": "qwen2.5:3b", "role": "chat" },
+        { "id": "qwen2.5-coder:1.5b", "role": "code" },
+        { "id": "qwen3:1.7b", "role": "chat" },
+        { "id": "all-minilm", "role": "embeddings" },
+        { "id": "moondream", "role": "vision" }
+      ]
+    },
+    "tier2": {
+      "display": "Tier 2 - Standard (8GB+ RAM, modern CPU)",
+      "models": [
+        { "id": "llama3.1:8b", "role": "chat" },
+        { "id": "qwen2.5:7b", "role": "chat" },
+        { "id": "qwen2.5-coder:7b", "role": "code" },
+        { "id": "qwen3:4b", "role": "chat" },
+        { "id": "qwen2.5vl:7b", "role": "vision" },
+        { "id": "nomic-embed-text", "role": "embeddings" }
+      ]
+    }
+  }
+}

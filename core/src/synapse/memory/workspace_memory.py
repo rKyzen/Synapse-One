@@ -165,39 +165,36 @@ class WorkspaceMemory(MemoryStore):
     # -- embeddings ---------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> list[list[float]] | None:
-        provider = self._embedding_provider()
+        provider, model = self._embedding_provider()
         if provider is None:
             return None
         try:
-            return provider.embed(texts, model=self._embedding_model)
+            return provider.embed(texts, model=model)
         except Exception:  # noqa: BLE001 - memory never breaks the pipeline
             log.debug("memory_embed_failed")
             return None
 
     def _embedding_provider(self):
-        """First provider that exposes an embedding-capable model, or None."""
+        """First provider exposing an embedding model, as ``(provider, model)``.
+
+        ``model`` is the configured embedding model when it is installed,
+        otherwise ``None`` so the provider auto-resolves the best installed
+        embedding model (adaptive to whatever the hardware tier installed).
+        """
         for provider in self._providers.all():
             try:
-                if provider.embed is not None and self._provider_has_embedding(provider):
-                    return provider
+                if getattr(provider, "embed", None) is None:
+                    continue
+                installed = {d.id for d in provider.list_models()}
+                if self._embedding_model and self._embedding_model in installed:
+                    return provider, self._embedding_model
+                for desc in provider.list_models():
+                    meta = provider.to_metadata(desc)
+                    if meta and meta.capabilities.embeddings > 0.9:
+                        return provider, None
             except Exception:  # noqa: BLE001
                 continue
-        return None
-
-    def _provider_has_embedding(self, provider) -> bool:
-        # Prefer the configured model if installed; else any embedding-capable
-        # model the provider reports.
-        installed = {d.id for d in provider.list_models()}
-        if self._embedding_model and self._embedding_model in installed:
-            return True
-        try:
-            for desc in provider.list_models():
-                meta = provider.to_metadata(desc)
-                if meta and meta.capabilities.embeddings > 0.9:
-                    return True
-        except Exception:  # noqa: BLE001
-            return False
-        return False
+        return None, None
 
     @staticmethod
     def _cosine(a: list[float], b: list[float]) -> float:

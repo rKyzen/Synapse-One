@@ -1,0 +1,8 @@
+To run this App
+
+Pre requesties:
+Python 3.14
+
+GO to core folder and run start.bat
+
+Press y when asked to install the required Libraries, files and models

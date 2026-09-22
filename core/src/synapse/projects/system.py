@@ -70,9 +70,19 @@ class WorkspaceSystem:
         self._workspaces: dict[str, object] = {}
         self._memories: dict[str, object] = {}
         self._chat_stores: dict[str, ChatStore] = {}
+        self._goal_stores: dict[str, object] = {}
         self._operators: dict[str, object] = {}
         self._action_logs: dict[str, object] = {}
         self._projects: dict[str, ProjectInfo] = {}
+        self._indexes: dict[str, object] = {}
+        self._change_panels: dict[str, object] = {}
+        self._terminals: dict[str, object] = {}
+        self._code_editors: dict[str, object] = {}
+        self._diagnostics: dict[str, object] = {}
+        self._tool_registries: dict[str, object] = {}
+        self._note_stores: dict[str, object] = {}
+        self._document_stores: dict[str, object] = {}
+        self._todo_stores: dict[str, object] = {}
         self._lock = threading.RLock()
 
         self._memory_cfg = dict(memory_config or {})
@@ -81,6 +91,7 @@ class WorkspaceSystem:
 
         self._active_project_id: str | None = None
         self._active_chat_id: str | None = None
+        self._active_view: str = "home"
         self.recover()
 
     # -- projects -----------------------------------------------------------
@@ -138,6 +149,10 @@ class WorkspaceSystem:
     def create_project(self, name: str, parent_dir: str | None = None) -> ProjectInfo:
         info = self.manager.create(name, parent_dir=parent_dir)
         self._reload_projects(include_archived=True)
+        try:
+            self.project_index(info.id).scan()
+        except Exception:  # noqa: BLE001 - indexing never blocks creation
+            log.debug("initial_index_scan_failed", project_id=info.id)
         log.info("project_ready", project_id=info.id, workspace=info.workspace_path)
         return info
 
@@ -145,6 +160,10 @@ class WorkspaceSystem:
         """Adopt an existing folder on disk as a project workspace."""
         info = self.manager.register(name, workspace_path)
         self._reload_projects(include_archived=True)
+        try:
+            self.project_index(info.id).scan()
+        except Exception:  # noqa: BLE001 - indexing never blocks registration
+            log.debug("initial_index_scan_failed", project_id=info.id)
         return info
 
     def scan_project(self, project_id: str) -> dict:
@@ -266,7 +285,23 @@ class WorkspaceSystem:
                 log.warning("internal_purge_failed", path=str(bucket))
 
     def _drop_cached(self, project_id: str) -> None:
-        for bucket in (self._workspaces, self._memories, self._chat_stores, self._operators, self._action_logs):
+        for bucket in (
+            self._workspaces,
+            self._memories,
+            self._chat_stores,
+            self._goal_stores,
+            self._operators,
+            self._action_logs,
+            self._indexes,
+            self._change_panels,
+            self._terminals,
+            self._code_editors,
+            self._diagnostics,
+            self._tool_registries,
+            self._note_stores,
+            self._document_stores,
+            self._todo_stores,
+        ):
             bucket.pop(project_id, None)
 
     # -- per-project internal state ------------------------------------------
@@ -283,6 +318,108 @@ class WorkspaceSystem:
             if project_id not in self._chat_stores:
                 self._chat_stores[project_id] = ChatStore(project_id, self.chats_dir(project_id))
             return self._chat_stores[project_id]
+
+    # -- goals (AI Operating Workspace redesign, Phase A) ----------------------
+    #
+    # Goals are the atomic unit of the product: the user states an outcome and
+    # the workspace tracks progress, steps, and linked artifacts around it.
+
+    def goals_dir(self, project_id: str) -> Path:
+        return self._paths.goals_dir / project_id
+
+    def goal_store(self, project_id: str) -> "GoalStore":
+        from synapse.projects.goals import GoalStore
+
+        with self._lock:
+            if project_id not in self._goal_stores:
+                self._goal_stores[project_id] = GoalStore(
+                    project_id, self.goals_dir(project_id)
+                )
+            return self._goal_stores[project_id]
+
+    def goals(self, project_id: str, *, include_archived: bool = False) -> list:
+        """All goals of a workspace, newest first."""
+        return self.goal_store(project_id).list(include_archived=include_archived)
+
+    def workspace_type(self, project_id: str) -> str:
+        """The workspace's type (general/student/research/business/...).
+
+        Stored in the project settings blob so it survives re-registration and
+        is exposed through ``ProjectInfo.settings`` without schema changes.
+        Defaults to ``general`` — the universal workspace.
+        """
+        info = self.manager.get(project_id)
+        if info is None:
+            return "general"
+        return (info.settings or {}).get("workspace_type", "general")
+
+    def set_workspace_type(self, project_id: str, workspace_type: str) -> bool:
+        """Change a workspace's type (validates against the enum)."""
+        from synapse.domain.enums import WorkspaceType
+
+        try:
+            value = WorkspaceType(workspace_type)
+        except ValueError:
+            return False
+        return self._update_project_settings(project_id, {"workspace_type": value.value})
+
+    def _update_project_settings(self, project_id: str, patch: dict) -> bool:
+        info = self.manager.get(project_id)
+        if info is None:
+            return False
+        settings = dict(info.settings or {})
+        settings.update(patch)
+        self.manager.update_settings(project_id, settings)
+        self._reload_projects(include_archived=True)
+        return True
+
+    # -- notes / documents / todos (AI Operating Workspace redesign, Phase B) ---
+    #
+    # Workspace content stores: notes (scratch), documents (typed artifacts),
+    # todos (user to-do items). All follow the shared JsonEntityStore pattern
+    # and are goal-linkable — chat stays one view inside the workspace.
+
+    def note_store(self, project_id: str) -> "NoteStore":
+        from synapse.projects.notes import NoteStore
+
+        with self._lock:
+            if project_id not in self._note_stores:
+                self._note_stores[project_id] = NoteStore(
+                    project_id, self._paths.notes_dir / project_id
+                )
+            return self._note_stores[project_id]
+
+    def notes(self, project_id: str) -> list:
+        """All notes of a workspace, newest first."""
+        return self.note_store(project_id).list()
+
+    def document_store(self, project_id: str) -> "DocumentStore":
+        from synapse.projects.documents import DocumentStore
+
+        with self._lock:
+            if project_id not in self._document_stores:
+                self._document_stores[project_id] = DocumentStore(
+                    project_id, self._paths.documents_dir / project_id
+                )
+            return self._document_stores[project_id]
+
+    def documents(self, project_id: str) -> list:
+        """All documents of a workspace, newest first."""
+        return self.document_store(project_id).list()
+
+    def todo_store(self, project_id: str) -> "TodoStore":
+        from synapse.projects.todos import TodoStore
+
+        with self._lock:
+            if project_id not in self._todo_stores:
+                self._todo_stores[project_id] = TodoStore(
+                    project_id, self._paths.todos_dir / project_id
+                )
+            return self._todo_stores[project_id]
+
+    def todos(self, project_id: str) -> list:
+        """All todo items of a workspace, newest first."""
+        return self.todo_store(project_id).list()
 
     def file_operator(self, project_id: str):
         """Safe filesystem tool rooted at the project's WORKSPACE FOLDER.
@@ -307,6 +444,141 @@ class WorkspaceSystem:
                     project_id, self._paths.actions_dir / project_id
                 )
             return self._action_logs[project_id]
+
+    def project_index(self, project_id: str):
+        """Per-project code index (files, imports, symbols, dependencies)."""
+        with self._lock:
+            if project_id not in self._indexes:
+                from synapse.workspace.project_index import ProjectIndex
+
+                self._indexes[project_id] = ProjectIndex(self.workspace_path(project_id))
+            return self._indexes[project_id]
+
+    def change_panel(self, project_id: str):
+        """Per-project file-change tracker (created/modified/deleted/renamed)."""
+        with self._lock:
+            if project_id not in self._change_panels:
+                from synapse.workspace.change_panel import ChangePanel
+
+                self._change_panels[project_id] = ChangePanel(session_id=project_id)
+            return self._change_panels[project_id]
+
+    def terminal(self, project_id: str):
+        """Per-project command runner rooted at the workspace folder."""
+        with self._lock:
+            if project_id not in self._terminals:
+                from synapse.terminal.runner import TerminalRunner
+
+                self._terminals[project_id] = TerminalRunner(self.workspace_path(project_id))
+            return self._terminals[project_id]
+
+    def tool_registry(self, project_id: str):
+        """The Tool Engine surface for a workspace (Phase A wiring).
+
+        A ``ToolRegistry`` bound to the project's FileOperator, with the
+        filesystem tools (read/write/edit/folder/delete/search/list) plus a
+        sandboxed terminal tool. This is the single execution surface the
+        orchestrator routes tool calls through; the legacy imperative path in
+        the master agent stays untouched until Phase B adopts the registry.
+        """
+        with self._lock:
+            if project_id not in self._tool_registries:
+                from synapse.pipeline.tools import ToolDefinition, ToolRegistry
+
+                registry = ToolRegistry(self.file_operator(project_id))
+
+                def _run_terminal(command: str, timeout: int | None = None) -> dict:
+                    """Handler bound to THIS project's terminal (closure)."""
+                    result = self.terminal(project_id).run(command, timeout=timeout)
+                    return result.to_dict() if hasattr(result, "to_dict") else result.__dict__
+
+                registry.register(
+                    ToolDefinition(
+                        name="run_terminal",
+                        description=(
+                            "Run a shell command in the workspace folder and "
+                            "return its output (sandboxed, timed out)"
+                        ),
+                        parameters={
+                            "command": {"type": "string", "description": "Command to run"},
+                            "timeout": {
+                                "type": "integer",
+                                "description": "Timeout in seconds (optional)",
+                            },
+                        },
+                        handler=_run_terminal,
+                        dangerous=True,
+                    )
+                )
+                self._tool_registries[project_id] = registry
+            return self._tool_registries[project_id]
+
+    def code_editor(self, project_id: str):
+        """Per-project patch-based code editor over the workspace."""
+        with self._lock:
+            if project_id not in self._code_editors:
+                from synapse.actions.code_editor import CodeEditor
+
+                self._code_editors[project_id] = CodeEditor(self.file_operator(project_id))
+            return self._code_editors[project_id]
+
+    def diagnostics(self, project_id: str):
+        """Per-project diagnostics analyzer (syntax, imports, style)."""
+        with self._lock:
+            if project_id not in self._diagnostics:
+                from synapse.diagnostics.analyzer import DiagnosticAnalyzer
+
+                self._diagnostics[project_id] = DiagnosticAnalyzer(
+                    self.file_operator(project_id),
+                    project_index=self.project_index(project_id),
+                )
+            return self._diagnostics[project_id]
+
+    def search_workspace(self, project_id: str, query: str, *, max_results: int = 20) -> dict:
+        """Semantic + keyword + symbol search across the project's files.
+
+        Returns a ``SearchResults``-shaped dict with ``results``, ``query``,
+        ``total_results``, ``search_time_ms`` and ``truncated``.
+        """
+        from synapse.search.semantic_search import SemanticSearch
+
+        engine = SemanticSearch(self.project_index(project_id))
+        results = engine.search(query, max_results=max_results)
+        return {
+            "results": [
+                {
+                    "file_path": r.file_path,
+                    "line": r.line,
+                    "content": r.content,
+                    "score": round(r.score, 3),
+                    "match_type": r.match_type,
+                    "metadata": r.metadata,
+                }
+                for r in results.results
+            ],
+            "query": results.query,
+            "total_results": results.total_results,
+            "search_time_ms": results.search_time_ms,
+            "truncated": results.truncated,
+        }
+
+    def refresh_project_index(self, project_id: str) -> dict | None:
+        """(Re)scan the project's workspace folder into the code index."""
+        index = self.project_index(project_id)
+        structure = index.scan()
+        if structure is None:
+            return None
+        self.manager.touch(project_id)
+        return {
+            "root": structure.root,
+            "total_files": structure.total_files,
+            "total_folders": structure.total_folders,
+            "languages": structure.languages,
+            "main_language": structure.main_language,
+            "has_tests": structure.has_tests,
+            "has_docs": structure.has_docs,
+            "entry_points": structure.entry_points,
+        }
 
     def memory_for(self, project_id: str):
         """Per-project WorkspaceMemory, stored internally under ``memory/``."""
@@ -377,8 +649,15 @@ class WorkspaceSystem:
         trace: dict | None = None,
         files: list[str] | None = None,
     ) -> StoredMessage | None:
+        info = self.manager.get(project_id)
         message = self.chat_store(project_id).append(
-            chat_id, role=role, content=content, meta=meta, trace=trace, files=files,
+            chat_id,
+            role=role,
+            content=content,
+            meta=meta,
+            trace=trace,
+            files=files,
+            project_name=info.name if info else None,
         )
         if message:
             self._save_session(project_id, chat_id)
@@ -400,6 +679,10 @@ class WorkspaceSystem:
             known = set(self.manager.list_ids(include_archived=True))
             for bucket_name in (
                 self._paths.chats_dir,
+                self._paths.goals_dir,
+                self._paths.notes_dir,
+                self._paths.documents_dir,
+                self._paths.todos_dir,
                 self._paths.memory_dir,
                 self._paths.embeddings_dir,
                 self._paths.actions_dir,
@@ -455,6 +738,7 @@ class WorkspaceSystem:
                 cid = session.get("chat_id")
                 if cid and self.chat_store(pid).get(cid):
                     self._active_chat_id = cid
+            self._active_view = session.get("view", "home")
         if self._active_project_id is None:
             self._active_project_id = DEFAULT_PROJECT_ID
         if self._active_project_id not in self._projects:
@@ -489,7 +773,14 @@ class WorkspaceSystem:
         return {
             "project_id": self._active_project_id,
             "chat_id": self._active_chat_id,
+            "view": self._active_view,
         }
+
+    def switch_view(self, view: str) -> dict:
+        """Switch the workspace UI view (home/files/notes/tasks/chats/...)."""
+        self._active_view = view.strip() or "home"
+        self._save_session(self._active_project_id, self._active_chat_id)
+        return self.session()
 
     def save_session(self, project_id: str, chat_id: str | None = None) -> None:
         self._save_session(project_id, chat_id or self._active_chat_id)
@@ -502,6 +793,7 @@ class WorkspaceSystem:
             data = {
                 "project_id": self._active_project_id,
                 "chat_id": self._active_chat_id,
+                "view": self._active_view,
                 "updated_at": _now_iso(),
             }
             self._session_path.parent.mkdir(parents=True, exist_ok=True)

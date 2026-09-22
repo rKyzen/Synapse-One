@@ -30,6 +30,8 @@ from synapse.workspace.operator import WorkspaceSafetyError
 from synapse.workspace.review import summarize as summarize_validations
 from synapse.workspace.review import validate_file
 
+from synapse.workspace.artifacts import build_artifact_content
+
 log = get_logger("synapse.actions.engine")
 
 
@@ -51,8 +53,9 @@ class ActionEngine:
     def read(self, rel: str) -> str | None:
         return self._op.read(rel)
 
-    def write(self, rel: str, content: str) -> dict:
-        return self._op.write(rel, content)
+    def write(self, rel: str, content: str | bytes) -> dict:
+        data, _ = build_artifact_content(rel, content)
+        return self._op.write(rel, data)
 
     def edit(self, rel: str, old: str, new: str) -> dict:
         """Targeted in-place edit; fails cleanly when ``old`` is absent."""
@@ -113,6 +116,37 @@ class ActionEngine:
 
     # -- execution --------------------------------------------------------------
 
+    def _verified(self, perform: Callable[[], object], check: Callable[[], bool], fail: str):
+        """Run a mutation, verify the real filesystem state, retry once.
+
+        ``perform`` must be safe to run twice (idempotent). When the check
+        still fails after the retry, ``OSError(fail)`` is raised so the caller
+        records a failed action — a silent non-write can never pass as "ok".
+        """
+        result = perform()
+        if check():
+            return result
+        result = perform()
+        if not check():
+            raise OSError(fail)
+        return result
+
+    def _edit_verified(self, path: str, old: str, new: str) -> bool:
+        """True when the edit landed: file exists and ``old`` is gone."""
+        content = self._op.read(path)
+        return content is not None and old not in content
+
+    def _content_matches(self, path: str, expected: str | bytes) -> bool:
+        if not self._op.exists(path):
+            return False
+        if isinstance(expected, bytes):
+            try:
+                return self._op.path_for(path).read_bytes() == expected
+            except OSError:
+                return False
+        content = self._op.read(path)
+        return content == expected
+
     def apply(
         self,
         ops: list[dict],
@@ -156,15 +190,23 @@ class ActionEngine:
                 on_step(step)
             try:
                 if action in ("create_folder", "mkdir", "folder"):
-                    self.create_folder(path)
+                    self._verified(
+                        lambda: self.create_folder(path),
+                        lambda: self._op.path_for(path).is_dir(),
+                        "folder missing after create (verification failed)",
+                    )
                     entry = FileAction(path=path, action="created_folder", status="ok")
                 elif action in ("rename", "move"):
-                    result = self._op.rename(path, op["to"])
+                    self._verified(
+                        lambda: self._op.rename(path, op["to"]),
+                        lambda: self._op.exists(op["to"]) and not self._op.exists(path),
+                        "rename not applied (verification failed)",
+                    )
                     content = self._op.read(op["to"]) or ""
                     check = validate_file(op["to"], content)
                     validations.append(check)
                     entry = FileAction(
-                        path=result["path"], action="renamed", bytes=len(content.encode()),
+                        path=op["to"], action="renamed", bytes=len(content.encode()),
                         validated=check.ok, validation=check.error or " · ".join(check.checks),
                     )
                 elif action in ("delete", "remove"):
@@ -177,14 +219,26 @@ class ActionEngine:
                         self._log_result(entry)
                         continue
                     ok = self._op.delete(path)
+                    if ok:
+                        self._verified(
+                            lambda: self._op.delete(path),
+                            lambda: not self._op.exists(path),
+                            "file still exists after delete (verification failed)",
+                        )
                     entry = FileAction(
                         path=path, action="deleted",
                         status="ok" if ok else "failed",
                         error="" if ok else "not found",
                     )
                 elif action in ("edit", "patch", "replace"):
-                    result = self.edit(path, op.get("old", ""), op.get("new", ""))
+                    old, new = op.get("old", ""), op.get("new", "")
+                    result = self.edit(path, old, new)
                     if result["ok"]:
+                        self._verified(
+                            lambda: self.edit(path, old, new),
+                            lambda: self._edit_verified(path, old, new),
+                            "edit not applied (verification failed)",
+                        )
                         content = self._op.read(path) or ""
                         check = validate_file(path, content)
                         validations.append(check)
@@ -199,8 +253,13 @@ class ActionEngine:
                     entry = FileAction(path=path or op.get("pattern", ""), action=action, status="ok")
                 else:  # write
                     content = op.get("content", "")
-                    result = self._op.write(path, content)
-                    check = validate_file(path, content)
+                    content_data, _ = build_artifact_content(path, content)
+                    result = self._verified(
+                        lambda: self._op.write(path, content_data),
+                        lambda: self._content_matches(path, content_data),
+                        "file missing or content mismatch after write (verification failed)",
+                    )
+                    check = validate_file(path, content_data)
                     validations.append(check)
                     entry = FileAction(
                         path=path, action=result["action"], bytes=result["bytes"],
@@ -299,17 +358,31 @@ class ActionEngine:
                         lines.append(f"### {path}")
                         lines.append(snippet)
                 elif action in ("rename", "move"):
-                    self._op.rename(op["path"], op["to"])
+                    self._verified(
+                        lambda: self._op.rename(op["path"], op["to"]),
+                        lambda: self._op.exists(op["to"]) and not self._op.exists(op["path"]),
+                        "rename not applied (verification failed)",
+                    )
                     actions.append(FileAction(path=op["path"], action="renamed", status="ok"))
                     lines.append(f"Renamed {op['path']} -> {op['to']}")
                 elif action in ("delete", "remove"):
                     ok = self._op.delete(op["path"])
+                    if ok:
+                        self._verified(
+                            lambda: self._op.delete(op["path"]),
+                            lambda: not self._op.exists(op["path"]),
+                            "file still exists after delete (verification failed)",
+                        )
                     actions.append(
                         FileAction(path=op["path"], action="deleted", status="ok" if ok else "failed", error="" if ok else "not found")
                     )
                     lines.append(f"Deleted {op['path']}" if ok else f"{op['path']}: not found")
                 elif action in ("create_folder", "mkdir"):
-                    self.create_folder(op["path"])
+                    self._verified(
+                        lambda: self.create_folder(op["path"]),
+                        lambda: self._op.path_for(op["path"]).is_dir(),
+                        "folder missing after create (verification failed)",
+                    )
                     actions.append(FileAction(path=op["path"], action="created_folder", status="ok"))
                     lines.append(f"Created folder {op['path']}/")
             except WorkspaceSafetyError as exc:

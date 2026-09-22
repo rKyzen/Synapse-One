@@ -16,21 +16,27 @@ log = logging.getLogger("synapse.workspace.embeddings")
 
 
 def _embedding_provider(providers, embedding_model: str | None):
-    """First provider that exposes a usable embedding model, else None."""
+    """First provider that exposes a usable embedding model, else (None, None).
+
+    Returns ``(provider, model)``: ``model`` is the configured embedding model
+    when it is installed, otherwise ``None`` so the provider auto-resolves the
+    best installed embedding model (adaptive to whatever the hardware tier
+    installed).
+    """
     for provider in providers.all():
         try:
             if getattr(provider, "embed", None) is None:
                 continue
             installed = {d.id for d in provider.list_models()}
             if embedding_model and embedding_model in installed:
-                return provider
+                return provider, embedding_model
             for desc in provider.list_models():
                 meta = provider.to_metadata(desc)
                 if meta and meta.capabilities.embeddings > 0.9:
-                    return provider
+                    return provider, None
         except Exception:  # noqa: BLE001
             continue
-    return None
+    return None, None
 
 
 class EmbeddingEngine(EmbeddingEngineContract):
@@ -44,7 +50,7 @@ class EmbeddingEngine(EmbeddingEngineContract):
     def embed(self, texts: list[str]) -> list[list[float]] | None:
         if not texts:
             return []
-        provider = _embedding_provider(self._providers, self._model)
+        provider, model = _embedding_provider(self._providers, self._model)
         if provider is None:
             log.debug("embedding_no_provider")
             return None
@@ -52,7 +58,7 @@ class EmbeddingEngine(EmbeddingEngineContract):
         try:
             for i in range(0, len(texts), self._batch):
                 batch = texts[i:i + self._batch]
-                vectors = provider.embed(batch, model=self._model)
+                vectors = provider.embed(batch, model=model)
                 if not vectors or len(vectors) != len(batch):
                     return None
                 for v in vectors:

@@ -16,6 +16,10 @@ json = false
 #                         available reasoning model after file tasks
 #   model_hints         : kind -> preferred model id, e.g.
 #                         { coding = "qwen2.5-coder", writing = "llama3.1" }
+#   goal_mode           : AI Operating Workspace (Phase B). When true, goals
+#                         created via POST /projects/{id}/goals are the primary
+#                         intake; when false, the legacy /request path is the
+#                         only entry point. Goals always persist either way.
 [planner]
 enabled = true
 min_split_complexity = 40
@@ -23,6 +27,37 @@ max_tasks = 6
 file_output_enabled = true
 add_review = true
 model_hints = {}
+goal_mode = false
+
+# AI Master Agent / Task Divider (model-backed decomposition).
+#   enabled      : route decomposition through a small LLM that emits a
+#                  structured TaskDecompositionPlan JSON graph (Ollama
+#                  structured outputs). Disabled = deterministic heuristic
+#                  planner only. Any Master AI failure falls back to the
+#                  deterministic planner — never a hard error.
+#   temperature  : near zero — the divider is a router, not a generator.
+#   max_retries  : extra attempts after the first (invalid JSON / timeout).
+#   max_tasks    : ceiling on how many sub-tasks a plan may contain.
+#   tiers.*      : candidate model ids per hardware tier (preference order).
+#                  The first registered + healthy candidate is chosen.
+#   resolver.*   : tier boundaries in GB (available RAM / VRAM).
+[master_agent]
+enabled = true
+temperature = 0.1
+max_retries = 1
+max_tasks = 8
+
+[master_agent.tiers]
+tier1 = ["qwen2.5:1.5b", "llama3.2:1b"]
+tier2 = ["qwen2.5:3b", "llama3.2:3b"]
+tier3 = ["qwen2.5:7b", "llama3.1:8b"]
+cloud = ["gpt-4o-mini", "gemini-2.5-flash"]
+
+[master_agent.resolver]
+tier2_min_ram_gb = 12.0
+tier3_min_ram_gb = 24.0
+tier3_min_vram_gb = 8.0
+cloud_max_ram_gb = 6.0
 
 # Workspace Memory — scoped (conversation/project/global) semantic memory.
 #   embedding_model : model used for embeddings (must be installed in Ollama)
@@ -111,6 +146,8 @@ max_chars = 8000
 [providers.ollama]
 enabled = true
 base_url = "http://localhost:11434"
+# Installed per hardware tier by SetupModels.bat (see models.json). When this
+# model is not installed the provider falls back to the first installed model.
 default_model = "qwen2.5:3b"
 
 # Timeouts (seconds). Local CPU inference is slow — generous defaults.
@@ -140,6 +177,12 @@ default_model = "gemini-1.5-flash"
 # The router treats these as SPECIALISTS: it matches the task's required and
 # preferred capabilities against every profile and picks the best fit.
 # All values are configurable; nothing is hardcoded in code.
+#
+# Which models get INSTALLED is decided by the hardware tier (SetupModels.bat
+# + models.json, the single source of truth for recommendations). The catalog
+# below only carries capability knowledge: profiles for models that are not
+# installed are ignored, and installed models without a profile get safe
+# name-based defaults. Either hardware tier therefore routes correctly.
 # ---------------------------------------------------------------------------
 
 # General chat specialist — the everyday model.
@@ -148,12 +191,96 @@ provider = "ollama"
 kind = "local"
 display_name = "Qwen 2.5 3B (general chat)"
 context_window = 32768
-required_ram_gb = 4
+required_ram_gb = 2
 latency = "fast"
 privacy_score = 1.0
 priority = 90
 preferred_tasks = ["chat", "writing", "translation", "summaries", "light reasoning"]
 capabilities = { chat = 1.0, writing = 0.95, translation = 0.9, planning = 0.75, reasoning = 0.7, coding = 0.4, math = 0.6, vision = false, tools = false }
+
+# ---------------------------------------------------------------------------
+# Tier 1 (low RAM / older CPU) specialists — installed only on Tier 1
+# machines by SetupModels.bat. Routed exactly like the Tier 2 profiles;
+# harmless on machines that never install them.
+# ---------------------------------------------------------------------------
+
+# Small chat specialist (Tier 1).
+[models."llama3.2:1b"]
+provider = "ollama"
+kind = "local"
+display_name = "Llama 3.2 1B (light chat)"
+context_window = 131072
+required_ram_gb = 2
+latency = "fast"
+privacy_score = 1.0
+priority = 70
+preferred_tasks = ["chat", "writing", "summaries", "translation"]
+capabilities = { chat = 0.85, writing = 0.7, translation = 0.7, planning = 0.5, reasoning = 0.45, coding = 0.4, math = 0.4, vision = false, tools = false }
+
+# Lightweight coding specialist (Tier 1).
+[models."qwen2.5-coder:1.5b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen 2.5 Coder 1.5B (light coding)"
+context_window = 32768
+required_ram_gb = 1
+latency = "fast"
+privacy_score = 1.0
+priority = 85
+preferred_tasks = ["coding", "debugging", "json", "function calling"]
+capabilities = { coding = 0.9, debugging = 0.85, architecture = 0.6, reasoning = 0.6, writing = 0.4, math = 0.5, json_capability = 0.9, terminal = 0.6, chat = 0.5, vision = false, tools = true }
+
+# Lightweight Qwen3 chat/reasoning specialist (Tier 1).
+[models."qwen3:1.7b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen3 1.7B (light chat)"
+context_window = 40960
+required_ram_gb = 2
+latency = "fast"
+privacy_score = 1.0
+priority = 80
+preferred_tasks = ["chat", "writing", "reasoning", "summaries"]
+capabilities = { chat = 0.95, writing = 0.8, translation = 0.8, planning = 0.6, reasoning = 0.65, coding = 0.5, math = 0.6, vision = false, tools = false }
+
+# Lightweight embeddings specialist (Tier 1).
+[models."all-minilm"]
+provider = "ollama"
+kind = "local"
+display_name = "All-MiniLM (embeddings)"
+context_window = 4096
+required_ram_gb = 1
+latency = "fast"
+privacy_score = 1.0
+priority = 10
+preferred_tasks = ["embeddings", "semantic search", "memory retrieval"]
+capabilities = { embeddings = 1.0, chat = 0.0, writing = 0.0, coding = 0.0, reasoning = 0.0, math = 0.0, vision = false, tools = false }
+
+# Lightweight vision specialist (Tier 1).
+[models."moondream"]
+provider = "ollama"
+kind = "local"
+display_name = "Moondream (vision)"
+context_window = 2048
+required_ram_gb = 2
+latency = "fast"
+privacy_score = 1.0
+priority = 80
+preferred_tasks = ["vision", "ocr", "image analysis"]
+capabilities = { vision = true, ocr = 0.8, pdf = 0.5, chat = 0.5, coding = 0.1, reasoning = 0.3, writing = 0.4, math = 0.2, tools = false }
+
+# Tier 2 chat specialist — hybrid thinking/non-thinking Qwen3.
+[models."qwen3:4b"]
+provider = "ollama"
+kind = "local"
+display_name = "Qwen3 4B (chat)"
+context_window = 40960
+required_ram_gb = 6
+latency = "fast"
+privacy_score = 1.0
+priority = 88
+preferred_tasks = ["chat", "writing", "reasoning", "translation", "summaries"]
+capabilities = { chat = 1.0, writing = 0.9, translation = 0.85, planning = 0.7, reasoning = 0.8, coding = 0.6, math = 0.7, vision = false, tools = true }
 
 # Coding specialist.
 [models."qwen2.5-coder:7b"]

@@ -209,6 +209,9 @@ class OllamaProvider(HttpBaseProvider):
             options["num_predict"] = request.max_tokens
         if options:
             payload["options"] = options
+        if request.format is not None:
+            # Structured outputs: Ollama constrains decoding to a JSON schema.
+            payload["format"] = request.format
 
         content, usage, metrics = self._run_stream(model, payload)
         return self._response(self.provider_id, model, self.kind, content, usage, metrics=metrics)
@@ -357,21 +360,31 @@ class OllamaProvider(HttpBaseProvider):
         )
         return content, Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens), metrics
 
+    @staticmethod
+    def _strip_latest(model_id: str) -> str:
+        """Normalize an id: ``foo:latest`` and ``foo:max`` are ``foo``."""
+        base, _, tag = model_id.rpartition(":")
+        return base if tag in ("latest", "max") else model_id
+
     def _resolve_model(self, request: ChatRequest) -> str:
         """Pick the model name to send to Ollama.
 
-        Priority: the routed model (explicit request) > configured default >
-        first installed model. Never falls back to a hardcoded name.
+        Priority: the routed model (explicit request) > configured default
+        (only when actually installed) > first installed model. Never falls
+        back to a hardcoded name and never sends an uninstalled model.
         """
         if request.model:
             return request.model
+        installed = [d.id for d in self.list_models()]
+        if not installed:
+            raise RuntimeError("ollama reports no installed models")
         configured = self._config.get("providers.ollama.default_model")
         if configured:
-            return str(configured)
-        models = self.list_models()
-        if not models:
-            raise RuntimeError("ollama reports no installed models")
-        return models[0].display_name
+            configured = str(configured)
+            for installed_id in installed:
+                if self._strip_latest(installed_id) == self._strip_latest(configured):
+                    return installed_id
+        return installed[0]
 
     # -- support/health -----------------------------------------------------
 

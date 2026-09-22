@@ -1,4 +1,4 @@
-"""Generate utilitarian black/white/transparency web UI (Codex-style)."""
+"""Generate utilitarian black/white/transparency web UI (Codex-style 3-panel workspace)."""
 import pathlib
 
 CSS = r"""
@@ -12,17 +12,22 @@ CSS = r"""
   --text2: #888;
   --muted: #555;
   --white: #fff;
+  --green: #7bd88f;
+  --amber: #ffd479;
+  --red: #ff6b6b;
   --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; overflow: hidden; }
 body { font-family: var(--sans); background: var(--bg); color: var(--text); display: flex; font-size: 13px; }
-::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
 button { font: inherit; cursor: pointer; background: none; border: none; color: inherit; }
 input, textarea, select { font: inherit; color: inherit; background: none; border: none; outline: none; }
+
+/* Panel 1: Left Sidebar (Projects & Chats) */
 #sidebar { width: 240px; flex: 0 0 240px; background: rgba(255,255,255,0.02); border-right: 1px solid var(--border); display: flex; flex-direction: column; transition: margin-left .15s, opacity .15s; }
 #sidebar.collapsed { margin-left: -240px; opacity: 0; pointer-events: none; }
 .sb-head { padding: 12px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
@@ -43,6 +48,17 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .conv .del { opacity: 0; font-size: 13px; color: var(--muted); padding: 0 4px; }
 .conv:hover .del { opacity: 1; }
 .conv .del:hover { color: var(--white); }
+.sb-new-chat { margin: 8px 10px; padding: 6px 10px; border: 1px solid var(--border); color: var(--text2); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+.sb-new-chat:hover { border-color: var(--white); color: var(--white); }
+#projBanner { margin: 6px 10px; padding: 8px 10px; border: 1px solid #b8860b; background: rgba(255, 170, 0, 0.08); color: #ffd479; font-size: 11px; line-height: 1.5; }
+#projBanner .reconnect { margin-top: 6px; border: 1px solid var(--border2); color: var(--white); padding: 4px 10px; font-size: 11px; }
+#projBanner .reconnect:hover { border-color: var(--white); }
+#projBanner.hidden { display: none; }
+#projOpen svg { width: 13px; height: 13px; }
+#projDel { border: 1px solid var(--border); color: var(--muted); width: 22px; height: 22px; line-height: 1; flex: 0 0 22px; }
+#projDel:hover { color: var(--red); border-color: var(--red); }
+
+/* Panel 2: Center Main App (Conversation & Task Activity) */
 #app { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #topbar { flex: 0 0 auto; height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02); }
 .tb-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; color: var(--muted); border: 1px solid transparent; font-size: 12px; font-family: var(--mono); }
@@ -57,6 +73,7 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 #statusDot.loading { background: var(--white); animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 #statusText { font-size: 10px; color: var(--muted); font-family: var(--mono); white-space: nowrap; }
+
 #messages { flex: 1; overflow-y: auto; padding: 20px 16px 120px; scroll-behavior: smooth; }
 .msg-wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
 .msg { display: flex; gap: 8px; align-items: flex-start; }
@@ -79,6 +96,8 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .trace-box pre { background: rgba(255,255,255,0.03); border: 1px solid var(--border); padding: 8px; font-size: 10px; line-height: 1.5; overflow: auto; max-height: 200px; font-family: var(--mono); color: var(--text2); display: none; }
 .trace-box button { font-size: 10px; font-family: var(--mono); color: var(--muted); text-decoration: underline; padding: 0; }
 .trace-box button:hover { color: var(--white); }
+
+/* Markdown & formatting inside bubbles */
 .bubble p { margin: 0 0 6px; } .bubble p:last-child { margin-bottom: 0; }
 .bubble h1, .bubble h2, .bubble h3 { margin: 8px 0 4px; line-height: 1.3; font-weight: 600; }
 .bubble h1 { font-size: 15px; } .bubble h2 { font-size: 14px; } .bubble h3 { font-size: 13px; }
@@ -95,20 +114,33 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .bubble pre .copy-btn:hover { color: var(--white); border-color: var(--white); }
 .bubble pre .copy-btn.copied { color: var(--white); border-color: var(--white); }
 .bubble hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
-.typing { display: flex; gap: 5px; padding: 10px 12px; align-items: center; }
-.typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--white); animation: typBounce 1s infinite; }
-.typing span:nth-child(2) { animation-delay: .15s; }
-.typing span:nth-child(3) { animation-delay: .3s; }
-@keyframes typBounce { 0%,80%,100%{opacity:.2;transform:translateY(0)} 40%{opacity:1;transform:translateY(-4px)} }
-.tl-bubble { font-family: var(--mono); font-size: 11.5px; line-height: 1.8; color: var(--text2); padding: 2px 12px 4px; }
+
+/* Timeline & Task DAG Card */
+.tl-bubble { font-family: var(--mono); font-size: 11.5px; line-height: 1.8; color: var(--text2); padding: 6px 12px 8px; }
 .tl-line { display: flex; gap: 7px; align-items: baseline; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tl-line .tl-ico { flex: 0 0 auto; }
 .tl-line.done { color: var(--muted); }
-.tl-line.error { color: #f68; }
-.tl-line.finished { color: #7bd88f; }
+.tl-line.error { color: var(--red); }
+.tl-line.finished { color: var(--green); }
 .tl-line.live .tl-ico { animation: tlPulse 1s infinite; }
 @keyframes tlPulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+
+.dag-card { margin-top: 8px; border: 1px solid var(--border2); background: rgba(255,255,255,0.02); padding: 8px 10px; font-family: var(--mono); font-size: 11px; }
+.dag-card .dag-title { font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--white); font-size: 10px; margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; }
+.dag-task-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+.dag-task-row:last-child { border-bottom: none; }
+.dag-badge { font-size: 9px; padding: 1px 5px; border-radius: 2px; text-transform: uppercase; letter-spacing: 0.5px; flex: 0 0 auto; }
+.dag-badge.pending { border: 1px solid var(--muted); color: var(--muted); }
+.dag-badge.running { border: 1px solid var(--white); color: var(--white); animation: pulse 1s infinite; }
+.dag-badge.waiting { border: 1px solid var(--amber); color: var(--amber); }
+.dag-badge.completed { border: 1px solid var(--green); color: var(--green); }
+.dag-badge.failed { border: 1px solid var(--red); color: var(--red); }
+.dag-desc { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.dag-model { font-size: 9px; color: var(--text2); flex: 0 0 auto; }
+
 .status-banner { background: rgba(255,255,255,0.08); border: 1px solid var(--border2); padding: 8px 12px; font-size: 11px; font-family: var(--mono); color: var(--text2); margin: 8px auto; max-width: 760px; text-align: center; }
+.status-banner.info { color: var(--green); border-color: var(--green); }
+
 #inputBar { flex: 0 0 auto; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); padding: 10px 16px 14px; }
 .input-wrap { max-width: 760px; margin: 0 auto; position: relative; }
 #attachments { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
@@ -127,6 +159,7 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 #attachBtn { position: absolute; right: 38px; bottom: 6px; border: 1px solid var(--border); color: var(--muted); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; }
 #attachBtn:hover { color: var(--white); border-color: var(--white); }
 #attachBtn svg { width: 12px; height: 12px; }
+
 .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 60px 20px; color: var(--muted); text-align: center; }
 .empty .orb { width: 40px; height: 40px; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 14px; color: var(--text2); }
 .empty h2 { font-size: 14px; font-weight: 400; color: var(--text2); font-family: var(--mono); text-transform: uppercase; letter-spacing: 2px; }
@@ -134,12 +167,43 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .sugg-wrap { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; justify-content: center; }
 .sugg { border: 1px solid var(--border); color: var(--text2); padding: 5px 10px; font-size: 11px; font-family: var(--mono); transition: border-color .1s; }
 .sugg:hover { border-color: var(--white); color: var(--white); }
-#fpanel { width: 260px; flex: 0 0 260px; background: rgba(255,255,255,0.02); border-left: 1px solid var(--border); display: flex; flex-direction: column; transition: margin-right .15s, opacity .15s; }
-#fpanel.collapsed { margin-right: -260px; opacity: 0; pointer-events: none; }
-.fp-head { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; }
-.fp-head span { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); flex: 1; }
-.fp-head button { color: var(--muted); font-size: 16px; }
+
+/* Panel 3: Right Sidebar (Workspace Tree & Previews) */
+#fpanel { width: 300px; flex: 0 0 300px; background: rgba(255,255,255,0.02); border-left: 1px solid var(--border); display: flex; flex-direction: column; transition: margin-right .15s, opacity .15s; position: relative; }
+#fpanel.collapsed { margin-right: -300px; opacity: 0; pointer-events: none; }
+.fp-head { padding: 8px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; }
+.fp-tabs { display: flex; gap: 4px; flex: 1; }
+.fp-tab { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); padding: 3px 6px; border: 1px solid transparent; }
+.fp-tab:hover { color: var(--text); }
+.fp-tab.active { color: var(--white); border-color: var(--border2); background: var(--surface); }
+.fp-head button { color: var(--muted); font-size: 14px; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; }
 .fp-head button:hover { color: var(--white); }
+
+#fpBody { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+#fpWorkView, #fpUploadView { flex: 1; display: flex; flex-direction: column; }
+.hidden { display: none !important; }
+
+.tree-head { padding: 6px 10px; font-family: var(--mono); font-size: 10px; color: var(--muted); border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center; }
+.tree-head .ws-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+#treeList { flex: 1; overflow-y: auto; padding: 4px 6px; }
+.tree-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font-size: 11px; color: var(--text2); font-family: var(--mono); border: 1px solid transparent; cursor: pointer; border-radius: 2px; }
+.tree-item:hover { background: var(--surface); color: var(--white); }
+.tree-item.selected { background: var(--surface2); color: var(--white); border-color: var(--border); }
+.tree-item .ico { flex: 0 0 auto; font-size: 12px; }
+.tree-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-item .badge-mod { font-size: 8px; padding: 1px 4px; border-radius: 2px; text-transform: uppercase; }
+.tree-item .badge-mod.created { background: rgba(123, 216, 143, 0.15); color: var(--green); }
+.tree-item .badge-mod.modified { background: rgba(255, 212, 121, 0.15); color: var(--amber); }
+.tree-item .size { font-size: 9px; color: var(--muted); flex: 0 0 auto; }
+
+/* File Preview Overlay Drawer */
+#fpPreview { position: absolute; inset: 0; background: #080808; z-index: 20; display: flex; flex-direction: column; border-left: 1px solid var(--border2); }
+.prev-head { padding: 8px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; }
+.prev-head .pname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--white); font-weight: 600; }
+.prev-head .pinfo { font-size: 9px; color: var(--muted); }
+.prev-body { flex: 1; overflow: auto; padding: 8px; }
+.prev-body pre { font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--text); white-space: pre-wrap; word-break: break-all; }
+
 #fpList { flex: 1; overflow-y: auto; padding: 6px; }
 .fp-item { display: flex; align-items: center; gap: 6px; padding: 6px 8px; font-size: 11px; color: var(--text2); font-family: var(--mono); border: 1px solid transparent; }
 .fp-item:hover { background: var(--surface); border-color: var(--border); }
@@ -153,6 +217,7 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 #fpDrop { margin: 6px; padding: 20px; border: 1px dashed var(--border); text-align: center; color: var(--muted); font-size: 10px; font-family: var(--mono); transition: border-color .1s; }
 #fpDrop.over { border-color: var(--white); color: var(--text2); }
 #fpUpload { display: none; }
+
 .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100; display: none; align-items: center; justify-content: center; }
 .overlay.open { display: flex; }
 .modal { background: #0a0a0a; border: 1px solid var(--border2); padding: 20px; max-width: 380px; width: 90%; max-height: 80vh; overflow-y: auto; }
@@ -173,16 +238,6 @@ input, textarea, select { font: inherit; color: inherit; background: none; borde
 .sb-sbtn { border: 1px solid var(--border); color: var(--muted); width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; }
 .sb-sbtn:hover { color: var(--white); border-color: var(--white); }
 .sb-sbtn svg { width: 12px; height: 12px; }
-#projDel { border: 1px solid var(--border); color: var(--muted); width: 22px; height: 22px; line-height: 1; flex: 0 0 22px; }
-#projDel:hover { color: #ff6b6b; border-color: #ff6b6b; }
-#projBanner { margin: 6px 10px; padding: 8px 10px; border: 1px solid #b8860b; background: rgba(255, 170, 0, 0.08); color: #ffd479; font-size: 11px; line-height: 1.5; }
-#projBanner .reconnect { margin-top: 6px; border: 1px solid var(--border2); color: var(--white); padding: 4px 10px; font-size: 11px; }
-#projBanner .reconnect:hover { border-color: var(--white); }
-#projBanner.hidden { display: none; }
-.sb-new-chat { margin: 8px 10px; padding: 6px 10px; border: 1px solid var(--border); color: var(--text2); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
-.sb-new-chat:hover { border-color: var(--white); color: var(--white); }
-#projOpen svg { width: 13px; height: 13px; }
-.status-banner.info { color: #7bd88f; border-color: #7bd88f; }
 """
 
 HTML_BODY = r"""
@@ -220,7 +275,7 @@ HTML_BODY = r"""
     <div class="tb-sep"></div>
     <div id="statusDot"></div>
     <span id="statusText">...</span>
-    <button id="toggleFiles" class="tb-btn" title="Files">
+    <button id="toggleFiles" class="tb-btn" title="Workspace Files">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
     </button>
   </div>
@@ -228,7 +283,7 @@ HTML_BODY = r"""
   <div id="inputBar">
     <div class="input-wrap">
       <div id="attachments"></div>
-      <textarea id="prompt" rows="1" placeholder="..."></textarea>
+      <textarea id="prompt" rows="1" placeholder="Type a message or request..."></textarea>
       <button id="sendBtn" disabled title="Send">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
@@ -239,9 +294,36 @@ HTML_BODY = r"""
   </div>
 </div>
 <div id="fpanel" class="collapsed">
-  <div class="fp-head"><span>files</span><button id="fpClose">&times;</button></div>
-  <div id="fpList"></div>
-  <div id="fpDrop">drop<input id="fpUpload" type="file" multiple></div>
+  <div class="fp-head">
+    <div class="fp-tabs">
+      <button id="tabWork" class="fp-tab active">workspace</button>
+      <button id="tabUploads" class="fp-tab">uploads</button>
+    </div>
+    <button id="fpRefresh" title="Refresh files">&#x21bb;</button>
+    <button id="fpClose" title="Close panel">&times;</button>
+  </div>
+  <div id="fpBody">
+    <div id="fpWorkView">
+      <div class="tree-head">
+        <span class="ws-path" id="wsPathLabel">workspace</span>
+        <span id="wsCount">0 files</span>
+      </div>
+      <div id="treeList"></div>
+    </div>
+    <div id="fpUploadView" class="hidden">
+      <div id="fpList"></div>
+      <div id="fpDrop">drop files here<input id="fpUpload" type="file" multiple></div>
+    </div>
+  </div>
+  <div id="fpPreview" class="hidden">
+    <div class="prev-head">
+      <span class="pname" id="prevName">file.txt</span>
+      <span class="pinfo" id="prevInfo">0 bytes</span>
+      <button id="prevCopy" title="Copy content" style="font-size:10px;padding:1px 6px;border:1px solid var(--border)">copy</button>
+      <button id="prevClose" title="Close preview">&times;</button>
+    </div>
+    <div class="prev-body"><pre><code id="prevCode"></code></pre></div>
+  </div>
 </div>
 <input id="pickInput" type="file" multiple hidden>
 <div id="settingsOverlay" class="overlay">
@@ -269,7 +351,7 @@ HTML_BODY = r"""
       <div>ctrl+b &mdash; sidebar</div>
       <div>ctrl+f &mdash; search</div>
       <div>ctrl+/ &mdash; shortcuts</div>
-      <div>ctrl+shift+o &mdash; files</div>
+      <div>ctrl+shift+o &mdash; workspace files</div>
       <div>esc &mdash; close</div>
     </div>
     <div class="actions"><button id="scClose" class="btn primary">close</button></div>
@@ -297,7 +379,56 @@ let chats = [];
 let messages = [];
 let busy = false;
 let attachedFiles = new Map();
-const TL_ICON = { understand:'🧠', analyze:'🧭', read_workspace:'📂', read:'📄', list:'📂', search:'🔎', model:'🤖', generate:'✍', write:'💾', edit:'🔄', create_folder:'📁', rename:'🔀', delete:'🗑', verified:'🛡️', index:'🗂️', finished:'✅', error:'❌' };
+let currentDagTasks = [];
+
+const TL_ICON = {
+  understand: '🧠',
+  plan_tasks: '📋',
+  select_capability: '🎯',
+  route_model: '🔀',
+  load_model: '⚡',
+  execute_task: '⚙️',
+  waiting: '⏳',
+  create_file: '📄',
+  edit_file: '✏️',
+  run_tests: '🧪',
+  validate_result: '🛡️',
+  task_routed: '🤖',
+  analyze: '🧭',
+  read_workspace: '📂',
+  read: '📄',
+  list: '📂',
+  search: '🔎',
+  model: '🤖',
+  generate: '✍',
+  write: '💾',
+  edit: '🔄',
+  create_folder: '📁',
+  rename: '🔀',
+  delete: '🗑',
+  verified: '🛡️',
+  index: '🗂️',
+  finished: '✅',
+  error: '❌'
+};
+
+function fileIcon(path) {
+  const p = (path || '').toLowerCase();
+  if (p.endsWith('.py') || p.endsWith('.js') || p.endsWith('.ts') || p.endsWith('.html') || p.endsWith('.css') || p.endsWith('.json')) return '📄';
+  if (p.endsWith('.pptx') || p.endsWith('.ppt')) return '📽️';
+  if (p.endsWith('.pdf')) return '📑';
+  if (p.endsWith('.xlsx') || p.endsWith('.xls') || p.endsWith('.csv')) return '📊';
+  if (p.endsWith('.docx') || p.endsWith('.doc') || p.endsWith('.md') || p.endsWith('.txt')) return '📝';
+  return '📄';
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0 || !bytes) return '0 B';
+  const k = 1024, sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
 function loadSettings() {
   try { return JSON.parse(localStorage.getItem(LS_SETTINGS)) || { temperature: 0.7, maxTokens: '', sysPrompt: '' }; }
   catch { return { temperature: 0.7, maxTokens: '', sysPrompt: '' }; }
@@ -337,8 +468,7 @@ function renderProjectBanner() {
   const btn = document.createElement('button');
   btn.className = 'reconnect';
   btn.textContent = 'locate folder';
-  btn.addEventListener('click', async () => { await reconnectProject();
-    await loadProjects(); });
+  btn.addEventListener('click', async () => { await reconnectProject(); await loadProjects(); });
   banner.appendChild(btn);
 }
 function baseName(p) {
@@ -361,8 +491,6 @@ async function pickProjectFolder() {
 }
 $('projSel').addEventListener('change', async () => { await switchProject($('projSel').value); });
 $('projNew').addEventListener('click', async () => {
-  // Creating a project asks ONE question: where should the folder live.
-  // The project is named after the chosen folder; everything else is allowed.
   const folder = await pickProjectFolder();
   if (!folder) { showError('cancelled — no folder chosen'); return; }
   const body = { name: baseName(folder), parent_dir: parentPath(folder) };
@@ -422,7 +550,7 @@ $('projDel').addEventListener('click', async () => {
 async function reconnectProject() {
   const p = projects.find(x => x.id === activeProjectId);
   if (!p) return;
-  const full = await pickParentFolder();
+  const full = await pickProjectFolder();
   if (!full) return;
   try {
     await api('/projects/' + p.id + '/reconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace_path: full }) });
@@ -459,7 +587,7 @@ async function createChat() {
   if (!activeProjectId) { err('createChat: no activeProjectId'); return null; }
   try {
     log('createChat for', activeProjectId);
-    const info = await api('/projects/' + activeProjectId + '/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'new' }) });
+    const info = await api('/projects/' + activeProjectId + '/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'new chat' }) });
     log('chat created', info.id);
     await loadChats();
     await switchChat(info.id);
@@ -537,7 +665,7 @@ function copyCode(btn) {
 function renderMessages() {
   const wrap = $('msgWrap'); wrap.innerHTML = '';
   if (!messages.length) {
-    wrap.innerHTML = '<div class="empty" id="emptyState"><div class="orb">S</div><h2>ready</h2><p>type a message or drop files to begin.</p><div class="sugg-wrap"><button class="sugg">summarize workspace</button><button class="sugg">find todos</button><button class="sugg">explain architecture</button></div></div>';
+    wrap.innerHTML = '<div class="empty" id="emptyState"><div class="orb">S</div><h2>ready</h2><p>type a message or request to begin.</p><div class="sugg-wrap"><button class="sugg">create an expense tracker with documentation and tests</button><button class="sugg">generate a quarterly presentation in PPT</button><button class="sugg">summarize workspace structure</button></div></div>';
     return;
   }
   messages.forEach((m, i) => appendMsgEl(m, i)); scrollToBottom();
@@ -558,33 +686,52 @@ function appendMsgEl(m, idx) {
   el.appendChild(av); el.appendChild(body); wrap.appendChild(el); return el;
 }
 function scrollToBottom() { const m = $('messages'); m.scrollTop = m.scrollHeight; }
+
 function showTyping() {
   const wrap = $('msgWrap');
   const el = document.createElement('div');
   el.className = 'msg assistant';
   el.id = 'timelineBox';
-  el.innerHTML = '<div class="avatar">S</div><div class="msg-body"><div class="bubble tl-bubble"></div></div>';
+  el.innerHTML = '<div class="avatar">S</div><div class="msg-body"><div class="bubble tl-bubble"><div id="tlLines"></div><div id="dagCard" class="dag-card hidden"><div class="dag-title"><span>Task Execution DAG</span><span id="dagCount"></span></div><div id="dagList"></div></div></div></div>';
   wrap.appendChild(el);
   tlLastKey = '';
+  currentDagTasks = [];
   scrollToBottom();
   log('timeline shown');
   return el;
 }
 function removeTyping() { const el = $('timelineBox'); if (el) el.remove(); }
 let tlLastKey = '';
+
 function tlAdd(kind, text) {
   const box = $('timelineBox'); if (!box) return;
   const key = kind + '|' + text;
   if (tlLastKey === key) return;
   tlLastKey = key;
-  const bubble = box.querySelector('.tl-bubble');
+  const linesEl = box.querySelector('#tlLines');
   const line = document.createElement('div');
   line.className = 'tl-line live ' + (kind === 'error' ? 'error' : kind === 'finished' ? 'finished' : '');
   line.innerHTML = '<span class="tl-ico">' + (TL_ICON[kind] || '·') + '</span><span>' + esc(text || kind) + '</span>';
-  bubble.appendChild(line);
-  bubble.querySelectorAll('.tl-line.live').forEach(l => { if (l !== line) l.classList.remove('live'); });
+  linesEl.appendChild(line);
+  linesEl.querySelectorAll('.tl-line.live').forEach(l => { if (l !== line) l.classList.remove('live'); });
+
+  // Update Task DAG card if task event
+  if (kind === 'plan_tasks' || kind === 'execute_task' || kind === 'task_routed' || kind === 'waiting' || kind === 'run_tests' || kind === 'validate_result') {
+    renderDagProgress(kind, text);
+  }
   scrollToBottom();
 }
+
+function renderDagProgress(kind, text) {
+  const card = $('dagCard'); if (!card) return;
+  card.classList.remove('hidden');
+  const list = $('dagList');
+  if (kind === 'plan_tasks') {
+    const match = (text || '').match(/(\d+)\s+tasks/);
+    if (match) $('dagCount').textContent = match[1] + ' tasks planned';
+  }
+}
+
 function showError(msg) {
   err('UI error:', msg);
   const wrap = $('msgWrap');
@@ -597,8 +744,8 @@ function showError(msg) {
 }
 function tlFinish() {
   const box = $('timelineBox'); if (!box) return;
-  const bubble = box.querySelector('.tl-bubble');
-  const live = bubble.querySelector('.tl-line.live');
+  const linesEl = box.querySelector('#tlLines');
+  const live = linesEl.querySelector('.tl-line.live');
   if (!live) return;
   live.classList.remove('live');
   live.classList.add('finished');
@@ -702,6 +849,7 @@ async function send() {
     messages.push(errMsg); appendMsgEl(errMsg, messages.length - 1);
   }
   loadChats();
+  refreshFiles();
 }
 function regenerateFrom(msgIdx) { if (busy) return; messages.splice(msgIdx); renderMessages(); const lastUser = [...messages].reverse().find(m => m.role === 'user'); if (lastUser) { ta.value = lastUser.content; autosize(); updateSend(); } }
 function editMessage(idx) { const m = messages[idx]; if (m.role !== 'user') return; const newText = prompt('edit:', m.content); if (newText !== null && newText.trim()) { messages.splice(idx); renderMessages(); ta.value = newText.trim(); autosize(); updateSend(); } }
@@ -711,27 +859,134 @@ function refreshModels() {
     models.forEach(m => { const opt = document.createElement('option'); opt.value = m.id; opt.textContent = m.id + (m.available ? '' : ' *'); opt.disabled = !m.available; sel.appendChild(opt); }); sel.value = cur;
   }).catch(e => err('refreshModels', e));
 }
+
+/* Panel 3: Right Panel Tabs and Work Tree */
 $('toggleFiles').addEventListener('click', () => { const p = $('fpanel'); p.classList.toggle('collapsed'); $('toggleFiles').classList.toggle('active', !p.classList.contains('collapsed')); });
 $('fpClose').addEventListener('click', () => { $('fpanel').classList.add('collapsed'); $('toggleFiles').classList.remove('active'); });
+
+$('tabWork').addEventListener('click', () => {
+  $('tabWork').classList.add('active');
+  $('tabUploads').classList.remove('active');
+  $('fpWorkView').classList.remove('hidden');
+  $('fpUploadView').classList.add('hidden');
+});
+
+$('tabUploads').addEventListener('click', () => {
+  $('tabUploads').classList.add('active');
+  $('tabWork').classList.remove('active');
+  $('fpUploadView').classList.remove('hidden');
+  $('fpWorkView').classList.add('hidden');
+});
+
+$('fpRefresh').addEventListener('click', () => { refreshFiles(); });
+
 function refreshFiles() {
+  refreshWorkTree();
+  refreshUploads();
+}
+
+async function refreshWorkTree() {
+  if (!activeProjectId) {
+    $('treeList').innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:10px;font-family:var(--mono)">no active project</div>';
+    return;
+  }
+  const p = projects.find(x => x.id === activeProjectId);
+  if (p && p.workspace_path) $('wsPathLabel').textContent = baseName(p.workspace_path);
+  try {
+    const [workFiles, changes] = await Promise.all([
+      api('/projects/' + activeProjectId + '/work').catch(() => []),
+      api('/projects/' + activeProjectId + '/changes').catch(() => ({ created: [], modified: [] }))
+    ]);
+    const list = $('treeList');
+    $('wsCount').textContent = workFiles.length + ' file(s)';
+    if (!workFiles.length) {
+      list.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:10px;font-family:var(--mono)">workspace empty</div>';
+      return;
+    }
+    list.innerHTML = '';
+    const createdSet = new Set((changes.created || []).map(x => x.path || x));
+    const modSet = new Set((changes.modified || []).map(x => x.path || x));
+
+    workFiles.forEach(f => {
+      const el = document.createElement('div');
+      el.className = 'tree-item';
+      const isCreated = createdSet.has(f.path);
+      const isMod = modSet.has(f.path);
+      const badgeHtml = isCreated ? '<span class="badge-mod created">new</span>' : (isMod ? '<span class="badge-mod modified">mod</span>' : '');
+      const ico = fileIcon(f.path);
+      el.innerHTML = '<span class="ico">' + ico + '</span><span class="name">' + esc(f.path) + '</span>' + badgeHtml + '<span class="size">' + formatBytes(f.size || f.bytes || 0) + '</span>';
+      el.addEventListener('click', () => previewFile(f.path, f.size || f.bytes || 0));
+      list.appendChild(el);
+    });
+  } catch (e) {
+    err('refreshWorkTree', e);
+  }
+}
+
+async function previewFile(path, size) {
+  if (!activeProjectId) return;
+  try {
+    const data = await api('/projects/' + activeProjectId + '/work/file?path=' + encodeURIComponent(path));
+    $('prevName').textContent = path;
+    $('prevInfo').textContent = formatBytes(size) + ' · ' + (data.content.split('\n').length) + ' lines';
+    $('prevCode').textContent = data.content;
+    $('fpPreview').classList.remove('hidden');
+  } catch (e) {
+    err('previewFile', e);
+    showError('preview failed: ' + e.message);
+  }
+}
+
+$('prevClose').addEventListener('click', () => { $('fpPreview').classList.add('hidden'); });
+$('prevCopy').addEventListener('click', () => {
+  const code = $('prevCode').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    $('prevCopy').textContent = 'copied';
+    setTimeout(() => $('prevCopy').textContent = 'copy', 1200);
+  });
+});
+
+function refreshUploads() {
   const qs = activeProjectId ? '?project_id=' + encodeURIComponent(activeProjectId) : '';
   fetch('/workspace' + qs).then(r => r.json()).then(w => {
     const list = $('fpList');
-    if (!w.files.length) { list.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:10px;font-family:var(--mono)">empty</div>'; return; }
+    if (!w.files.length) { list.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:10px;font-family:var(--mono)">no attachments</div>'; return; }
     list.innerHTML = '';
-    w.files.forEach(f => { const el = document.createElement('div'); el.className = 'fp-item'; const checked = attachedFiles.has(f.id) ? 'checked' : ''; const dotClass = f.status === 'indexed' ? 'ok' : f.status === 'failed' ? 'err' : 'idx'; el.innerHTML = '<input type="checkbox" ' + checked + '><span class="dot ' + dotClass + '"></span><span class="name">' + esc(f.name) + '</span><span class="info">' + f.indexed_chunks + '</span>'; el.querySelector('input').addEventListener('change', e => { if (e.target.checked) attachedFiles.set(f.id, { name: f.name, status: f.status }); else attachedFiles.delete(f.id); renderChips(); }); list.appendChild(el); });
+    w.files.forEach(f => {
+      const el = document.createElement('div'); el.className = 'fp-item';
+      const checked = attachedFiles.has(f.id) ? 'checked' : '';
+      const dotClass = f.status === 'indexed' ? 'ok' : f.status === 'failed' ? 'err' : 'idx';
+      el.innerHTML = '<input type="checkbox" ' + checked + '><span class="dot ' + dotClass + '"></span><span class="name">' + esc(f.name) + '</span><span class="info">' + f.indexed_chunks + '</span>';
+      el.querySelector('input').addEventListener('change', e => {
+        if (e.target.checked) attachedFiles.set(f.id, { name: f.name, status: f.status });
+        else attachedFiles.delete(f.id);
+        renderChips();
+      });
+      list.appendChild(el);
+    });
     renderChips();
-  }).catch(e => err('refreshFiles', e));
+  }).catch(e => err('refreshUploads', e));
 }
+
 function renderChips() {
   const box = $('attachments'); box.innerHTML = '';
-  attachedFiles.forEach((info, id) => { const chip = document.createElement('div'); chip.className = 'chip'; chip.innerHTML = '<span>' + esc(info.name) + '</span><span class="st">' + info.status + '</span><button>&times;</button>'; chip.querySelector('button').addEventListener('click', () => { attachedFiles.delete(id); renderChips(); refreshFiles(); }); box.appendChild(chip); });
+  attachedFiles.forEach((info, id) => {
+    const chip = document.createElement('div'); chip.className = 'chip';
+    chip.innerHTML = '<span>' + esc(info.name) + '</span><span class="st">' + info.status + '</span><button>&times;</button>';
+    chip.querySelector('button').addEventListener('click', () => { attachedFiles.delete(id); renderChips(); refreshUploads(); });
+    box.appendChild(chip);
+  });
 }
 function uploadFile(file) {
   const fd = new FormData(); fd.append('file', file);
   const qs = activeProjectId ? '?project_id=' + encodeURIComponent(activeProjectId) : '';
-  fetch('/files' + qs, { method: 'POST', body: fd }).then(r => r.json()).then(res => { attachedFiles.set(res.file.id, { name: res.file.name, status: res.file.status }); renderChips(); refreshFiles(); $('fpanel').classList.remove('collapsed'); $('toggleFiles').classList.add('active'); }).catch(e => err('uploadFile', e));
+  fetch('/files' + qs, { method: 'POST', body: fd }).then(r => r.json()).then(res => {
+    attachedFiles.set(res.file.id, { name: res.file.name, status: res.file.status });
+    renderChips(); refreshUploads();
+    $('fpanel').classList.remove('collapsed'); $('toggleFiles').classList.add('active');
+  }).catch(e => err('uploadFile', e));
 }
+
 $('attachBtn').addEventListener('click', () => $('pickInput').click());
 $('pickInput').addEventListener('change', e => { [...e.target.files].forEach(uploadFile); e.target.value = ''; });
 $('fpDrop').addEventListener('dragover', e => { e.preventDefault(); $('fpDrop').classList.add('over'); });
@@ -740,10 +995,12 @@ $('fpDrop').addEventListener('drop', e => { e.preventDefault(); $('fpDrop').clas
 $('fpUpload').addEventListener('change', e => { [...e.target.files].forEach(uploadFile); e.target.value = ''; });
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { e.preventDefault(); [...(e.dataTransfer?.files || [])].forEach(uploadFile); });
+
 $('settingsBtn').addEventListener('click', () => { $('setTemp').value = settings.temperature; $('setTempVal').textContent = settings.temperature; $('setMaxTok').value = settings.maxTokens || ''; $('setSysPrompt').value = settings.sysPrompt || ''; $('settingsOverlay').classList.add('open'); });
 $('setTemp').addEventListener('input', () => { $('setTempVal').textContent = $('setTemp').value; });
 $('settingsCancel').addEventListener('click', () => $('settingsOverlay').classList.remove('open'));
 $('settingsSave').addEventListener('click', () => { settings.temperature = parseFloat($('setTemp').value) || 0.7; settings.maxTokens = $('setMaxTok').value; settings.sysPrompt = $('setSysPrompt').value; saveSettings(); $('settingsOverlay').classList.remove('open'); });
+
 let searchIdx = -1;
 function openSearch() { $('searchBar').classList.add('open'); $('searchInput').focus(); }
 function closeSearch() { $('searchBar').classList.remove('open'); clearHighlights(); searchIdx = -1; }
@@ -753,14 +1010,21 @@ function highlightMatch(m) { document.querySelectorAll('mark.current').forEach(e
 $('searchBtn').addEventListener('click', openSearch); $('searchClose').addEventListener('click', closeSearch); $('searchInput').addEventListener('input', doSearch); $('searchNext').addEventListener('click', doSearch); $('searchPrev').addEventListener('click', doSearch);
 $('shortcutsBtn').addEventListener('click', () => $('shortcutsOverlay').classList.add('open'));
 $('scClose').addEventListener('click', () => $('shortcutsOverlay').classList.remove('open'));
+
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { if ($('searchBar').classList.contains('open')) closeSearch(); else if ($('settingsOverlay').classList.contains('open')) $('settingsOverlay').classList.remove('open'); else if ($('shortcutsOverlay').classList.contains('open')) $('shortcutsOverlay').classList.remove('open'); }
+  if (e.key === 'Escape') {
+    if (!$('fpPreview').classList.contains('hidden')) $('fpPreview').classList.add('hidden');
+    else if ($('searchBar').classList.contains('open')) closeSearch();
+    else if ($('settingsOverlay').classList.contains('open')) $('settingsOverlay').classList.remove('open');
+    else if ($('shortcutsOverlay').classList.contains('open')) $('shortcutsOverlay').classList.remove('open');
+  }
   if (e.ctrlKey && e.key === 'n') { e.preventDefault(); createChat(); }
   if (e.ctrlKey && e.key === 'b') { e.preventDefault(); $('sidebar').classList.toggle('collapsed'); }
   if (e.ctrlKey && e.key === 'f') { e.preventDefault(); openSearch(); }
   if (e.ctrlKey && e.key === '/') { e.preventDefault(); $('shortcutsOverlay').classList.toggle('open'); }
   if (e.ctrlKey && e.shiftKey && e.key === 'O') { e.preventDefault(); $('fpanel').classList.toggle('collapsed'); $('toggleFiles').classList.toggle('active', !$('fpanel').classList.contains('collapsed')); }
 });
+
 function refreshStatus() {
   fetch('/status').then(r => r.json()).then(st => {
     const ready = st.providers.some(p => p.ready); $('statusDot').className = ready ? '' : 'off';
@@ -768,6 +1032,7 @@ function refreshStatus() {
     $('statusText').textContent = (names || 'none') + ' / ' + st.registry_count;
   }).catch(e => { $('statusDot').className = 'off'; $('statusText').textContent = 'offline'; err('refreshStatus', e); });
 }
+
 async function boot() {
   log('boot starting');
   try {
