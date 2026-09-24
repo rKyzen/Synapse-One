@@ -201,8 +201,15 @@ class CompositeVerifier(Verifier):
             claims = self._extract_claims(response)
             sources_used.append("context")
             supported = 0
+            if isinstance(context, list):
+                sources = [
+                    c.text if hasattr(c, "text") else (c.get("text", "") if isinstance(c, dict) else str(c))
+                    for c in context
+                ]
+            else:
+                sources = [str(context)]
             for claim in claims:
-                result = self._facts.check_claim(claim, [context])
+                result = self._facts.check_claim(claim, sources)
                 if result["supported"]:
                     supported += 1
             coverage = supported / len(claims) if claims else 1.0

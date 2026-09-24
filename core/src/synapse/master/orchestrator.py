@@ -67,7 +67,7 @@ _ANALYSIS_SYSTEM_PROMPT = (
     "CRITICAL RULES:\n"
     "1. You are an orchestrator and router, NOT a worker. NEVER solve the task directly or generate file contents here.\n"
     "2. Distinguish between ANSWERING ABOUT SOMETHING vs DOING/CREATING SOMETHING:\n"
-    "   - 'Explain HTML' -> direct answer, artifact_required=false, files_needed=false, workspace_needed=false\n"
+    "   - 'Explain photosynthesis in simple terms' / 'Explain HTML' -> direct answer, artifact_required=false, files_needed=false, workspace_needed=false, required_capabilities=['conversation', 'reasoning'], recommended_model_role='gemma3:4b'\n"
     "   - 'Show me an HTML example' -> direct answer, artifact_required=false\n"
     "   - 'Generate/Create/Build me an HTML/CSS landing page' -> artifact_generation, artifact_required=true, files_needed=true, coding_needed=true, execution_mode=artifact_generation\n"
     "   - 'Create a landing page in my project/workspace' -> workspace_agent, artifact_required=true, workspace_needed=true, files_needed=true, coding_needed=true\n"
@@ -80,17 +80,62 @@ _ANALYSIS_SYSTEM_PROMPT = (
 
 #: system instruction — the Master AI is an orchestrator/router, never a worker.
 _DIVIDER_SYSTEM_PROMPT = (
-    "You are the Synapse One Master AI Orchestrator. Your ONLY job is to analyze "
+    "You are the Synapse One Master AI Orchestrator (≤1.7B parameter router). Your ONLY job is to analyze "
     "the user's request, detect required capabilities, decompose complex requests into "
-    "minimal subtasks, build a Task DAG with dependencies, and select the appropriate specialist "
+    "minimal subtasks with clear dependencies, and select the appropriate specialist "
     "model or tool for each subtask from the provided Model Registry.\n\n"
-    "CRITICAL RULES:\n"
-    "1. You are an orchestrator and router, NOT a worker. NEVER directly solve the specialist task yourself.\n"
-    "2. Each subtask MUST be assigned a target capability and a specialist model or tool from the registry.\n"
-    "3. Different subtasks can and should route to different specialist models (e.g. coding to Qwen Coder, "
+    "CRITICAL NON-NEGOTIABLE RULES:\n"
+    "1. You are strictly a planner and router, NOT a worker. NEVER directly solve the task yourself, never write code, never do math proofs, never generate documents, and never claim a file was created.\n"
+    "2. Real filesystem tools are the ONLY way files are created or modified on disk.\n"
+    "3. Each subtask MUST be assigned an intent, target capability, and the exact specialist model or tool from the registry.\n"
+    "4. Different subtasks can and should route to different specialist models (e.g. coding to Qwen Coder, "
     "math/chat to Gemma, vision to vision model, file creation to filesystem_tool).\n"
-    "4. Do NOT use heavy models like 32B unless the subtask genuinely requires deep reasoning.\n"
-    "5. Output ONLY valid JSON matching the provided schema."
+    "5. Do NOT use heavy models like 32B unless the subtask genuinely requires deep reasoning on high-end hardware.\n"
+    "6. Output strictly valid JSON matching the TaskDecompositionPlan schema.\n\n"
+    "FEW-SHOT EXAMPLES OF VALID TASK DECOMPOSITION PLANS:\n\n"
+    "Example 1: Compound Coding Project with Tests and Docs\n"
+    "User: 'Create a CLI expense tracker in Python with tests and documentation'\n"
+    "{\n"
+    '  "execution_strategy": "SEQUENTIAL",\n'
+    '  "tasks": [\n'
+    '    {"task_id": 1, "intent": "PLANNING", "sub_prompt": "Plan architecture and CLI structure for expense tracker", "assigned_model": "qwen3:4b", "capability": "planning", "reasoning": "system design planning", "dependencies": []},\n'
+    '    {"task_id": 2, "intent": "CODING", "sub_prompt": "Implement expense tracker in src/expense_tracker.py", "assigned_model": "qwen2.5-coder:7b", "capability": "coding", "reasoning": "code specialist implementation", "dependencies": [1]},\n'
+    '    {"task_id": 3, "intent": "CODING", "sub_prompt": "Write pytest suite in test/test_expense_tracker.py", "assigned_model": "qwen2.5-coder:7b", "capability": "testing", "reasoning": "test suite implementation", "dependencies": [2]},\n'
+    '    {"task_id": 4, "intent": "WRITING", "sub_prompt": "Write documentation in docs/architecture.md", "assigned_model": "gemma3:4b", "capability": "writing", "reasoning": "documentation writing", "dependencies": [2]}\n'
+    "  ]\n"
+    "}\n\n"
+    "Example 2: Mathematical Proof / Deep Reasoning\n"
+    "User: 'Prove why opposite corners of a chessboard cannot be covered by 31 dominoes'\n"
+    "{\n"
+    '  "execution_strategy": "SEQUENTIAL",\n'
+    '  "tasks": [\n'
+    '    {"task_id": 1, "intent": "DEEP_REASONING", "sub_prompt": "Formalize chessboard coloring proof and deduce contradiction", "assigned_model": "gemma3:4b", "capability": "reasoning", "reasoning": "deep mathematical proof", "dependencies": []}\n'
+    "  ]\n"
+    "}\n\n"
+    "Example 3: Bug Fix in Workspace\n"
+    "User: 'Fix the IndexError in parser.py'\n"
+    "{\n"
+    '  "execution_strategy": "SEQUENTIAL",\n'
+    '  "tasks": [\n'
+    '    {"task_id": 1, "intent": "CODING", "sub_prompt": "Diagnose and fix IndexError in parser.py", "assigned_model": "qwen2.5-coder:7b", "capability": "debugging", "reasoning": "code debugging specialist", "dependencies": []}\n'
+    "  ]\n"
+    "}\n\n"
+    "Example 4: Image Analysis\n"
+    "User: 'Inspect chart.png and describe the data trends'\n"
+    "{\n"
+    '  "execution_strategy": "SEQUENTIAL",\n'
+    '  "tasks": [\n'
+    '    {"task_id": 1, "intent": "VISION", "sub_prompt": "Extract and interpret data trends from chart.png", "assigned_model": "qwen2.5vl:7b", "capability": "vision", "reasoning": "multimodal vision specialist", "dependencies": []}\n'
+    "  ]\n"
+    "}\n\n"
+    "Example 5: Simple Text Explanation / Question Answering\n"
+    "User: 'Explain photosynthesis in simple terms'\n"
+    "{\n"
+    '  "execution_strategy": "SEQUENTIAL",\n'
+    '  "tasks": [\n'
+    '    {"task_id": 1, "intent": "CONVERSATION", "sub_prompt": "Explain photosynthesis in simple terms", "assigned_model": "gemma3:4b", "capability": "conversation", "reasoning": "educational text explanation", "dependencies": []}\n'
+    "  ]\n"
+    "}"
 )
 
 #: fallback search order when the assigned tier has no usable model installed:
@@ -114,6 +159,35 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if start == -1 or end == -1 or end <= start:
         raise ValueError("no JSON object found in model output")
     return json.loads(cleaned[start : end + 1])
+
+
+def validate_plan_dag(plan: TaskDecompositionPlan) -> None:
+    """Validate task graph invariants before execution.
+
+    Checks:
+    - Non-empty tasks list
+    - Unique non-empty task IDs
+    - All sub_prompts are non-empty strings
+    - Dependencies reference existing tasks
+    - No self-dependencies
+    - Acyclicity (verified via topological sort)
+    """
+    if not plan.tasks:
+        raise ValueError("decomposition plan contains no tasks")
+    ids = set()
+    for task in plan.tasks:
+        if task.task_id in ids:
+            raise ValueError(f"duplicate task_id {task.task_id} in decomposition plan")
+        ids.add(task.task_id)
+        if not task.sub_prompt or not task.sub_prompt.strip():
+            raise ValueError(f"task {task.task_id} has an empty prompt")
+        for dep in task.dependencies:
+            if dep == task.task_id:
+                raise ValueError(f"task {task.task_id} depends on itself")
+            if dep not in ids and dep not in {t.task_id for t in plan.tasks}:
+                raise ValueError(f"task {task.task_id} depends on unknown task {dep}")
+    dag = plan.to_dag()
+    dag.topological_order()
 
 
 class MasterModelSelection:
@@ -272,6 +346,7 @@ class AIMasterOrchestrator(TaskPlanner):
                 ChatMessage(role="user", content=user_content),
             ],
             temperature=self._temperature,
+            max_tokens=768,
             model=selection.model_id,
             format=MasterAnalysis.model_json_schema(),
         )
@@ -506,8 +581,13 @@ class AIMasterOrchestrator(TaskPlanner):
         failures: list[str] = []
         for attempt in range(self._max_retries + 1):
             try:
-                raw = self._call_master(selection, prompt)
+                raw = self._call_master(
+                    selection,
+                    prompt,
+                    retry_error=failures[-1] if failures else None,
+                )
                 plan = self._to_plan(raw, prompt)
+                validate_plan_dag(plan)
                 break
             except Exception as exc:  # noqa: BLE001 - any failure falls back
                 failures.append(str(exc)[:200])
@@ -539,7 +619,12 @@ class AIMasterOrchestrator(TaskPlanner):
 
     # -- the AI call --------------------------------------------------------
 
-    def _call_master(self, selection: MasterModelSelection, prompt: str) -> str:
+    def _call_master(
+        self,
+        selection: MasterModelSelection,
+        prompt: str,
+        retry_error: str | None = None,
+    ) -> str:
         provider = self._providers.get(selection.provider_id)
         if provider is None:
             raise RuntimeError(f"master provider '{selection.provider_id}' not registered")
@@ -561,6 +646,15 @@ class AIMasterOrchestrator(TaskPlanner):
             vram_gb=vram,
         )
 
+        repair_prompt = ""
+        if retry_error:
+            repair_prompt = (
+                f"\n\nCRITICAL FIX: Your previous response was rejected due to error:\n"
+                f"'{retry_error}'\n"
+                "Please output strictly valid JSON conforming to the TaskDecompositionPlan schema "
+                "with non-empty prompts, valid task IDs, and no cycles."
+            )
+
         user_content = (
             f"SYSTEM HARDWARE CONTEXT:\n"
             f"- Detected Tier: {selection.tier.value}\n"
@@ -574,6 +668,7 @@ class AIMasterOrchestrator(TaskPlanner):
             "Do NOT perform the work yourself. Output ONLY valid JSON matching the schema below.\n"
             f"Schema: {json.dumps(TaskDecompositionPlan.model_json_schema())}\n\n"
             f"USER PROMPT:\n{prompt}"
+            f"{repair_prompt}"
         )
 
         request = ChatRequest(
@@ -582,6 +677,7 @@ class AIMasterOrchestrator(TaskPlanner):
                 ChatMessage(role="user", content=user_content),
             ],
             temperature=self._temperature,
+            max_tokens=768,
             model=selection.model_id,
             format=TaskDecompositionPlan.model_json_schema(),
         )

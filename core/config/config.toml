@@ -48,10 +48,10 @@ max_retries = 1
 max_tasks = 8
 
 [master_agent.tiers]
-tier1 = ["gemma3:1b"]
-tier2 = ["gemma3:4b"]
-tier3 = ["gemma3:4b"]
-tier3_plus = ["gemma3:4b"]
+tier1 = ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b"]
+tier2 = ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b"]
+tier3 = ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b"]
+tier3_plus = ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b"]
 cloud = ["gpt-4o-mini", "gemini-2.5-flash"]
 
 [master_agent.resolver]

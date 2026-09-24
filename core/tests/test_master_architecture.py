@@ -396,11 +396,11 @@ def test_req1_master_model_is_actual_llm():
     # Verifies that an actual LLM chat invocation took place
     assert len(provider.requests) == 1
     assert orchestrator.used_ai is True
-    assert provider.requests[0].model == "gemma3:4b"
+    assert provider.requests[0].model == "gemma3:1b"
 
 
 # ---------------------------------------------------------------------------
-# Requirement 2: Master Model is small designated model per tier.
+# Requirement 2: Master Model is small designated model per tier (~1B parameter).
 # ---------------------------------------------------------------------------
 def test_req2_master_model_is_small_designated_model_per_tier():
     resolver = TierResolver()
@@ -408,22 +408,22 @@ def test_req2_master_model_is_small_designated_model_per_tier():
     # Tier 1: < 6GB RAM -> gemma3:1b
     t1 = resolver.resolve(HardwareProfile(memory=MemoryInfo(total_gb=8.0, available_gb=4.0)))
     assert t1.tier == HardwareTier.TIER1
-    assert t1.candidate_models == ["gemma3:1b"]
+    assert "gemma3:1b" in t1.candidate_models
 
-    # Tier 2: 6 - 16GB RAM -> gemma3:4b
+    # Tier 2: 6 - 16GB RAM -> 1B master model (with fallbacks)
     t2 = resolver.resolve(HardwareProfile(memory=MemoryInfo(total_gb=16.0, available_gb=10.0)))
     assert t2.tier == HardwareTier.TIER2
-    assert t2.candidate_models == ["gemma3:4b"]
+    assert "gemma3:1b" in t2.candidate_models
 
-    # Tier 3: >= 16GB RAM or >= 12GB VRAM -> gemma3:4b
+    # Tier 3: >= 16GB RAM or >= 12GB VRAM -> 1B master model (with fallbacks)
     t3 = resolver.resolve(HardwareProfile(memory=MemoryInfo(total_gb=32.0, available_gb=20.0)))
     assert t3.tier == HardwareTier.TIER3
-    assert t3.candidate_models == ["gemma3:4b"]
+    assert "gemma3:1b" in t3.candidate_models
 
-    # Tier 3+: >= 32GB RAM or >= 20GB VRAM -> gemma3:4b
+    # Tier 3+: >= 32GB RAM or >= 20GB VRAM -> 1B master model (with fallbacks)
     t3_plus = resolver.resolve(HardwareProfile(memory=MemoryInfo(total_gb=64.0, available_gb=40.0)))
     assert t3_plus.tier == HardwareTier.TIER3_PLUS
-    assert t3_plus.candidate_models == ["gemma3:4b"]
+    assert "gemma3:1b" in t3_plus.candidate_models
 
 
 # ---------------------------------------------------------------------------

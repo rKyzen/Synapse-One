@@ -33,6 +33,8 @@ from synapse.domain import (
     RoutingDecision,
 )
 from synapse.domain.models import ModelMetadata
+from synapse.hardware.model_matrix import get_exact_model, matches_model_id
+from synapse.hardware.tier_resolver import TierResolver
 
 #: Weight of each REQUIRED capability in the score.
 _REQUIRED_WEIGHTS: dict[Capability, float] = {
@@ -119,6 +121,35 @@ _RELIABILITY_MAX_PENALTY = 0.15
 _RELIABILITY_FAILURE_PENALTY = 0.05
 
 
+def pick_primary_capability(caps: list[Capability] | None) -> Capability:
+    """Select the most specific capability from a task's requirements."""
+    if not caps:
+        return Capability.CHAT
+    for specific_cap in (
+        Capability.VISION,
+        Capability.IMAGE_UNDERSTANDING,
+        Capability.OCR,
+        Capability.CODING,
+        Capability.FILE_CREATION,
+        Capability.FILE_EDITING,
+        Capability.TESTING,
+        Capability.DEBUGGING,
+        Capability.PLANNING,
+        Capability.ARCHITECTURE,
+        Capability.MATH,
+        Capability.REASONING,
+        Capability.TRANSLATION,
+        Capability.LANGUAGES,
+        Capability.RESEARCH,
+        Capability.WRITING,
+        Capability.SUMMARIZATION,
+        Capability.EMBEDDINGS,
+    ):
+        if specific_cap in caps:
+            return specific_cap
+    return caps[0]
+
+
 class Router(Router):
     """Deterministic rule-based intelligent router. Replaceable by a learned
     router later — the interface stays the same."""
@@ -148,9 +179,14 @@ class Router(Router):
         required = set(decision.required_capabilities)
         preferred = [c for c in decision.preferred_capabilities if c not in required]
 
+        tier = TierResolver().resolve(hardware).tier
+        primary_cap = pick_primary_capability(decision.required_capabilities)
+        is_deep = (complexity >= _DEEP_REASONING_THRESHOLD and (Capability.REASONING in required or Capability.MATH in required))
+        locked_model = get_exact_model(tier, primary_cap, is_deep_reasoning=is_deep)
+
         scored = sorted(
             (
-                (self._score(m, decision, required, preferred, complexity), m)
+                (self._score(m, decision, required, preferred, complexity, locked_model_id=locked_model), m)
                 for m in candidates
             ),
             key=lambda pair: pair[0],
@@ -229,6 +265,7 @@ class Router(Router):
         decision: Decision,
         *,
         complexity: int = 0,
+        locked_model_id: str | None = None,
     ) -> float:
         """Requirement/preference-weighted capability score for ``m``.
 
@@ -237,7 +274,7 @@ class Router(Router):
         """
         required = set(decision.required_capabilities)
         preferred = [c for c in decision.preferred_capabilities if c not in required]
-        return self._score(m, decision, required, preferred, complexity)
+        return self._score(m, decision, required, preferred, complexity, locked_model_id=locked_model_id)
 
     @staticmethod
     def _filter(
@@ -398,9 +435,14 @@ class Router(Router):
         # Score candidates
         required = set(decision.required_capabilities)
         preferred = [c for c in decision.preferred_capabilities if c not in required]
+        tier = TierResolver().resolve(hardware).tier
+        primary_cap = pick_primary_capability(decision.required_capabilities)
+        is_deep = Capability.REASONING in required or Capability.MATH in required
+        locked_model = get_exact_model(tier, primary_cap, is_deep_reasoning=is_deep)
+
         scored = []
         for m in candidates:
-            raw_score = self._score(m, decision, required, preferred, 0)
+            raw_score = self._score(m, decision, required, preferred, 0, locked_model_id=locked_model)
             adjusted = self._reliability_adjust(raw_score, m, performance)
             breakdown = self._score_breakdown(m, decision, required, preferred)
             scored.append({
@@ -457,9 +499,15 @@ class Router(Router):
             }
 
         # Penalties
-        if Capability.VISION not in required:
-            if m.capabilities.vision:
-                breakdown["penalties"]["vision_unused"] = _VISION_UNUSED_PENALTY
+        has_vision_req = (Capability.VISION in required or Capability.IMAGE_UNDERSTANDING in required)
+        is_vision_model = (
+            bool(m.capabilities.vision)
+            or "vl" in m.id.lower()
+            or "moondream" in m.id.lower()
+        )
+        if not has_vision_req:
+            if is_vision_model:
+                breakdown["penalties"]["vision_unused"] = 1.0
             if m.capabilities.ocr > 0:
                 breakdown["penalties"]["ocr_unused"] = _OCR_UNUSED_PENALTY
             if m.capabilities.pdf > 0:
@@ -490,8 +538,13 @@ class Router(Router):
         required: set[Capability],
         preferred: list[Capability],
         complexity: int,
+        locked_model_id: str | None = None,
     ) -> float:
         score = 0.0
+
+        # Exact Model Matrix locked priority
+        if locked_model_id and matches_model_id(m.id, locked_model_id):
+            score += 2.0 if complexity < _DEEP_REASONING_THRESHOLD else 0.8
 
         for cap in required:
             score += m.capabilities.score_for(cap) * _REQUIRED_WEIGHTS.get(cap, 0.0)
@@ -519,8 +572,9 @@ class Router(Router):
                 score += 0.15
 
         # Unused specializations are penalized.
-        if Capability.VISION not in required:
-            if m.capabilities.vision:
+        has_vision_req = (Capability.VISION in required or Capability.IMAGE_UNDERSTANDING in required)
+        if not has_vision_req:
+            if m.capabilities.vision or "vl" in m.id.lower() or "moondream" in m.id.lower():
                 score -= _VISION_UNUSED_PENALTY
             if m.capabilities.ocr > 0:
                 score -= _OCR_UNUSED_PENALTY

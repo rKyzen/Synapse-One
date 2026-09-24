@@ -129,6 +129,16 @@ class OllamaEscalationEngine(EscalationEngine):
             log.warning("escalation_provider_missing", provider_id=target.provider_id)
             return current_response, decision.current_score
 
+        ctx_str = ""
+        if context:
+            if isinstance(context, list):
+                ctx_str = "\n".join(
+                    c.text if hasattr(c, "text") else (c.get("text", "") if isinstance(c, dict) else str(c))
+                    for c in context
+                )
+            else:
+                ctx_str = str(context)
+
         messages = [
             ChatMessage(role="user", content=prompt),
             ChatMessage(
@@ -139,7 +149,7 @@ class OllamaEscalationEngine(EscalationEngine):
                 role="user",
                 content=(
                     "Your colleague gave the answer above with low confidence. "
-                    + ("Context:\n" + context + "\n\n" if context else "")
+                    + (f"Context:\n{ctx_str}\n\n" if ctx_str else "")
                     + "Please provide a corrected, more accurate answer. "
                     "Start your answer directly, without meta-commentary."
                 ),

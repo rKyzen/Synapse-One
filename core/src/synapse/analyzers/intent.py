@@ -9,19 +9,30 @@ ignores one when images are actually involved.
 
 from __future__ import annotations
 
+import re
+
 from synapse.contracts import IntentAnalyzer
 from synapse.domain import IntentResult, IntentType
 
-#: (intent, base_weight, keywords) — matched on lowercase prompt text.
+#: (intent, base_weight, keywords) — matched on lowercase prompt text with word boundaries.
 _INTENT_TABLE: list[tuple[IntentType, int, tuple[str, ...]]] = [
-    (IntentType.PLANNING, 12, ("plan", "roadmap", "schedule", "timeline", "organize", "steps to", "outline to")),
-    (IntentType.CODING, 15, ("code", "program", "debug", "api", "function", "script", "website", "web app", "flutter", "python", "javascript", "repository", "git", "refactor", "algorithm", "bug", "build", "develop", "implement", "platform", "quicksort", "software")),
+    (IntentType.PLANNING, 12, ("plan", "planning", "roadmap", "schedule", "timeline", "organize", "steps to", "outline to")),
+    (IntentType.CODING, 15, ("code", "coding", "program", "programming", "debug", "debugging", "bug", "bugs", "fix", "fixes", "api", "function", "functions", "script", "scripts", "website", "web app", "flutter", "python", "javascript", "repository", "git", "refactor", "algorithm", "build", "develop", "implement", "platform", "quicksort", "software")),
     (IntentType.RESEARCH, 14, ("research", "study", "analyze", "investigate", "survey", "paper", "citation", "literature", "sources", "evidence", "findings")),
-    (IntentType.WRITING, 13, ("write", "essay", "email", "letter", "story", "poem", "grammar", "rewrite", "draft", "summarize", "translate", "proofread")),
+    (IntentType.WRITING, 13, ("write", "writing", "essay", "email", "letter", "story", "poem", "grammar", "rewrite", "draft", "summarize", "translate", "proofread")),
     (IntentType.BUSINESS, 12, ("business", "revenue", "profit", "client", "contract", "pitch", "strategy", "sales", "startup", "invoice", "market")),
     (IntentType.CREATIVE, 11, ("creative", "brainstorm", "design", "imagine", "moodboard", "illustration", "artwork", "logo")),
-    (IntentType.EDUCATION, 10, ("teach", "learn", "student", "homework", "explain", "lesson", "tutorial", "quiz")),
+    (IntentType.EDUCATION, 10, ("teach", "learn", "student", "homework", "explain", "explaining", "explanation", "lesson", "tutorial", "quiz")),
     (IntentType.CONVERSATION, 8, ("hi", "hello", "hey", "how are you", "thanks", "thank you", "who are you", "bye", "good morning")),
+]
+
+_COMPILED_INTENT_TABLE: list[tuple[IntentType, int, list[re.Pattern]]] = [
+    (
+        intent,
+        weight,
+        [re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE) for kw in keywords],
+    )
+    for intent, weight, keywords in _INTENT_TABLE
 ]
 
 #: Unambiguous image-understanding signals. Deliberately excludes ambiguous
@@ -33,6 +44,11 @@ _VISION_HINTS: tuple[str, ...] = (
     "visual inspection", "image analysis", "caption this",
 )
 
+_VISION_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\b" + re.escape(hint) + r"\b", re.IGNORECASE)
+    for hint in _VISION_HINTS
+]
+
 #: Semantic-retrieval signals (memory engine is a later phase; the router
 #: boosts embeddings-capable models when these appear).
 _EMBEDDING_HINTS: tuple[str, ...] = (
@@ -41,20 +57,25 @@ _EMBEDDING_HINTS: tuple[str, ...] = (
     "search my memory", "what did i ask", "my previous work",
 )
 
+_EMBEDDING_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\b" + re.escape(hint) + r"\b", re.IGNORECASE)
+    for hint in _EMBEDDING_HINTS
+]
+
 
 def _score_prompt(text: str) -> dict[IntentType, int]:
     """Map each intent to a weighted score for the prompt text."""
     scores: dict[IntentType, int] = {}
-    for intent, weight, keywords in _INTENT_TABLE:
-        hits = sum(1 for kw in keywords if kw in text)
+    for intent, weight, patterns in _COMPILED_INTENT_TABLE:
+        hits = sum(1 for p in patterns if p.search(text))
         if hits:
             scores[intent] = weight * hits
     return scores
 
 
 def _modality(text: str) -> tuple[bool, bool, list[str]]:
-    vision = any(hint in text for hint in _VISION_HINTS)
-    embeddings = any(hint in text for hint in _EMBEDDING_HINTS)
+    vision = any(p.search(text) for p in _VISION_PATTERNS)
+    embeddings = any(p.search(text) for p in _EMBEDDING_PATTERNS)
     reasons = []
     if vision:
         reasons.append("prompt references images/screenshots/documents → vision required")

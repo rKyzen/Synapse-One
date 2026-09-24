@@ -16,23 +16,24 @@ def _profile(available_gb: float, vram_gb: float | None = None) -> HardwareProfi
 
 
 def test_default_candidates_match_feature_spec():
-    assert _DEFAULT_CANDIDATES[HardwareTier.TIER1] == ["gemma3:1b"]
-    assert _DEFAULT_CANDIDATES[HardwareTier.TIER2] == ["gemma3:4b"]
-    assert _DEFAULT_CANDIDATES[HardwareTier.TIER3] == ["gemma3:4b"]
-    assert _DEFAULT_CANDIDATES[HardwareTier.TIER3_PLUS] == ["gemma3:4b"]
+    expected = ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b", "gemma3:4b"]
+    assert _DEFAULT_CANDIDATES[HardwareTier.TIER1] == expected
+    assert _DEFAULT_CANDIDATES[HardwareTier.TIER2] == expected
+    assert _DEFAULT_CANDIDATES[HardwareTier.TIER3] == expected
+    assert _DEFAULT_CANDIDATES[HardwareTier.TIER3_PLUS] == expected
     assert _DEFAULT_CANDIDATES[HardwareTier.CLOUD_FALLBACK] == ["gpt-4o-mini", "gemini-2.5-flash"]
 
 
 def test_tier1_below_6gb():
     assignment = TierResolver().resolve(_profile(4.0))
     assert assignment.tier is HardwareTier.TIER1
-    assert assignment.candidate_models == ["gemma3:1b"]
+    assert assignment.candidate_models[0] == "gemma3:1b"
 
 
 def test_tier2_between_6_and_16gb():
     assignment = TierResolver().resolve(_profile(8.0))
     assert assignment.tier is HardwareTier.TIER2
-    assert assignment.candidate_models == ["gemma3:4b"]
+    assert assignment.candidate_models[0] == "gemma3:1b"
 
 
 def test_tier2_boundary_inclusive():
@@ -42,25 +43,25 @@ def test_tier2_boundary_inclusive():
 def test_tier3_between_16_and_32gb():
     assignment = TierResolver().resolve(_profile(20.0))
     assert assignment.tier is HardwareTier.TIER3
-    assert assignment.candidate_models == ["gemma3:4b"]
+    assert assignment.candidate_models[0] == "gemma3:1b"
 
 
 def test_tier3_dedicated_vram_low_ram():
     assignment = TierResolver().resolve(_profile(4.0, vram_gb=12.0))
     assert assignment.tier is HardwareTier.TIER3
-    assert assignment.candidate_models == ["gemma3:4b"]
+    assert assignment.candidate_models[0] == "gemma3:1b"
 
 
 def test_tier3_plus_above_32gb():
     assignment = TierResolver().resolve(_profile(36.0))
     assert assignment.tier is HardwareTier.TIER3_PLUS
-    assert assignment.candidate_models == ["gemma3:4b"]
+    assert assignment.candidate_models[0] == "gemma3:1b"
 
 
 def test_tier3_plus_dedicated_vram():
     assignment = TierResolver().resolve(_profile(4.0, vram_gb=24.0))
     assert assignment.tier is HardwareTier.TIER3_PLUS
-    assert assignment.candidate_models == ["gemma3:4b"]
+    assert assignment.candidate_models[0] == "gemma3:1b"
 
 
 def test_cloud_fallback_below_half_gb():

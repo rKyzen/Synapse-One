@@ -248,6 +248,43 @@ def _parse_strict_manifest(text: str) -> list[dict]:
     return _filter_manifest_ops(_dedupe_ops(_payload_to_ops(payload)))
 
 
+def _raw_code_to_ops(text: str, hint: str) -> list[dict]:
+    """Fallback when no JSON and no markdown code fences are present.
+
+    If the model output is raw code or script content with an explicit file header
+    or a non-empty hint, extract it into a write op.
+    """
+    if not text or not text.strip():
+        return []
+    cleaned = text.strip()
+    if _is_placeholder_content(cleaned):
+        return []
+
+    # Check for header line naming the file
+    first_line, _, rest = cleaned.partition("\n")
+    head = first_line.strip()
+    m = _PATH_HEADER_RE.match(head) or _PATH_RE.match(head)
+    detected_path = ""
+    body = cleaned
+    if m:
+        cand = m.group(1).strip()
+        if _is_valid_extracted_path(cand):
+            detected_path = cand
+            body = rest.strip("\n")
+
+    if not detected_path and hint:
+        sanitized = _sanitize_hint(hint)
+        if sanitized and _is_valid_extracted_path(sanitized):
+            detected_path = sanitized
+
+    if detected_path and not _is_placeholder_content(body):
+        if not is_safe_relative_path(detected_path):
+            detected_path = "output.txt"
+        return [{"action": "write", "path": detected_path, "content": body}]
+
+    return []
+
+
 def parse_file_manifest(
     result: str | None,
     hint: str = "",
@@ -285,6 +322,12 @@ def parse_file_manifest(
     fallback = _fences_to_ops(text, hint)
     if fallback:
         return fallback
+
+    # fallback: raw code / script output without fences or JSON
+    raw_ops = _raw_code_to_ops(text, hint)
+    if raw_ops:
+        return raw_ops
+
     return []
 
 
@@ -453,6 +496,22 @@ def _fences_to_ops(text: str, hint: str) -> list[dict]:
         return []
     matches = list(_FENCE_RE.finditer(text))
     if not matches:
+        # Check for unclosed code fence
+        unclosed = re.search(r"```(?P<lang>[a-zA-Z0-9_+-]*)[ \t]*\n?(?P<body>.*)$", text, re.DOTALL)
+        if unclosed:
+            lang = unclosed.group("lang") or ""
+            body = unclosed.group("body") or ""
+            raw = body.rstrip("\n")
+            if raw and raw.strip():
+                preceding_text = text[: unclosed.start()]
+                preceding_path = _extract_preceding_path(preceding_text)
+                path, body_content = _fence_destination(
+                    raw, lang, hint, preceding_path=preceding_path
+                )
+                if not _is_placeholder_content(body_content):
+                    if not is_safe_relative_path(path):
+                        path = "output.txt"
+                    return [{"action": "write", "path": path, "content": body_content}]
         return []
     used: set[str] = set()
     ops: list[dict] = []

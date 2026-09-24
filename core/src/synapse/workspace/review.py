@@ -208,16 +208,47 @@ def validate_file(path: str, content: str | bytes) -> ValidationResult:
     return result.model_copy(update={"path": path})
 
 
+def clean_review_text(review_text: str, ok_paths: set[str] | list[str]) -> str:
+    """Scrub false 'not found in workspace' claims for verified files from review text."""
+    if not review_text:
+        return ""
+    import re
+    path_set = {str(p).strip().lower() for p in ok_paths}
+    base_set = {p.rsplit("/", 1)[-1].lower() for p in path_set}
+    cleaned_lines = []
+    for line in review_text.splitlines():
+        sentences = re.split(r"(?<=[.!?])\s+", line)
+        kept_sentences = []
+        for s in sentences:
+            s_lower = s.lower()
+            if (
+                "not found in workspace" in s_lower
+                or "not found" in s_lower
+                or "missing from workspace" in s_lower
+                or "does not exist in workspace" in s_lower
+            ):
+                if any(p in s_lower for p in path_set) or any(b in s_lower for b in base_set):
+                    continue
+            kept_sentences.append(s)
+        if kept_sentences:
+            cleaned_lines.append(" ".join(kept_sentences))
+    return "\n".join(cleaned_lines).strip()
+
+
 def summarize(validations: list[ValidationResult], review_text: str = "") -> str:
     """Human-readable summary block appended to the final response."""
     lines = []
+    ok_paths = set()
     for result in validations:
         marker = "ok" if result.ok else "FAILED"
+        if result.ok:
+            ok_paths.add(result.path)
         detail = result.error or (" · ".join(result.checks) if result.checks else "")
         lines.append(f"- {result.path}: {marker}{(' (' + detail + ')') if detail else ''}")
     if not lines:
         return ""
     header = "Generated files (validation):"
-    if review_text:
-        return f"{header}\n" + "\n".join(lines) + f"\n\nReview:\n{review_text}"
+    cleaned_review = clean_review_text(review_text, ok_paths) if review_text else ""
+    if cleaned_review:
+        return f"{header}\n" + "\n".join(lines) + f"\n\nReview:\n{cleaned_review}"
     return f"{header}\n" + "\n".join(lines)

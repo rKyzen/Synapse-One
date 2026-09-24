@@ -26,13 +26,23 @@ from synapse.domain.hardware import (
     RecommendedModelLimits,
     StorageInfo,
 )
+from synapse.hardware.model_matrix import (
+    EXACT_MODEL_MATRIX,
+    ModelRole,
+    capability_to_role,
+    get_exact_model,
+)
 from synapse.hardware.tier_resolver import HardwareTier, TierAssignment, TierResolver
 
 __all__ = [
+    "EXACT_MODEL_MATRIX",
     "HardwareScanner",
     "HardwareTier",
+    "ModelRole",
     "TierAssignment",
     "TierResolver",
+    "capability_to_role",
+    "get_exact_model",
 ]
 
 

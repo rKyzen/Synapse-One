@@ -62,10 +62,17 @@ class ActionEngine:
         content = self._op.read(rel)
         if content is None:
             return {"ok": False, "error": f"file not found: {rel}"}
-        if not old or old not in content:
-            return {"ok": False, "error": "old text not found in file"}
-        updated = content.replace(old, new)
+        target_old = old
+        if not target_old or target_old not in content:
+            if target_old and target_old.strip() and target_old.strip() in content:
+                target_old = target_old.strip()
+            else:
+                return {"ok": False, "error": "old text not found in file"}
+        updated = content.replace(target_old, new, 1) if content.count(target_old) == 1 else content.replace(target_old, new)
         self._op.write(rel, updated)
+        post_content = self._op.read(rel)
+        if post_content is None or (new and new not in post_content):
+            return {"ok": False, "error": "edit not reflected on disk (verification failed)"}
         return {"ok": True, "bytes": len(updated.encode())}
 
     def move(self, src: str, dst: str) -> dict:
@@ -132,9 +139,15 @@ class ActionEngine:
         return result
 
     def _edit_verified(self, path: str, old: str, new: str) -> bool:
-        """True when the edit landed: file exists and ``old`` is gone."""
+        """True when the edit landed: file exists and contains new content."""
         content = self._op.read(path)
-        return content is not None and old not in content
+        if content is None:
+            return False
+        if new and new not in content:
+            return False
+        if old and old not in new and old in content:
+            return False
+        return True
 
     def _content_matches(self, path: str, expected: str | bytes) -> bool:
         if not self._op.exists(path):

@@ -14,6 +14,7 @@ class CpuInfo(BaseModel):
 
 
 class GpuInfo(BaseModel):
+    available: bool = False
     name: str | None = None
     vram_gb: float | None = None
     vendor: str | None = None
@@ -39,9 +40,13 @@ class RecommendedModelLimits(BaseModel):
 
     max_ram_gb: float = 0.0
     max_quantized_params_billions: float = 0.0
+    max_parameters_b: float = 0.0
     vram_available_gb: float = 0.0
     can_run_local_llm: bool = False
     notes: list[str] = Field(default_factory=list)
+
+
+HardwareRecommendations = RecommendedModelLimits
 
 
 class HardwareProfile(BaseModel):

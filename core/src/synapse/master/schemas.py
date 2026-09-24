@@ -218,6 +218,29 @@ class TaskDecompositionPlan(BaseModel):
             if model_hint and model_hint.endswith("_tool") and not req_tools:
                 req_tools = [model_hint]
 
+            # Inferred file_hint and file_output
+            file_hint = ""
+            file_out = sub.file_output
+            import re
+            m = re.search(r"\b([A-Za-z0-9_\-\.\/]+\.(?:py|js|ts|html|css|json|md|sh|toml|yaml|yml|sql))\b", sub.sub_prompt)
+            if m:
+                file_hint = m.group(1).strip()
+                file_out = True
+            elif sub.intent in (SubTaskIntent.CODING, SubTaskIntent.WRITING) or (sub.capability and any(c in sub.capability.lower() for c in ("code", "file", "test", "doc"))):
+                lowered_prompt = sub.sub_prompt.lower()
+                if any(w in lowered_prompt for w in ("html", "css", "landing page", "website")):
+                    file_hint = "index.html"
+                    file_out = True
+                elif "test" in lowered_prompt:
+                    file_hint = "test/test_app.py"
+                    file_out = True
+                elif any(w in lowered_prompt for w in ("doc", "readme", "architecture")):
+                    file_hint = "docs/README.md"
+                    file_out = True
+                elif any(w in lowered_prompt for w in ("python", "script", "app", "main")) or sub.intent == SubTaskIntent.CODING:
+                    file_hint = "src/main.py"
+                    file_out = True
+
             tasks.append(
                 Task(
                     id=f"t{sub.task_id}",
@@ -226,7 +249,8 @@ class TaskDecompositionPlan(BaseModel):
                     required_capabilities=required,
                     preferred_capabilities=preferred,
                     depends_on=[f"t{dep}" for dep in sub.dependencies],
-                    file_output=sub.file_output,
+                    file_output=file_out,
+                    file_hint=file_hint,
                     model_hint=model_hint if model_hint and not model_hint.endswith("_tool") else None,
                     preferred_model=model_hint if model_hint and not model_hint.endswith("_tool") else None,
                     required_tools=req_tools,

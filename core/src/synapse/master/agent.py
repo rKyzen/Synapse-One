@@ -61,14 +61,17 @@ from synapse.domain import (
     AgentResponse,
     Capability,
     ChatResponse,
+    ComplexityResult,
     Decision,
     DecisionTrace,
     ExecutionGraph,
     ExecutionPlan,
     GraphEdge,
     GraphNode,
+    IntentResult,
     MemoryScope,
     PrivacyMode,
+    PrivacyResult,
     ProviderKind,
     RoutingDecision,
     Task,
@@ -81,7 +84,7 @@ from synapse.domain.fileops import FileAction, ValidationResult
 from synapse.domain.tasks import TaskDAG
 from synapse.events import EventBus, Events
 from synapse.execution import Executor, ProviderUnavailable
-from synapse.providers.manager import ProviderManager
+from synapse.master.fast_path import FastPathResult, FastPathType, check_fast_path
 from synapse.master.schemas import ExecutionMode, MasterAnalysis, ReasoningComplexity
 from synapse.workspace.brief import build_workspace_brief
 from synapse.workspace.manifest import (
@@ -234,13 +237,130 @@ class MasterAgent:
         start = time.perf_counter()
         self._events.publish(Events.REQUEST_RECEIVED, {"prompt_length": len(prompt)})
 
-        # 1. Master Model Analysis First (runs before touching workspace or tools)
-        analysis_start = time.perf_counter()
-        master_analysis: MasterAnalysis = self._analyze_request(prompt)
-        if files:
-            master_analysis.files_needed = True
-            master_analysis.workspace_needed = True
-        master_analysis_ms = (time.perf_counter() - analysis_start) * 1000
+        # 0. Deterministic Fast Path (Arithmetic, Greetings, Identity, Workspace, Status)
+        fast_result = check_fast_path(prompt, has_files=bool(files))
+        if fast_result.is_fast_path:
+            if fast_result.path_type == FastPathType.WORKSPACE_QUERY and fast_result.direct_response is None:
+                if file_operator is not None:
+                    items = file_operator.list_tree()
+                    if items:
+                        lines = [f"- `{f.get('path')}` ({f.get('size', 0)} bytes)" for f in items]
+                        fast_result.direct_response = "### Project Files:\n\n" + "\n".join(lines)
+                    else:
+                        fast_result.direct_response = "Project workspace is currently empty."
+                else:
+                    fast_result.direct_response = "No active workspace folder opened."
+
+            elif fast_result.path_type == FastPathType.LOADED_MODELS and fast_result.direct_response is None:
+                if self._lifecycle is not None:
+                    loaded = self._lifecycle.list_loaded()
+                    if loaded:
+                        fast_result.direct_response = "### Currently Loaded Models:\n\n" + "\n".join(
+                            [f"- **{m}** (RAM: {r:.1f} GB)" for m, r in loaded.items()]
+                        )
+                    else:
+                        fast_result.direct_response = "No specialist models currently active in memory."
+                else:
+                    fast_result.direct_response = "No active loaded models reported."
+
+            elif fast_result.path_type == FastPathType.SYSTEM_STATUS and fast_result.direct_response is None:
+                hw = self._hardware.scan()
+                gpu_str = f"{hw.gpu.name} ({hw.gpu.vram_gb:.1f} GB VRAM)" if hw.gpu and hw.gpu.name else "None"
+                fast_result.direct_response = (
+                    f"### System Status:\n\n"
+                    f"- **CPU**: {hw.cpu.model}\n"
+                    f"- **RAM**: {hw.memory.available_gb:.1f} GB available / {hw.memory.total_gb:.1f} GB total\n"
+                    f"- **GPU**: {gpu_str}\n"
+                    f"- **Local LLM Capable**: {'Yes' if hw.recommendations.can_run_local_llm else 'No'}"
+                )
+
+            if fast_result.direct_response is not None:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                timings = {
+                    "fast_path_ms": round(elapsed_ms, 2),
+                    "master_analysis_ms": 0.0,
+                    "context_retrieval_ms": 0.0,
+                    "worker_inference_ms": 0.0,
+                    "tools_ms": 0.0,
+                    "total_ms": round(elapsed_ms, 2),
+                }
+                self._save_memory(prompt, fast_result.direct_response, memory=memory, conversation_id=conversation_id)
+                self._publish_timeline("fast_path", f"Fast path: {fast_result.path_type.value}")
+                self._events.publish(Events.REQUEST_ROUTED, {"provider": "fast_path", "model": "deterministic"})
+                self._events.publish(Events.REQUEST_COMPLETED, {"latency_ms": round(elapsed_ms, 1), "tasks": 0, "fast_path": True})
+
+                hardware = self._hardware.scan()
+                intent_res = IntentResult(primary=fast_result.intent, confidence=1.0)
+                comp_res = ComplexityResult(score=fast_result.complexity)
+                priv_res = PrivacyResult(mode=PrivacyMode.LOCAL_ONLY)
+                dec_res = Decision(can_stay_local=True, preferred_kind=ProviderKind.LOCAL)
+                routing_res = RoutingDecision(
+                    provider_id="fast_path",
+                    model_id="deterministic",
+                    kind=ProviderKind.LOCAL,
+                    reason=f"deterministic fast path: {fast_result.path_type.value}",
+                    capability_score=1.0,
+                )
+                fast_analysis = MasterAnalysis(
+                    intent="direct_answer",
+                    domain="general",
+                    goal=prompt[:80],
+                    workspace_needed=False,
+                    files_needed=False,
+                    artifact_required=False,
+                    reasoning_complexity=ReasoningComplexity.TRIVIAL,
+                    required_capabilities=["chat"],
+                    recommended_model_role="Fast Path",
+                    execution_mode=ExecutionMode.DIRECT_ANSWER,
+                    confidence=1.0,
+                )
+                trace = self._build_trace(
+                    intent_res, comp_res, priv_res, dec_res, routing_res, hardware, elapsed_ms, response=None,
+                    master_analysis=fast_analysis,
+                    timings=timings,
+                )
+                return AgentResponse(
+                    response=fast_result.direct_response,
+                    intent=fast_result.intent,
+                    complexity=fast_result.complexity,
+                    privacy=PrivacyMode.LOCAL_ONLY,
+                    provider="fast_path",
+                    model="deterministic",
+                    execution_plan=ExecutionPlan(
+                        intent=fast_result.intent,
+                        complexity=fast_result.complexity,
+                        privacy=PrivacyMode.LOCAL_ONLY,
+                    ),
+                    decision_trace=trace,
+                    latency_ms=round(elapsed_ms, 1),
+                    execution_graph=ExecutionGraph(total_latency_ms=round(elapsed_ms, 1)),
+                    workspace=None,
+                    actions=[],
+                )
+            elif fast_result.path_type == FastPathType.FAST_CHAT:
+                master_analysis = MasterAnalysis(
+                    intent="direct_answer",
+                    domain="general",
+                    goal=prompt[:80],
+                    workspace_needed=False,
+                    files_needed=False,
+                    artifact_required=False,
+                    reasoning_complexity=ReasoningComplexity.TRIVIAL,
+                    required_capabilities=["chat"],
+                    recommended_model_role="General Chat",
+                    execution_mode=ExecutionMode.DIRECT_ANSWER,
+                    confidence=1.0,
+                )
+                master_analysis_ms = 0.0
+
+        if not fast_result.is_fast_path or fast_result.path_type != FastPathType.FAST_CHAT:
+            # 1. Master Model Analysis First (runs before touching workspace or tools)
+            analysis_start = time.perf_counter()
+            master_analysis = self._analyze_request(prompt)
+            if files:
+                master_analysis.files_needed = True
+                master_analysis.workspace_needed = True
+            master_analysis_ms = (time.perf_counter() - analysis_start) * 1000
 
         self._publish_timeline("master_analysis", "Master Model analyzing request…")
         self._publish_timeline("intent_decision", f"Intent: {master_analysis.intent.replace('_', ' ').title()}")
@@ -316,7 +436,12 @@ class MasterAgent:
             intent = intent.model_copy(update={"primary": IntentType.RESEARCH})
         elif master_analysis.artifact_required or master_analysis.coding_needed:
             intent = intent.model_copy(update={"primary": IntentType.CODING})
-        elif not master_analysis.coding_needed and intent.primary is IntentType.CODING:
+        elif (
+            not master_analysis.coding_needed
+            and intent.primary is IntentType.CODING
+            and not _EXPLICIT_FILE_TARGET_RE.search(prompt)
+            and kind not in (RequestKind.FILE_MODIFICATION, RequestKind.FILE_CREATION, RequestKind.PROJECT_GENERATION)
+        ):
             intent = intent.model_copy(update={"primary": IntentType.CONVERSATION})
 
         privacy = self._privacy.analyze(
@@ -498,6 +623,7 @@ class MasterAgent:
                 dag, prompt, decision, hardware, registry_models, health, available, complexity.score, perf_stats,
                 workspace_outcome, files, temperature=temperature, max_tokens=max_tokens,
                 workspace=ws, memory=mem, conversation_id=conversation_id,
+                file_operator=file_operator, kind=kind,
             )
             worker_inference_ms = (time.perf_counter() - worker_inference_start) * 1000
 
@@ -941,6 +1067,8 @@ class MasterAgent:
         workspace=None,
         memory=None,
         conversation_id: str | None = None,
+        file_operator=None,
+        kind: RequestKind | None = None,
     ) -> tuple[ExecutionGraph, list[Task], RoutingDecision | None]:
         """Execute DAG with Phase 4 quality checks (confidence, verification, escalation, self-correction)."""
         ws = workspace if workspace is not None else self._workspace
@@ -1000,26 +1128,34 @@ class MasterAgent:
                 )
                 effective_prompt = context_bundle.user_prompt
 
-            # Phase XVI — pass the previous model's output forward: every
-            # task (except the first) sees the result of its dependencies, or
-            # of the most recently executed step, as prompt context. File
-            # manifests are reduced to their paths — raw manifest contents are
-            # never re-fed to another model (the filesystem, after apply, is
-            # the source of truth).
+            # Pass previous step context forward
             prior = self._prior_context(task, executed)
             if prior:
                 effective_prompt = f"{effective_prompt}\n\n{prior}"
 
-            # Phase 7 fix — a file task model is told exactly what to return.
-            # Without this real LLMs answer in prose/fenced code instead of a
-            # manifest, so the backend would have nothing structured to apply.
+            # Layer A & B Unification:
+            # Layer A (workspace context) is in the brief.
+            # Layer B (action format) is ONLY added when the task is file-producing.
             if task.file_output:
                 effective_prompt = f"{effective_prompt}\n\n{MANIFEST_INSTRUCTION}"
-            elif task.kind not in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
-                # Phase X — universal workspace tool: every other task may
-                # also produce files inside the project folder (soft rule:
-                # plain prose answers stay perfectly valid).
-                effective_prompt = f"{effective_prompt}\n\n{WORKSPACE_TOOL_INSTRUCTION}"
+
+            # If reviewing files, inject real files from disk
+            if task.kind == TaskKind.REVIEW and file_operator is not None:
+                try:
+                    tree = file_operator.list_tree()
+                    if tree:
+                        snippets = []
+                        for item in tree[:10]:
+                            p = item.get("path")
+                            c = file_operator.read(p)
+                            if c is not None:
+                                max_c = 2500
+                                snip = c if len(c) <= max_c else c[:max_c] + "\n... [truncated]"
+                                snippets.append(f"### File on disk: {p}\n{snip}")
+                        if snippets:
+                            effective_prompt = f"{effective_prompt}\n\nWorkspace actual files on disk for review:\n" + "\n\n".join(snippets)
+                except Exception:
+                    pass
 
             routing = self._route_task(
                 task_decision, hardware, registry_models, health, available, complexity, effective_prompt, perf_stats,
@@ -1088,6 +1224,52 @@ class MasterAgent:
                 task.status = TaskStatus.COMPLETED
                 node.status = TaskStatus.COMPLETED
                 node.latency_ms = round(task.latency_ms, 1)
+
+                # Progressive file execution and quality verification
+                if file_operator is not None and task.file_output and task.kind not in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
+                    # Vision Isolation: vision models never produce file ops
+                    if Capability.VISION not in (task.required_capabilities or []):
+                        ops = parse_file_manifest(task.result, hint=task.file_hint, strict=False)
+                        if ops:
+                            engine = ActionEngine(file_operator)
+                            ops = engine.plan_project_ops(kind, ops)
+                            task_actions, task_validations = engine.apply(ops, on_step=self._timeline_for_op)
+
+                            # Python AST Syntax Check Quality Loop
+                            py_actions = [a for a in task_actions if a.path.endswith(".py") and a.status == "ok"]
+                            has_syntax_err = False
+                            err_file, err_msg = "", ""
+                            for pa in py_actions:
+                                py_content = file_operator.read(pa.path)
+                                if py_content is not None:
+                                    try:
+                                        ast.parse(py_content)
+                                    except SyntaxError as syn_exc:
+                                        has_syntax_err = True
+                                        err_file = pa.path
+                                        err_msg = f"line {syn_exc.lineno}: {syn_exc.msg}"
+                                        break
+
+                            if has_syntax_err:
+                                log.warning("syntax_error_detected_retrying", file=err_file, error=err_msg)
+                                retry_prompt = (
+                                    f"{effective_prompt}\n\n"
+                                    f"SYNTAX REPAIR REQUIRED:\n"
+                                    f"The Python file '{err_file}' generated contains a SyntaxError ({err_msg}).\n"
+                                    f"Please return the complete, corrected JSON file manifest with valid Python syntax."
+                                )
+                                try:
+                                    fix_resp = self._execute_with_lifecycle(routing, retry_prompt, temperature=0.1, max_tokens=max_tokens)
+                                    fix_ops = parse_file_manifest(fix_resp.content, hint=task.file_hint, strict=False)
+                                    if fix_ops:
+                                        task.result = fix_resp.content
+                                        fix_ops = engine.plan_project_ops(kind, fix_ops)
+                                        task_actions, task_validations = engine.apply(fix_ops, on_step=self._timeline_for_op)
+                                except Exception as exc:  # noqa: BLE001
+                                    log.warning("syntax_repair_failed", error=str(exc)[:200])
+
+                            task._actions = task_actions
+                            task._validations = task_validations
 
                 if task.kind == TaskKind.REVIEW:
                     self._events.publish(Events.RESULT_VALIDATED, {"task_id": task.id, "status": "verified"})
@@ -1399,6 +1581,15 @@ class MasterAgent:
                 continue
             if task.kind in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
                 continue  # review commentary must never become files
+            # Vision isolation: vision models never produce file ops
+            if Capability.VISION in (task.required_capabilities or []):
+                continue
+            if hasattr(task, "_actions") and task._actions:
+                actions.extend(task._actions)
+                if hasattr(task, "_validations") and task._validations:
+                    validations.extend(task._validations)
+                continue
+
             # Planned file tasks get the tolerant prose/fenced-code converter;
             # universal-tool tasks (file intent not planned) must produce a
             # real manifest — ordinary prose never becomes files on disk.
@@ -1630,6 +1821,10 @@ class MasterAgent:
         review_task = dag.get("t-review")
         if review_task is not None and review_task.result:
             review_text = review_task.result.strip()
+        ok_paths = {a.path for a in actions if a.status == "ok"}
+        if review_text:
+            from synapse.workspace.review import clean_review_text
+            review_text = clean_review_text(review_text, ok_paths)
         block = ActionEngine.summarize(actions, validations, review_text=review_text)
         if summary_only:
             return block

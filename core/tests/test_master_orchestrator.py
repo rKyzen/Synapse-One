@@ -26,6 +26,7 @@ from synapse.domain import (
     TaskKind,
 )
 from synapse.domain.hardware import MemoryInfo
+from synapse.hardware import HardwareTier, TierResolver
 from synapse.master import AIMasterOrchestrator, TaskDecompositionPlan, extract_json_object
 from synapse.master.orchestrator import MasterModelSelection
 
@@ -70,7 +71,7 @@ class ScriptedProvider(ModelProvider):
         pass
 
     def list_models(self) -> list[ModelDescriptor]:
-        return [ModelDescriptor(id="gemma3:4b", provider_id=self.provider_id)]
+        return [ModelDescriptor(id="gemma3:1b", provider_id=self.provider_id)]
 
     def to_metadata(self, descriptor: ModelDescriptor) -> ModelMetadata | None:
         return None
@@ -152,13 +153,15 @@ def _make_orchestrator(
     models: list[ModelMetadata] | None = None,
     available_gb: float = 8.0,
     fallback: FallbackStub | None = None,
+    resolver: TierResolver | None = None,
     **kwargs,
 ):
     return AIMasterOrchestrator(
         providers=FakeManager(provider),
-        registry=FakeRegistry(models if models is not None else [_model("gemma3:4b")]),
+        registry=FakeRegistry(models if models is not None else [_model("gemma3:1b")]),
         hardware=FakeHardware(available_gb),
         config=None,  # type: ignore[arg-type] - defaults suffice
+        resolver=resolver,
         fallback_planner=fallback,
         **kwargs,
     )
@@ -175,7 +178,7 @@ def test_valid_plan_produces_dag_and_picks_tier_model():
 
     assert orch.used_ai is True
     assert orch.last_tier.value == "tier2"
-    assert orch.last_model == "gemma3:4b"
+    assert orch.last_model == "gemma3:1b"
     ids = [t.id for t in dag.tasks]
     assert ids == ["t1", "t2", "t-synthesis"]
     assert dag.get("t2").depends_on == ["t1"]
@@ -281,12 +284,14 @@ def test_disabled_uses_fallback_directly():
 
 
 def test_tier_escalation_when_assigned_tier_missing():
-    # tier2 assigned (8GB) but only tier1 model installed -> tier1 selected.
+    # tier2 assigned (8GB) with gemma3:4b configured, but only tier1 model (gemma3:1b) installed -> tier1 selected.
     provider = ScriptedProvider([json.dumps(_GOOD_PLAN)])
+    custom_resolver = TierResolver(candidates={HardwareTier.TIER1: ["gemma3:1b"], HardwareTier.TIER2: ["gemma3:4b"]})
     orch = _make_orchestrator(
         provider,
         models=[_model("gemma3:1b")],
         available_gb=8.0,
+        resolver=custom_resolver,
     )
     intent, complexity, privacy = _results()
     orch.plan("fix and email", intent, complexity, privacy, DECISION)

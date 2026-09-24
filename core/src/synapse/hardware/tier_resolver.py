@@ -42,12 +42,12 @@ class HardwareTier(str, Enum):
 
 
 #: built-in candidate models per tier (overridden by config).
-#: EXACTLY ONE default Master Model per hardware tier (small & fast).
+#: Master Model is permanently lightweight at ~1B parameters across all tiers.
 _DEFAULT_CANDIDATES: dict[HardwareTier, list[str]] = {
-    HardwareTier.TIER1: ["gemma3:1b"],
-    HardwareTier.TIER2: ["gemma3:4b"],
-    HardwareTier.TIER3: ["gemma3:4b"],
-    HardwareTier.TIER3_PLUS: ["gemma3:4b"],
+    HardwareTier.TIER1: ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b", "gemma3:4b"],
+    HardwareTier.TIER2: ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b", "gemma3:4b"],
+    HardwareTier.TIER3: ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b", "gemma3:4b"],
+    HardwareTier.TIER3_PLUS: ["gemma3:1b", "qwen2.5:1.5b", "llama3.2:1b", "qwen3:1.7b", "gemma3:4b"],
     HardwareTier.CLOUD_FALLBACK: ["gpt-4o-mini", "gemini-2.5-flash"],
 }
 
