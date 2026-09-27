@@ -23,6 +23,7 @@ import ast
 import json
 import re
 import time
+from pathlib import Path
 
 import structlog
 
@@ -203,9 +204,12 @@ class MasterAgent:
         self._citations = citation_engine
         self._grounding = grounding_validator
 
-    def _analyze_request(self, prompt: str) -> MasterAnalysis:
+    def _analyze_request(self, prompt: str, conversation_id: str | None = None) -> MasterAnalysis:
         if self._task_planner is not None and hasattr(self._task_planner, "analyze"):
-            return self._task_planner.analyze(prompt)
+            try:
+                return self._task_planner.analyze(prompt, conversation_id=conversation_id)
+            except TypeError:
+                return self._task_planner.analyze(prompt)
         from synapse.master.orchestrator import AIMasterOrchestrator
         return AIMasterOrchestrator._fallback_analysis(prompt, "direct fallback")
 
@@ -356,7 +360,7 @@ class MasterAgent:
         if not fast_result.is_fast_path or fast_result.path_type != FastPathType.FAST_CHAT:
             # 1. Master Model Analysis First (runs before touching workspace or tools)
             analysis_start = time.perf_counter()
-            master_analysis = self._analyze_request(prompt)
+            master_analysis = self._analyze_request(prompt, conversation_id=conversation_id)
             if files:
                 master_analysis.files_needed = True
                 master_analysis.workspace_needed = True
@@ -480,6 +484,8 @@ class MasterAgent:
                     files=files, ws=ws, memory=mem, conversation_id=conversation_id,
                     start=start, master_analysis=master_analysis,
                     master_analysis_ms=master_analysis_ms, context_retrieval_ms=0.0,
+                    project_id=project_id, project_name=project_name, project_path=project_path,
+                    file_operator=file_operator,
                 )
         elif (
             intent_kind is IntentKind.FILE_EDITING
@@ -502,6 +508,8 @@ class MasterAgent:
                 files=files, ws=ws, memory=mem, conversation_id=conversation_id,
                 start=start, master_analysis=master_analysis,
                 master_analysis_ms=master_analysis_ms, context_retrieval_ms=0.0,
+                project_id=project_id, project_name=project_name, project_path=project_path,
+                file_operator=file_operator,
             )
 
         # Context loading (strictly opt-in based on Master Analysis)
@@ -550,22 +558,49 @@ class MasterAgent:
         available = self._provider_available_models()
         perf_stats = self._performance.stats() if self._performance else None
 
-        brief = None
+        brief = build_workspace_brief(
+            project_id=project_id,
+            project_name=project_name,
+            project_path=project_path,
+            file_operator=file_operator,
+            memory=mem,
+            conversation_id=conversation_id,
+        )
+
+        web_start = time.perf_counter()
+        web_context = ""
+        web_ms = 0.0
+        if master_analysis is not None and master_analysis.web_needed:
+            self._publish_timeline("web_search", f"Searching web for: {prompt[:60]}…")
+            try:
+                from synapse.pipeline.tools import ToolRegistry
+                tool_reg = ToolRegistry()
+                search_results = tool_reg._web_search(prompt, max_results=4)
+                if search_results:
+                    res_lines = []
+                    for item in search_results:
+                        title = item.get("title", "")
+                        snippet = item.get("snippet", "")
+                        url = item.get("url", "")
+                        res_lines.append(f"- {title} ({url}):\n  {snippet}")
+                    web_context = "Fresh Web Search Results:\n" + "\n".join(res_lines) + "\n\n"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("web_search_failed", error=str(exc)[:200])
+            web_ms = (time.perf_counter() - web_start) * 1000
+
         context = None
-        if file_operator is not None and (master_analysis.workspace_needed or follow_up_override):
+        if file_operator is not None and (
+            master_analysis.workspace_needed
+            or master_analysis.artifact_required
+            or requires_workspace_access(prompt)
+            or follow_up_override
+        ):
             self._publish_timeline("read_workspace", "Reading workspace…")
-            brief = build_workspace_brief(
-                project_id=project_id,
-                project_name=project_name,
-                project_path=project_path,
-                file_operator=file_operator,
-                memory=mem,
-                conversation_id=conversation_id,
+            context = ActionEngine(file_operator).build_context(
+                on_file=lambda p: self._publish_timeline("read_file", f"Reading {p}")
             )
-            if requires_workspace_access(prompt) or follow_up_override:
-                context = ActionEngine(file_operator).build_context(
-                    on_file=lambda p: self._publish_timeline("read_file", f"Reading {p}")
-                )
+        if web_context:
+            context = f"{web_context}{context}" if context else web_context
         context_retrieval_ms = (time.perf_counter() - context_retrieval_start) * 1000
 
         dag = self._plan_tasks(prompt, intent, complexity, privacy, decision, master_analysis=master_analysis)
@@ -583,18 +618,6 @@ class MasterAgent:
                 for t in dag.tasks
             ],
         )
-        if brief:
-            for task in dag.tasks:
-                if context and task.kind not in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
-                    task.description = f"{brief}\n\n{context}\n\n{task.description}"
-                else:
-                    task.description = f"{brief}\n\n{task.description}"
-        elif context:
-            prefix = f"{context}\n\n"
-            for task in dag.tasks:
-                if task.kind in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
-                    continue
-                task.description = f"{prefix}{task.description}"
         self._events.publish(Events.TASK_PLANNED, {"task_count": len(dag.tasks)})
 
         # Phase 7 — explicit workspace operations are answered by the backend
@@ -608,6 +631,7 @@ class MasterAgent:
         backend_only = bool(backend_ops)
         actions: list[FileAction] = []
         validations: list[ValidationResult] = []
+        verification_ms = 0.0
         worker_inference_start = time.perf_counter()
         if backend_only:
             lines, actions = ActionEngine(file_operator).run_workspace_ops(
@@ -624,6 +648,10 @@ class MasterAgent:
                 workspace_outcome, files, temperature=temperature, max_tokens=max_tokens,
                 workspace=ws, memory=mem, conversation_id=conversation_id,
                 file_operator=file_operator, kind=kind,
+                project_id=project_id,
+                project_name=project_name,
+                project_path=project_path,
+                workspace_context=context,
             )
             worker_inference_ms = (time.perf_counter() - worker_inference_start) * 1000
 
@@ -633,6 +661,7 @@ class MasterAgent:
             tools_start = time.perf_counter()
             if file_operator is not None:
                 actions, validations = self._apply_file_outputs(dag, executed, file_operator, kind=kind)
+                ver_start = time.perf_counter()
                 # Phase XIII — write → verify → index → remember: confirm the
                 # files landed, syntax-check what we can, refresh the project
                 # index and record the write at project scope.
@@ -642,6 +671,7 @@ class MasterAgent:
                     project_index=project_index, change_panel=change_panel,
                     diagnostics=diagnostics,
                 )
+                verification_ms = (time.perf_counter() - ver_start) * 1000
             tools_ms = (time.perf_counter() - tools_start) * 1000
 
             # Synthesize final response (excluding raw file manifests, which
@@ -685,9 +715,16 @@ class MasterAgent:
             )
 
             # Self-correction / hallucination detection
-            if self._hallucination:
+            if self._hallucination and not actions:
                 # Gather project context for hallucination detection
-                existing_files = [f.name for f in ws.files.list()] if ws else []
+                existing_files = []
+                if file_operator is not None:
+                    for entry in file_operator.list_tree():
+                        existing_files.append(entry["path"])
+                        existing_files.append(Path(entry["path"]).name)
+                elif ws is not None:
+                    existing_files = [f.name for f in ws.files.list()]
+
                 installed_packages = []  # Could be populated from project
                 project_functions = []  # Could be populated from code index
 
@@ -762,8 +799,11 @@ class MasterAgent:
         timings = {
             "master_analysis_ms": round(master_analysis_ms, 2),
             "context_retrieval_ms": round(context_retrieval_ms, 2),
+            "model_load_ms": 0.0,
             "worker_inference_ms": round(worker_inference_ms, 2),
             "tools_ms": round(tools_ms, 2),
+            "web_ms": round(web_ms, 2),
+            "verification_ms": round(verification_ms, 2),
             "total_ms": round(elapsed_ms, 2),
         }
         routing = primary_routing or RoutingDecision(reason="no task routed")
@@ -777,6 +817,17 @@ class MasterAgent:
             timings=timings,
         )
         self._events.publish(Events.REQUEST_COMPLETED, {"latency_ms": round(elapsed_ms, 1), "tasks": len(dag.tasks)})
+        log.info(
+            "request_timing_breakdown",
+            master_analysis_ms=round(master_analysis_ms, 2),
+            context_retrieval_ms=round(context_retrieval_ms, 2),
+            model_load_ms=0.0,
+            worker_inference_ms=round(worker_inference_ms, 2),
+            tools_ms=round(tools_ms, 2),
+            web_ms=round(web_ms, 2),
+            verification_ms=round(verification_ms, 2),
+            total_ms=round(elapsed_ms, 2),
+        )
         log.info(
             "request_completed",
             latency_ms=round(elapsed_ms, 1),
@@ -826,6 +877,10 @@ class MasterAgent:
         master_analysis: MasterAnalysis | None = None,
         master_analysis_ms: float = 0.0,
         context_retrieval_ms: float = 0.0,
+        project_id: str | None = None,
+        project_name: str | None = None,
+        project_path: str | None = None,
+        file_operator=None,
     ) -> AgentResponse:
         """Chat-only request path (AI Operating Workspace Intent Router).
 
@@ -898,6 +953,73 @@ class MasterAgent:
         available = self._provider_available_models()
         perf_stats = self._performance.stats() if self._performance else None
 
+        mem = memory if memory is not None else self._memory
+
+        is_chat_memory = False
+        if master_analysis is not None and (
+            master_analysis.memory_needed
+            or master_analysis.intent == "chat_memory"
+            or master_analysis.domain == "chat_memory"
+            or any(
+                w in prompt.lower()
+                for w in (
+                    "what is this chat",
+                    "what is our chat",
+                    "what is this conversation",
+                    "summarize this chat",
+                    "summarize this conversation",
+                    "summarize our conversation",
+                    "what have we done",
+                    "what did we do",
+                    "what have we accomplished",
+                    "tell me about this chat",
+                    "what is the context of this chat",
+                )
+            )
+        ):
+            is_chat_memory = True
+
+        web_start = time.perf_counter()
+        web_context = ""
+        web_ms = 0.0
+        if master_analysis is not None and master_analysis.web_needed:
+            self._publish_timeline("web_search", f"Searching web for: {prompt[:60]}…")
+            try:
+                from synapse.pipeline.tools import ToolRegistry
+                tool_reg = ToolRegistry()
+                search_results = tool_reg._web_search(prompt, max_results=4)
+                if search_results:
+                    res_lines = []
+                    for item in search_results:
+                        title = item.get("title", "")
+                        snippet = item.get("snippet", "")
+                        url = item.get("url", "")
+                        res_lines.append(f"- {title} ({url}):\n  {snippet}")
+                    web_context = "Fresh Web Search Results:\n" + "\n".join(res_lines) + "\n\n"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("web_search_failed", error=str(exc)[:200])
+            web_ms = (time.perf_counter() - web_start) * 1000
+
+        if is_chat_memory:
+            from synapse.workspace.brief import build_specialist_prompt
+            effective_prompt = build_specialist_prompt(
+                prompt,
+                project_id=project_id,
+                project_name=project_name,
+                project_path=project_path,
+                file_operator=file_operator,
+                memory=mem,
+                conversation_id=conversation_id,
+                chat_store=self._chat_store if hasattr(self, "_chat_store") else None,
+                workspace_context=((web_context + chat_context).strip()) if (web_context or chat_context) else None,
+                is_chat=True,
+                include_file_rules=False,
+            )
+        else:
+            effective_prompt = f"{web_context}{chat_context}{prompt}"
+
+        chat_max_tokens = max_tokens if max_tokens is not None else 768
+
         worker_start = time.perf_counter()
         routing = self._route_chat(
             decision, hardware, registry_models, health, available,
@@ -908,7 +1030,7 @@ class MasterAgent:
         else:
             try:
                 response = self._execute_with_lifecycle(
-                    routing, f"{chat_context}{prompt}", temperature=temperature, max_tokens=max_tokens
+                    routing, effective_prompt, temperature=temperature, max_tokens=chat_max_tokens
                 )
                 final_response = response.content
             except ProviderUnavailable:
@@ -924,8 +1046,11 @@ class MasterAgent:
         timings = {
             "master_analysis_ms": round(master_analysis_ms, 2),
             "context_retrieval_ms": round(context_retrieval_ms, 2),
+            "model_load_ms": 0.0,
             "worker_inference_ms": round(worker_inference_ms, 2),
             "tools_ms": 0.0,
+            "web_ms": round(web_ms, 2),
+            "verification_ms": 0.0,
             "total_ms": round(elapsed_ms, 2),
         }
         graph = ExecutionGraph()
@@ -938,6 +1063,17 @@ class MasterAgent:
         )
         self._events.publish(
             Events.REQUEST_COMPLETED, {"latency_ms": round(elapsed_ms, 1), "tasks": 0, "chat": True}
+        )
+        log.info(
+            "request_timing_breakdown",
+            master_analysis_ms=round(master_analysis_ms, 2),
+            context_retrieval_ms=round(context_retrieval_ms, 2),
+            model_load_ms=0.0,
+            worker_inference_ms=round(worker_inference_ms, 2),
+            tools_ms=0.0,
+            web_ms=round(web_ms, 2),
+            verification_ms=0.0,
+            total_ms=round(elapsed_ms, 2),
         )
         log.info(
             "chat_completed",
@@ -1069,6 +1205,11 @@ class MasterAgent:
         conversation_id: str | None = None,
         file_operator=None,
         kind: RequestKind | None = None,
+        project_id: str | None = None,
+        project_name: str | None = None,
+        project_path: str | None = None,
+        chat_store=None,
+        workspace_context: str | None = None,
     ) -> tuple[ExecutionGraph, list[Task], RoutingDecision | None]:
         """Execute DAG with Phase 4 quality checks (confidence, verification, escalation, self-correction)."""
         ws = workspace if workspace is not None else self._workspace
@@ -1100,62 +1241,90 @@ class MasterAgent:
                     {"task_id": task.id, "capability": ", ".join(c.value for c in task.required_capabilities)},
                 )
 
-            # Phase 4: Build smart context using ContextBuilder
-            effective_prompt = task.description
-            if self._context_builder:
-                memory_results = None
-                if mem:
-                    hits = mem.search(MemoryScope.CONVERSATION, task.description, k=2, conversation=conversation_id)
-                    if hits:
-                        memory_results = [{"text": h.text, "scope": h.scope.value, "source": h.source} for h in hits]
-
-                retrieval_chunks = None
-                if workspace_outcome and workspace_outcome.retrieval:
-                    retrieval_chunks = [{"text": c.text, "file_name": c.file_name, "score": c.score} for c in workspace_outcome.retrieval]
-
-                conversation_history = None
-                if mem:
-                    recent = mem.recent(MemoryScope.CONVERSATION, 5, conversation=conversation_id)
-                    conversation_history = [{"role": h.source, "content": h.text} for h in recent]
-
-                context_bundle = self._context_builder.build(
-                    task.description,
-                    task_capabilities=[c.value for c in task.required_capabilities] if task.required_capabilities else [],
-                    memory_results=memory_results,
-                    retrieval_chunks=retrieval_chunks,
-                    conversation_history=conversation_history,
-                    workspace_outcome={"retrieval": workspace_outcome.retrieval, "vision_descriptions": workspace_outcome.vision_descriptions} if workspace_outcome else None,
-                )
-                effective_prompt = context_bundle.user_prompt
-
             # Pass previous step context forward
             prior = self._prior_context(task, executed)
-            if prior:
-                effective_prompt = f"{effective_prompt}\n\n{prior}"
 
-            # Layer A & B Unification:
-            # Layer A (workspace context) is in the brief.
-            # Layer B (action format) is ONLY added when the task is file-producing.
-            if task.file_output:
-                effective_prompt = f"{effective_prompt}\n\n{MANIFEST_INSTRUCTION}"
+            # If targeting an existing file for edit/modification:
+            target_edit_path = None
+            existing_file_content = None
+            if file_operator is not None:
+                if task.file_hint and file_operator.exists(task.file_hint):
+                    target_edit_path = task.file_hint
+                elif not task.file_hint:
+                    for candidate in ("main.py", "app.py", "src/main.py", "index.html", "script.py", "expense_tracker.py", "style.css", "script.js"):
+                        if file_operator.exists(candidate) and any(w in task.description.lower() for w in ("fastapi", "code", "app", "python", "endpoint", "edit", "add to", "modify", "update", "button", "html", "style", "css", "script", "js", "website")):
+                            target_edit_path = candidate
+                            break
 
-            # If reviewing files, inject real files from disk
+            if target_edit_path and file_operator is not None:
+                existing_file_content = file_operator.read(target_edit_path)
+
+            # If reviewing files, inject real files from disk that passed verification
+            review_snippets = None
             if task.kind == TaskKind.REVIEW and file_operator is not None:
                 try:
+                    from synapse.workspace.review import validate_file
+                    verified_ok_paths: set[str] = set()
+                    failed_paths: set[str] = set()
+                    for t in executed:
+                        if hasattr(t, "_actions") and t._actions:
+                            for a in t._actions:
+                                if a.status == "ok" and getattr(a, "validated", True):
+                                    verified_ok_paths.add(a.path)
+                                elif a.status == "failed" or not getattr(a, "validated", True):
+                                    failed_paths.add(a.path)
+
                     tree = file_operator.list_tree()
                     if tree:
                         snippets = []
                         for item in tree[:10]:
                             p = item.get("path")
+                            if p in failed_paths and p not in verified_ok_paths:
+                                continue
                             c = file_operator.read(p)
                             if c is not None:
+                                v_res = validate_file(p, c)
+                                if not v_res.ok:
+                                    continue
                                 max_c = 2500
                                 snip = c if len(c) <= max_c else c[:max_c] + "\n... [truncated]"
                                 snippets.append(f"### File on disk: {p}\n{snip}")
                         if snippets:
-                            effective_prompt = f"{effective_prompt}\n\nWorkspace actual files on disk for review:\n" + "\n\n".join(snippets)
+                            review_snippets = snippets
                 except Exception:
                     pass
+
+            from synapse.workspace.brief import build_specialist_prompt
+            if "You are a specialist inside Synapse" in task.description or "You are inside Synapse" in task.description:
+                effective_prompt = task.description
+                if prior and prior not in effective_prompt:
+                    effective_prompt = f"{effective_prompt}\n\n{prior}"
+                if task.file_output and "OUTPUT FORMAT" not in effective_prompt and "Rules:" not in effective_prompt:
+                    effective_prompt = f"{effective_prompt}\n\n{MANIFEST_INSTRUCTION}"
+                if target_edit_path and existing_file_content and target_edit_path not in effective_prompt:
+                    effective_prompt = (
+                        f"{effective_prompt}\n\n"
+                        f"Current content of the file you must modify ({target_edit_path}):\n"
+                        f"```\n{existing_file_content}\n```"
+                    )
+                if review_snippets and "Workspace actual files on disk" not in effective_prompt:
+                    effective_prompt = f"{effective_prompt}\n\nWorkspace actual files on disk for review:\n" + "\n\n".join(review_snippets)
+            else:
+                effective_prompt = build_specialist_prompt(
+                    task.description,
+                    project_id=project_id,
+                    project_name=project_name,
+                    project_path=project_path,
+                    file_operator=file_operator,
+                    memory=mem,
+                    conversation_id=conversation_id,
+                    chat_store=chat_store or (self._chat_store if hasattr(self, "_chat_store") else None),
+                    target_edit_path=target_edit_path,
+                    target_edit_content=existing_file_content,
+                    prior_context=prior,
+                    review_snippets=review_snippets,
+                    workspace_context=workspace_context,
+                )
 
             routing = self._route_task(
                 task_decision, hardware, registry_models, health, available, complexity, effective_prompt, perf_stats,
@@ -1217,8 +1386,19 @@ class MasterAgent:
                     Events.TASK_STARTED,
                     {"task_id": task.id, "description": task.description, "model": routing.model_id},
                 )
+                task_max_tokens = max_tokens
+                if task_max_tokens is None:
+                    if task.file_output or (kind and kind in (RequestKind.FILE_CREATION, RequestKind.PROJECT_GENERATION)):
+                        task_max_tokens = 2048
+                    elif target_edit_path or (kind and kind is RequestKind.FILE_MODIFICATION):
+                        task_max_tokens = 1536
+                    elif task.kind in (TaskKind.REVIEW, TaskKind.SYNTHESIS):
+                        task_max_tokens = 768
+                    else:
+                        task_max_tokens = 1024
+
                 task_start = time.perf_counter()
-                response = self._execute_with_lifecycle(routing, effective_prompt, temperature=temperature, max_tokens=max_tokens)
+                response = self._execute_with_lifecycle(routing, effective_prompt, temperature=temperature, max_tokens=task_max_tokens)
                 task.latency_ms = (time.perf_counter() - task_start) * 1000
                 task.result = response.content
                 task.status = TaskStatus.COMPLETED
@@ -1229,47 +1409,95 @@ class MasterAgent:
                 if file_operator is not None and task.file_output and task.kind not in (TaskKind.SYNTHESIS, TaskKind.REVIEW):
                     # Vision Isolation: vision models never produce file ops
                     if Capability.VISION not in (task.required_capabilities or []):
-                        ops = parse_file_manifest(task.result, hint=task.file_hint, strict=False)
+                        hint_path = target_edit_path or task.file_hint or ""
+                        ops = parse_file_manifest(task.result, hint=hint_path, strict=False)
+                        if not ops:
+                            # Auto re-prompt once with stronger instruction
+                            target_path = hint_path or "main.py"
+                            reprompt_msg = (
+                                f"{effective_prompt}\n\n"
+                                f"ACTION REQUIRED: You must emit the file changes as JSON now.\n"
+                                f"End your response with ONE JSON object containing the complete updated content:\n"
+                                f'{{"files": [{{"path": "{target_path}", "content": "<complete updated code>"}}]}}'
+                            )
+                            try:
+                                retry_resp = self._execute_with_lifecycle(routing, reprompt_msg, temperature=0.1, max_tokens=task_max_tokens)
+                                retry_ops = parse_file_manifest(retry_resp.content, hint=hint_path, strict=False)
+                                if retry_ops:
+                                    ops = retry_ops
+                                    task.result = retry_resp.content
+                            except Exception:
+                                pass
+
                         if ops:
                             engine = ActionEngine(file_operator)
                             ops = engine.plan_project_ops(kind, ops)
                             task_actions, task_validations = engine.apply(ops, on_step=self._timeline_for_op)
 
-                            # Python AST Syntax Check Quality Loop
-                            py_actions = [a for a in task_actions if a.path.endswith(".py") and a.status == "ok"]
-                            has_syntax_err = False
-                            err_file, err_msg = "", ""
-                            for pa in py_actions:
-                                py_content = file_operator.read(pa.path)
-                                if py_content is not None:
-                                    try:
-                                        ast.parse(py_content)
-                                    except SyntaxError as syn_exc:
-                                        has_syntax_err = True
-                                        err_file = pa.path
-                                        err_msg = f"line {syn_exc.lineno}: {syn_exc.msg}"
-                                        break
+                            # Post-Creation Verification & Auto-Fix Loop (Universal across .py, .json, .js, .css, .html, etc.)
+                            failing_items: list[tuple[str, str]] = []
+                            for v in task_validations:
+                                if not v.ok:
+                                    failing_items.append((v.path, v.error or "validation failed"))
+                            for a in task_actions:
+                                if a.status == "failed" and a.path and not any(p == a.path for p, _ in failing_items):
+                                    failing_items.append((a.path, a.error or "action failed"))
+                            for a in task_actions:
+                                if a.path.endswith(".py") and a.status == "ok" and not any(p == a.path for p, _ in failing_items):
+                                    py_content = file_operator.read(a.path)
+                                    if py_content is not None:
+                                        try:
+                                            ast.parse(py_content)
+                                        except SyntaxError as syn_exc:
+                                            failing_items.append((a.path, f"python syntax error: line {syn_exc.lineno}: {syn_exc.msg}"))
 
-                            if has_syntax_err:
-                                log.warning("syntax_error_detected_retrying", file=err_file, error=err_msg)
+                            if failing_items:
+                                log.warning("post_creation_verification_failed_retrying", failing_count=len(failing_items), files=[p for p, _ in failing_items])
+                                errors_desc = []
+                                for file_path, err_msg in failing_items:
+                                    curr_content = file_operator.read(file_path) or ""
+                                    errors_desc.append(
+                                        f"File: {file_path}\n"
+                                        f"Verification Error: {err_msg}\n"
+                                        f"Current Content on Disk:\n"
+                                        f"```\n{curr_content}\n```"
+                                    )
+
                                 retry_prompt = (
                                     f"{effective_prompt}\n\n"
-                                    f"SYNTAX REPAIR REQUIRED:\n"
-                                    f"The Python file '{err_file}' generated contains a SyntaxError ({err_msg}).\n"
-                                    f"Please return the complete, corrected JSON file manifest with valid Python syntax."
+                                    f"AUTOMATIC POST-CREATION VERIFICATION FAILED:\n"
+                                    f"The following file(s) generated failed syntax/structure verification checks:\n\n"
+                                    + "\n\n".join(errors_desc) + "\n\n"
+                                    f"REPAIR INSTRUCTIONS:\n"
+                                    f"1. Fix the syntax and structural errors identified above.\n"
+                                    f"2. Return the complete, fully working corrected file content (do not omit anything or use placeholders).\n"
+                                    f"3. Return the corrected files in JSON format:\n"
+                                    f'{{\n  "files": [\n    {{"path": "<path>", "content": "<complete corrected code>"}}\n  ]\n}}'
                                 )
                                 try:
-                                    fix_resp = self._execute_with_lifecycle(routing, retry_prompt, temperature=0.1, max_tokens=max_tokens)
-                                    fix_ops = parse_file_manifest(fix_resp.content, hint=task.file_hint, strict=False)
+                                    fix_resp = self._execute_with_lifecycle(routing, retry_prompt, temperature=0.1, max_tokens=task_max_tokens)
+                                    fix_ops = parse_file_manifest(fix_resp.content, hint=failing_items[0][0], strict=False)
                                     if fix_ops:
                                         task.result = fix_resp.content
                                         fix_ops = engine.plan_project_ops(kind, fix_ops)
-                                        task_actions, task_validations = engine.apply(fix_ops, on_step=self._timeline_for_op)
+                                        repaired_actions, repaired_validations = engine.apply(fix_ops, on_step=self._timeline_for_op)
+                                        orig_actions = {a.path: a.action for a in task_actions}
+                                        for ra in repaired_actions:
+                                            if orig_actions.get(ra.path) == "created" and ra.action == "modified":
+                                                ra.action = "created"
+                                        repaired_paths = {a.path for a in repaired_actions}
+                                        task_actions = [a for a in task_actions if a.path not in repaired_paths] + repaired_actions
+                                        repaired_val_paths = {v.path for v in repaired_validations}
+                                        task_validations = [v for v in task_validations if v.path not in repaired_val_paths] + repaired_validations
                                 except Exception as exc:  # noqa: BLE001
-                                    log.warning("syntax_repair_failed", error=str(exc)[:200])
+                                    log.warning("auto_repair_failed", error=str(exc)[:200])
 
                             task._actions = task_actions
                             task._validations = task_validations
+                        else:
+                            fail_path = hint_path or "output.py"
+                            task._actions = [FileAction(path=fail_path, action="write", status="failed", error="no file manifest found in model output")]
+                            task._validations = []
 
                 if task.kind == TaskKind.REVIEW:
                     self._events.publish(Events.RESULT_VALIDATED, {"task_id": task.id, "status": "verified"})
@@ -1325,7 +1553,13 @@ class MasterAgent:
                     # manifest whose paths are creation intent, not claims —
                     # the engine's post-write verification is the real check.)
                     if self._hallucination and not task.file_output:
-                        existing_files = [f.name for f in ws.files.list()] if ws else []
+                        existing_files = []
+                        if file_operator is not None:
+                            for entry in file_operator.list_tree():
+                                existing_files.append(entry["path"])
+                                existing_files.append(Path(entry["path"]).name)
+                        elif ws is not None:
+                            existing_files = [f.name for f in ws.files.list()]
                         flags = self._hallucination.scan(
                             task.result,
                             prompt=task.description,

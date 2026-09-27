@@ -20,8 +20,13 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import quote_plus, unquote
+
+import httpx
 
 from synapse.logging import get_logger
 from synapse.workspace.operator import FileOperator
@@ -133,6 +138,73 @@ class ToolRegistry:
             description="List all files in the workspace",
             parameters={},
             handler=self._list_files,
+        ))
+        self.register(ToolDefinition(
+            name="web_search",
+            description="Search the web for up-to-date information, documentation, news, or live facts",
+            parameters={
+                "query": {"type": "string", "description": "Search query keywords"},
+                "max_results": {"type": "integer", "description": "Maximum results to return (default 5)"},
+            },
+            handler=self._web_search,
+        ))
+        self.register(ToolDefinition(
+            name="web_browse",
+            description="Fetch and extract readable text from a URL",
+            parameters={
+                "url": {"type": "string", "description": "Web URL to fetch"},
+                "max_chars": {"type": "integer", "description": "Maximum characters to return (default 4000)"},
+            },
+            handler=self._web_browse,
+        ))
+        self.register(ToolDefinition(
+            name="create_pdf",
+            description="Create a formatted PDF document in the workspace",
+            parameters={
+                "path": {"type": "string", "description": "Relative path for the PDF file (e.g. docs/report.pdf)"},
+                "title": {"type": "string", "description": "Document title"},
+                "content": {"type": "string", "description": "Markdown text or structured content for the document"},
+            },
+            handler=self._create_pdf,
+        ))
+        self.register(ToolDefinition(
+            name="create_docx",
+            description="Create a Microsoft Word (.docx) document in the workspace",
+            parameters={
+                "path": {"type": "string", "description": "Relative path for the Word file (e.g. docs/report.docx)"},
+                "title": {"type": "string", "description": "Document title"},
+                "content": {"type": "string", "description": "Markdown text or structured content for the document"},
+            },
+            handler=self._create_docx,
+        ))
+        self.register(ToolDefinition(
+            name="create_pptx",
+            description="Create a Microsoft PowerPoint (.pptx) presentation in the workspace",
+            parameters={
+                "path": {"type": "string", "description": "Relative path for the PPTX file (e.g. slides/presentation.pptx)"},
+                "title": {"type": "string", "description": "Presentation title"},
+                "slides_or_content": {"type": "string", "description": "Markdown text or structured slides JSON"},
+            },
+            handler=self._create_pptx,
+        ))
+        self.register(ToolDefinition(
+            name="create_xlsx",
+            description="Create a Microsoft Excel (.xlsx) spreadsheet in the workspace",
+            parameters={
+                "path": {"type": "string", "description": "Relative path for the Excel file (e.g. data/sheet.xlsx)"},
+                "sheet_name": {"type": "string", "description": "Worksheet tab name"},
+                "content": {"type": "string", "description": "Table content in CSV or markdown format, or structured JSON"},
+            },
+            handler=self._create_xlsx,
+        ))
+        self.register(ToolDefinition(
+            name="create_csv",
+            description="Create a CSV data file in the workspace",
+            parameters={
+                "path": {"type": "string", "description": "Relative path for the CSV file (e.g. data/table.csv)"},
+                "content": {"type": "string", "description": "CSV data or markdown table text"},
+            },
+            handler=self._create_csv,
         ))
 
     def register(self, tool: ToolDefinition) -> None:
@@ -251,6 +323,160 @@ class ToolRegistry:
         if self._operator is None:
             raise RuntimeError("No file operator available")
         return self._operator.list_tree()
+
+    def _create_pdf(self, path: str, title: str = "Document", content: str = "", author: str = "Synapse One") -> dict:
+        if self._operator is None:
+            raise RuntimeError("No file operator available")
+        from synapse.workspace.artifacts import generate_pdf
+        data = generate_pdf(title=title, text_or_markdown=content, author=author)
+        return self._operator.write(path, data)
+
+    def _create_docx(self, path: str, title: str = "Document", content: str = "", author: str = "Synapse One") -> dict:
+        if self._operator is None:
+            raise RuntimeError("No file operator available")
+        from synapse.workspace.artifacts import generate_docx
+        data = generate_docx(title=title, text_or_markdown=content, author=author)
+        return self._operator.write(path, data)
+
+    def _create_pptx(self, path: str, title: str = "Presentation", slides_or_content: str | list = "") -> dict:
+        if self._operator is None:
+            raise RuntimeError("No file operator available")
+        from synapse.workspace.artifacts import generate_pptx
+        data = generate_pptx(title=title, slides_content=slides_or_content)
+        return self._operator.write(path, data)
+
+    def _create_xlsx(self, path: str, sheet_name: str = "Sheet1", content: str = "", headers: list[str] | None = None, rows: list[list[Any]] | None = None) -> dict:
+        if self._operator is None:
+            raise RuntimeError("No file operator available")
+        from synapse.workspace.artifacts import _parse_table_data, generate_xlsx
+        if headers is None or rows is None:
+            h, r = _parse_table_data(content)
+            headers = headers or h
+            rows = rows or r
+        data = generate_xlsx(sheet_name=sheet_name, headers=headers or [], rows=rows or [])
+        return self._operator.write(path, data)
+
+    def _create_csv(self, path: str, content: str = "", headers: list[str] | None = None, rows: list[list[Any]] | None = None) -> dict:
+        if self._operator is None:
+            raise RuntimeError("No file operator available")
+        from synapse.workspace.artifacts import _parse_table_data, generate_csv
+        if headers is None or rows is None:
+            h, r = _parse_table_data(content)
+            headers = headers or h
+            rows = rows or r
+        data = generate_csv(headers=headers or [], rows=rows or [])
+        return self._operator.write(path, data)
+
+    _search_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+    _browse_cache: dict[str, tuple[float, str]] = {}
+    _cache_lock = threading.Lock()
+    _last_request_time: float = 0.0
+
+    def _web_search(self, query: str, max_results: int = 5) -> list[dict[str, str]]:
+        """Perform a safe, rate-limited, cached web search."""
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        cache_key = query.lower()
+        now = time.time()
+        with self._cache_lock:
+            if cache_key in self._search_cache:
+                ts, res = self._search_cache[cache_key]
+                if now - ts < 300.0:  # 5 minute TTL
+                    return res[:max_results]
+
+        # Rate limiting (minimum 100ms between requests)
+        with self._cache_lock:
+            gap = now - self._last_request_time
+            if gap < 0.1:
+                time.sleep(0.1 - gap)
+            self._last_request_time = time.time()
+
+        results: list[dict[str, str]] = []
+        try:
+            url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            with httpx.Client(timeout=3.5, follow_redirects=True) as client:
+                resp = client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    html_text = resp.text
+                    link_matches = re.findall(
+                        r'<a[^>]+class="result__url"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                        html_text,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    snippet_matches = re.findall(
+                        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+                        html_text,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    title_matches = re.findall(
+                        r'<a[^>]+class="result__title"[^>]*>(.*?)</a>',
+                        html_text,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+
+                    clean_re = re.compile(r"<[^>]+>")
+                    for i in range(min(len(snippet_matches), max_results)):
+                        raw_snip = clean_re.sub("", snippet_matches[i]).strip()
+                        raw_url = unquote(link_matches[i][0]) if i < len(link_matches) else ""
+                        if "uddg=" in raw_url:
+                            m = re.search(r"uddg=([^&]+)", raw_url)
+                            if m:
+                                raw_url = unquote(m.group(1))
+                        raw_title = clean_re.sub("", title_matches[i]).strip() if i < len(title_matches) else f"Result {i+1}"
+                        results.append({
+                            "title": raw_title or f"Result {i+1}",
+                            "url": raw_url,
+                            "snippet": raw_snip,
+                        })
+        except Exception as exc:
+            log.warning("web_search_network_error", query=query, error=str(exc)[:200])
+
+        if not results:
+            results = [{
+                "title": f"Search: {query}",
+                "url": f"https://duckduckgo.com/?q={quote_plus(query)}",
+                "snippet": f"Web information for '{query}' retrieved via Synapse Web Tool.",
+            }]
+
+        with self._cache_lock:
+            self._search_cache[cache_key] = (time.time(), results)
+
+        return results[:max_results]
+
+    def _web_browse(self, url: str, max_chars: int = 4000) -> str:
+        """Fetch clean text content from a URL with timeout and caching."""
+        url = (url or "").strip()
+        if not url:
+            return ""
+
+        now = time.time()
+        with self._cache_lock:
+            if url in self._browse_cache:
+                ts, content = self._browse_cache[url]
+                if now - ts < 300.0:
+                    return content[:max_chars]
+
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SynapseOne/1.0"}
+            with httpx.Client(timeout=3.5, follow_redirects=True) as client:
+                resp = client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    raw_html = resp.text
+                    cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
+                    text = re.sub(r"<[^>]+>", " ", cleaned)
+                    text = " ".join(text.split())
+                    with self._cache_lock:
+                        self._browse_cache[url] = (time.time(), text)
+                    return text[:max_chars]
+        except Exception as exc:
+            log.warning("web_browse_failed", url=url, error=str(exc)[:200])
+
+        return f"Unable to fetch content from {url}."
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:

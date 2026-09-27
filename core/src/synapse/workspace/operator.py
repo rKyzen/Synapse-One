@@ -51,6 +51,81 @@ def is_safe_relative_path(rel: str) -> bool:
     return True
 
 
+_FORBIDDEN_ROOT_DIRS = frozenset({
+    "windows", "winnt", "system32", "syswow64", "program files",
+    "program files (x86)", "programdata", "etc", "usr", "var",
+    "bin", "sbin", "sys", "proc", "dev", "boot", "root",
+})
+
+
+def normalize_workspace_rel(rel: str, root: Path | None = None) -> str:
+    """Normalize a path (relative, prefixed, or root-contained absolute) into a safe relative path."""
+    if not isinstance(rel, str) or not rel.strip():
+        return ""
+    clean = rel.strip().strip("'\"").replace("\\", "/")
+    while clean.startswith("file://"):
+        clean = clean[7:]
+    if clean.startswith("/") and len(clean) > 2 and clean[2] == ":":
+        clean = clean[1:]
+
+    parts = [p for p in clean.lstrip("/").split("/") if p not in ("", ".")]
+    if any(p in ("..",) for p in parts):
+        return clean
+
+    has_drive = len(clean) >= 2 and clean[1] == ":"
+    first_dir = (parts[1] if has_drive and len(parts) > 1 else parts[0] if parts else "").lower()
+    if first_dir in _FORBIDDEN_ROOT_DIRS:
+        return clean
+
+    if root is not None:
+        try:
+            root_res = Path(root).resolve()
+            p = Path(clean)
+            if p.is_absolute() or has_drive or (clean.startswith("/") and not clean.startswith("./")):
+                try:
+                    p_res = p.resolve()
+                    if p_res.is_relative_to(root_res):
+                        return str(p_res.relative_to(root_res)).replace("\\", "/")
+                except Exception:
+                    pass
+
+            root_name = root_res.name.lower()
+            unprefixed = clean.lstrip("/")
+            no_drive = unprefixed[2:].lstrip("/") if has_drive else unprefixed
+
+            if no_drive.lower().startswith(f"{root_name}/"):
+                candidate = no_drive[len(root_name) + 1:].lstrip("/")
+                if is_safe_relative_path(candidate):
+                    return candidate
+            elif no_drive.lower() == root_name:
+                return ""
+
+            root_posix = root_res.as_posix()
+            root_no_drive = root_posix[2:].lstrip("/") if (len(root_posix) >= 2 and root_posix[1] == ":") else root_posix.lstrip("/")
+            if no_drive.lower().startswith(f"{root_no_drive.lower()}/"):
+                candidate = no_drive[len(root_no_drive) + 1:].lstrip("/")
+                if is_safe_relative_path(candidate):
+                    return candidate
+
+            # If path has an explicit drive prefix (e.g. A:/Test/calculator.py or A:/Test/Assets/log.txt)
+            # and was not directly relative to root, strip the drive and top-level folder prefix
+            if has_drive and len(parts) >= 3:
+                candidate = "/".join(parts[2:])
+                if is_safe_relative_path(candidate):
+                    return candidate
+            elif has_drive and len(parts) == 2:
+                candidate = parts[1]
+                if is_safe_relative_path(candidate):
+                    return candidate
+        except Exception:
+            pass
+
+    while clean.startswith("./"):
+        clean = clean[2:]
+
+    return clean
+
+
 class FileOperator:
     """Safe CRUD inside one workspace folder. Never writes outside it.
 
@@ -79,9 +154,9 @@ class FileOperator:
         Raises WorkspaceSafetyError when the path escapes the root or targets
         the workspace's Git internals.
         """
-        if not is_safe_relative_path(rel):
+        rel_norm = normalize_workspace_rel(rel, self._root)
+        if not rel_norm or not is_safe_relative_path(rel_norm):
             raise WorkspaceSafetyError(f"unsafe path rejected: {rel!r}")
-        rel_norm = rel.replace("\\", "/").strip("/")
         if rel_norm.split("/", 1)[0] == ".git":
             raise WorkspaceSafetyError(f"git internals are read-only: {rel!r}")
         candidate = (self._root / rel_norm).resolve()
@@ -154,6 +229,14 @@ class FileOperator:
         log.info("work_file_renamed", src=src, dst=dst)
         return {"path": dst, "from": src, "action": "renamed"}
 
+    def create_folder(self, rel: str) -> Path:
+        """Create a folder (and any parent directories) inside the workspace."""
+        path = self.path_for(rel)
+        with self._lock:
+            path.mkdir(parents=True, exist_ok=True)
+        log.info("work_folder_created", path=rel)
+        return path
+
     def delete(self, rel: str) -> bool:
         path = self.path_for(rel)
         with self._lock:
@@ -161,7 +244,8 @@ class FileOperator:
                 return False
             try:
                 if path.is_dir():
-                    path.rmdir()
+                    import shutil
+                    shutil.rmtree(path)
                 else:
                     path.unlink()
             except OSError as exc:
@@ -171,6 +255,24 @@ class FileOperator:
         return True
 
     # -- listing ---------------------------------------------------------------
+
+    def list_folders(self, rel: str = "") -> list[str]:
+        """Recursively list directory paths under ``rel`` (default: whole work dir)."""
+        base = self.path_for(rel) if rel else self._root
+        if not base.is_dir():
+            return []
+        folders: list[str] = []
+        for child in sorted(base.rglob("*")):
+            if not child.is_dir():
+                continue
+            try:
+                rel_path = str(child.relative_to(self._root)).replace("\\", "/")
+            except ValueError:
+                continue
+            if rel_path.split("/", 1)[0] == ".git":
+                continue
+            folders.append(rel_path)
+        return folders
 
     def list_tree(self, rel: str = "") -> list[dict]:
         """Recursively list files under ``rel`` (default: whole work dir).

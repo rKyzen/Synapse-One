@@ -86,7 +86,12 @@ class DefaultContextBuilder(ContextBuilder):
         effective_max = max_context_chars if max_context_chars is not None else self._max_context_chars
         memory_entries = self._filtered(memory_results, capabilities, query=prompt)
         chunks = self._filtered(retrieval_chunks, capabilities, query=prompt)
-        history = self._filtered(conversation_history, capabilities, text_key="content")
+        is_memory_task = any(
+            w in (prompt or "").lower()
+            for w in ("chat", "conversation", "summarize", "discuss", "what did we", "what have we")
+        )
+        history_limit = 8 if is_memory_task else 5
+        history = (conversation_history[-history_limit:] if conversation_history else [])
 
         parts: list[str] = [prompt]
         counts = {

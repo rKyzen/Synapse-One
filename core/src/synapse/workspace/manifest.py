@@ -43,37 +43,28 @@ log = get_logger("synapse.workspace.manifest")
 #: a JSON manifest the backend executes. Kept next to the parser so the two
 #: stay in lockstep.
 MANIFEST_INSTRUCTION = """\
-OUTPUT FORMAT — respond with ONE JSON object and nothing else: no prose, no \
-markdown, no code fences. For example:
-{"folders": ["assets"], "files": [{"path": "index.html", "content": "<p>hi</p>"}, {"path": "style.css", "content": "body{}"}]}
+OUTPUT FORMAT — If you create or change files, end your response with exactly one JSON object and nothing after it.
+
+Preferred formats:
+1. Full create / overwrite (recommended for new files, code, docs, and rich documents .pdf, .docx, .pptx, .xlsx, .csv):
+{"folders": ["optional/dirs"], "files": [{"path": "relative/path.ext", "content": "complete file body or document markdown/data"}]}
+
+2. Rich artifact generation (alternative format for presentations, spreadsheets, reports):
+{"artifacts": [{"path": "docs/report.pdf", "content": "# Title\n\nContent..."}, {"path": "data/expenses.xlsx", "content": "Category,Amount\nFood,50"}]}
+
+3. Edit (use only when the change is small and you have the exact current snippet):
+{"action": "edit", "path": "relative/path.py", "old": "exact current snippet", "new": "replacement"}
+
+4. Rename / Delete:
+{"action": "rename", "path": "old.py", "to": "new.py"}
+{"action": "delete", "path": "stale.py"}
 
 Rules:
-- "files" is the single list of file contents; every item has "path" (relative to the project — no leading "/", no "..", no absolute paths) and "content" (the complete file body as one string).
-- put every directory that must exist under "folders".
-- to change an existing file use {"action":"edit","path":..., "old":"<exact snippet>", "new":"<replacement>"}.
-- to rename a file use {"action":"rename","path":..., "to":...}.
-- to delete a file use {"action":"delete","path":...}.
-Only the paths inside the JSON will be created — nothing outside the JSON is read."""
+- Paths relative to project root only
+- Prefer full-content overwrite — it is far more reliable
+- If no files change, reply with normal prose only (no JSON)"""
 
-#: Appended to every task that does NOT already carry the strict manifest
-#: requirement (any request kind, per Phase X "universal workspace tool").
-#: The model is told it works inside the user's project folder and may
-#: produce files; a pure-prose answer remains perfectly valid.
-WORKSPACE_TOOL_INSTRUCTION = """\
-You are working inside the user's project folder. The file listings above are \
-real files you can read and edit, and you are allowed to create new files \
-anywhere inside the folder.
-
-If your answer produces or changes files, end it with ONE JSON object and \
-nothing else: {"folders": ["src"], "files": [{"path": "src/main.py", "content": "..."}]}
-Each "files" item has "path" (relative to the project — no leading "/", no \
-"..", no absolute paths) and "content" (the complete file body). To change an \
-existing file use {"action":"edit","path":..., "old":"<exact snippet>", \
-"new":"<replacement>"}; to rename {"action":"rename","path":...,"to":...}; to \
-delete {"action":"delete","path":...}.
-
-Only add a manifest when your answer actually creates or changes files — if \
-it is a normal answer, plain prose is fine."""
+WORKSPACE_TOOL_INSTRUCTION = MANIFEST_INSTRUCTION
 
 
 
@@ -94,7 +85,7 @@ _FENCE_RE = re.compile(
     r"```(?P<lang>[a-zA-Z0-9_+-]*)[ \t]*\n?(?P<body>.*?)```",
     re.DOTALL,
 )
-_PATH_RE = re.compile(r"^[#]?\s*(?:FILE|PATH)?\s*[:=]?\s*([A-Za-z0-9_./\-]+\.\w+)\s*$")
+_PATH_RE = re.compile(r"^[#]?\s*(?:FILE|PATH)?\s*[:=]?\s*([A-Za-z0-9_./:\-]+\.\w+)\s*$", re.IGNORECASE)
 
 #: placeholder file bodies models produce when they echo the manifest
 #: instruction's example instead of writing real content ("...").
@@ -123,6 +114,7 @@ def _json_objects(text: str) -> list[dict]:
         depth = 0
         in_str = False
         esc = False
+        i = start
         for i in range(start, len(text)):
             ch = text[i]
             if in_str:
@@ -142,7 +134,7 @@ def _json_objects(text: str) -> list[dict]:
                 if depth == 0:
                     candidate = text[start : i + 1]
                     try:
-                        value = json.loads(candidate)
+                        value = json.loads(candidate, strict=False)
                     except Exception:  # noqa: BLE001
                         value = None
                     if isinstance(value, dict):
@@ -150,7 +142,7 @@ def _json_objects(text: str) -> list[dict]:
                     break
         # Resume after the balanced object so JSON nested INSIDE a manifest
         # (e.g. an item of the "files" array) is not collected as a sibling.
-        start = text.find("{", i + 1)
+        start = text.find("{", i + 1) if i + 1 < len(text) else -1
     return found
 
 
@@ -169,20 +161,52 @@ def _filter_manifest_ops(ops: list[dict]) -> list[dict]:
     return [o for o in ops if not _is_placeholder_content(o.get("content"))]
 
 
+def is_safe_manifest_path(raw: str) -> bool:
+    """True when ``raw`` does not attempt parent traversal or invalid escaping."""
+    if not isinstance(raw, str) or not raw.strip() or raw.strip() in (".", "/", "\\"):
+        return False
+    clean = raw.strip().strip("'\"").replace("\\", "/")
+    if clean.startswith("/") and len(clean) > 2 and clean[2] == ":":
+        clean = clean[1:]
+    parts = [p for p in clean.split("/") if p not in ("", ".")]
+    if not parts or any(p in ("..",) for p in parts):
+        return False
+    if any(p in (".", "..") for p in clean.split("/")):
+        return False
+    return True
+
+
 def _payload_to_ops(payload: dict) -> list[dict]:
     """Convert a parsed JSON object into normalized file ops."""
     ops: list[dict] = []
+    # Single top-level action: {"action": "edit"|"rename"|"delete"|"write", ...}
+    if payload.get("action") or payload.get("operation"):
+        op = _clean_op_item(payload)
+        if op:
+            ops.append(op)
+            return ops
+    if payload.get("rename") and isinstance(payload["rename"], dict):
+        op = _clean_op_item({"action": "rename", **payload["rename"]})
+        if op:
+            ops.append(op)
+            return ops
+    if payload.get("delete") and isinstance(payload["delete"], str):
+        op = _clean_op_item({"action": "delete", "path": payload["delete"]})
+        if op:
+            ops.append(op)
+            return ops
+
     # explicit folder creation — the backend makes real directories.
     for key in ("folders", "dirs", "directories"):
         value = payload.get(key)
         if isinstance(value, list):
             for rel in value:
                 rel = str(rel)
-                if is_safe_relative_path(rel):
+                if is_safe_manifest_path(rel):
                     ops.append({"action": "create_folder", "path": rel})
                 else:
                     ops.append({"action": "create_folder", "path": rel, "error": "unsafe path"})
-    for key in ("files", "create", "writes", "operations", "ops"):
+    for key in ("files", "create", "writes", "operations", "ops", "artifacts", "documents"):
         value = payload.get(key)
         if isinstance(value, list):
             for item in value:
@@ -191,7 +215,9 @@ def _payload_to_ops(payload: dict) -> list[dict]:
                     ops.append(op)
         elif isinstance(value, dict):
             for rel, content in value.items():
-                if is_safe_relative_path(str(rel)):
+                if isinstance(content, (dict, list)):
+                    content = json.dumps(content)
+                if is_safe_manifest_path(str(rel)):
                     ops.append({"action": "write", "path": str(rel), "content": str(content)})
                 else:
                     ops.append({"action": "write", "path": str(rel), "content": str(content), "error": "unsafe path"})
@@ -202,8 +228,10 @@ def _payload_to_ops(payload: dict) -> list[dict]:
     # top-level mapping {"path.py": content, ...} (no files/file key)
     if not ops:
         for rel, value in payload.items():
+            if rel in ("action", "operation", "intent", "reasoning", "old", "new", "path", "file"):
+                continue
             if isinstance(value, str):
-                if is_safe_relative_path(str(rel)):
+                if is_safe_manifest_path(str(rel)):
                     ops.append({"action": "write", "path": str(rel), "content": value})
                 else:
                     ops.append({"action": "write", "path": str(rel), "content": value, "error": "unsafe path"})
@@ -248,6 +276,48 @@ def _parse_strict_manifest(text: str) -> list[dict]:
     return _filter_manifest_ops(_dedupe_ops(_payload_to_ops(payload)))
 
 
+def _is_code_or_markup(path: str, body: str) -> bool:
+    """Check whether raw body matches the expected code/markup structure of path."""
+    if not body or not body.strip():
+        return False
+    if _is_placeholder_content(body):
+        return False
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext in ("md", "txt", "rst", "adoc"):
+        return True
+    if ext == "py":
+        import ast
+        try:
+            ast.parse(body)
+            return True
+        except SyntaxError:
+            py_markers = ("def ", "class ", "import ", "from ", "return ", "print(", "if __name__", "@")
+            return any(m in body for m in py_markers)
+    if ext in ("json", "jsonc"):
+        import json
+        try:
+            json.loads(body)
+            return True
+        except Exception:
+            return "{" in body and "}" in body
+    if ext in ("html", "htm", "xml", "svg"):
+        return "<" in body and ">" in body
+    if ext in ("js", "ts", "jsx", "tsx", "mjs", "cjs"):
+        js_markers = ("function", "const ", "let ", "var ", "=>", "import ", "export ", "console.", "{", "}")
+        return any(m in body for m in js_markers)
+    if ext in ("css", "scss", "sass", "less"):
+        return "{" in body and "}" in body
+    if ext in ("sh", "bash", "zsh"):
+        sh_markers = ("#!/", "echo ", "export ", "if [", "then", "fi", "cd ", "mkdir ")
+        return any(m in body for m in sh_markers)
+    if ext in ("yaml", "yml", "toml", "ini", "cfg", "env"):
+        return ":" in body or "=" in body
+    if ext in ("sql",):
+        sql_markers = ("SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "FROM", "WHERE")
+        return any(m in body.upper() for m in sql_markers)
+    return True
+
+
 def _raw_code_to_ops(text: str, hint: str) -> list[dict]:
     """Fallback when no JSON and no markdown code fences are present.
 
@@ -278,7 +348,9 @@ def _raw_code_to_ops(text: str, hint: str) -> list[dict]:
             detected_path = sanitized
 
     if detected_path and not _is_placeholder_content(body):
-        if not is_safe_relative_path(detected_path):
+        if not _is_code_or_markup(detected_path, body):
+            return []
+        if not is_safe_manifest_path(detected_path):
             detected_path = "output.txt"
         return [{"action": "write", "path": detected_path, "content": body}]
 
@@ -342,14 +414,14 @@ def _clean_op_item(item: object) -> dict | None:
     if action in ("rename", "move") or to:
         src = str(item.get("from") or item.get("path") or "")
         dst = str(to or item.get("path") or "")
-        safe = is_safe_relative_path(src) and is_safe_relative_path(dst)
+        safe = is_safe_manifest_path(src) and is_safe_manifest_path(dst)
         return {"action": "rename", "path": src, "to": dst, **({"error": "unsafe path"} if not safe else {})}
     if action in ("delete", "remove"):
         return {"action": "delete", "path": str(raw_path)}
     if action in ("edit", "patch", "replace"):
         old = item.get("old") or item.get("find") or item.get("from")
         new = item.get("new") or item.get("replace") or item.get("to")
-        safe = is_safe_relative_path(str(raw_path))
+        safe = is_safe_manifest_path(str(raw_path))
         return {
             "action": "edit",
             "path": str(raw_path),
@@ -357,12 +429,26 @@ def _clean_op_item(item: object) -> dict | None:
             "new": str(new or ""),
             **({"error": "unsafe path"} if not safe else {}),
         }
-    if raw_path:
-        safe = is_safe_relative_path(str(raw_path))
+    if action in ("create_pdf", "create_docx", "create_pptx", "create_xlsx", "create_csv", "create_artifact", "create_doc", "create_presentation", "create_sheet"):
+        content_val = item.get("content") or item.get("text") or item.get("body") or item.get("slides") or item.get("sections") or item.get("rows")
+        if isinstance(content_val, (dict, list)):
+            content_val = json.dumps(content_val)
+        safe = is_safe_manifest_path(str(raw_path))
         return {
             "action": "write",
             "path": str(raw_path),
-            "content": str(content or ""),
+            "content": str(content_val or ""),
+            **({"error": "unsafe path"} if not safe else {}),
+        }
+    if raw_path:
+        safe = is_safe_manifest_path(str(raw_path))
+        content_str = content
+        if isinstance(content_str, (dict, list)):
+            content_str = json.dumps(content_str)
+        return {
+            "action": "write",
+            "path": str(raw_path),
+            "content": str(content_str or ""),
             **({"error": "unsafe path"} if not safe else {}),
         }
     return None
@@ -392,41 +478,41 @@ _LANG_DEFAULT_PATH: dict[str, str] = {
 #: extension requirement below).
 _PATH_HEADER_RE = re.compile(
     r"^\s*(?:#|//|/\*|<!--|--|%;|['\"])\s*(?:FILE|PATH|filepath)?\s*[:=]?\s*"
-    r"([A-Za-z0-9_./\-]+\.\w+)\s*(?:\*/|-->)?\s*$",
+    r"([A-Za-z0-9_./:\-]+\.\w+)\s*(?:\*/|-->)?\s*$",
     re.IGNORECASE,
 )
 
 _PRECEDING_PATH_RES = [
     # Explicit prefix: File: `path/to/file.ext` or File: path/to/file.ext
     re.compile(
-        r"(?:file|path|filename|filepath|destination)\s*[:=]\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"']?",
+        r"(?:file|path|filename|filepath|destination)\s*[:=]\s*[`*\"']?([A-Za-z0-9_./:\-]+\.[A-Za-z0-9]+)[`*\"']?",
         re.IGNORECASE,
     ),
     # Markdown heading: ### `path/to/file.ext` or ### path/to/file.ext
     re.compile(
-        r"^#+\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"':]?",
+        r"^#+\s*[`*\"']?([A-Za-z0-9_./:\-]+\.[A-Za-z0-9]+)[`*\"':]?",
         re.IGNORECASE,
     ),
     # List item: - `path/to/file.ext` or 1. `path/to/file.ext`
     re.compile(
-        r"^(?:[-*+]|\d+[\.\)])\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"':]?",
+        r"^(?:[-*+]|\d+[\.\)])\s*[`*\"']?([A-Za-z0-9_./:\-]+\.[A-Za-z0-9]+)[`*\"':]?",
         re.IGNORECASE,
     ),
     # Standalone path line or path with colon: `path/to/file.ext` or requirements.txt:
     re.compile(
-        r"^\s*[`*\"']?([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*\"':]?\s*$",
+        r"^\s*[`*\"']?([A-Za-z0-9_./:\-]+\.[A-Za-z0-9]+)[`*\"':]?\s*$",
         re.IGNORECASE,
     ),
     # Backticked or bold anywhere on the line
     re.compile(
-        r"[`*]([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)[`*]",
+        r"[`*]([A-Za-z0-9_./:\-]+\.[A-Za-z0-9]+)[`*]",
         re.IGNORECASE,
     ),
 ]
 
 
 def _is_valid_extracted_path(cand: str) -> bool:
-    if not cand or not is_safe_relative_path(cand):
+    if not cand or not is_safe_manifest_path(cand):
         return False
     cand_lower = cand.lower().strip()
     if cand_lower in ("e.g.", "i.e.", "etc.", "version.1"):
@@ -466,7 +552,7 @@ def _sanitize_hint(hint: str, lang: str = "") -> str:
     if not hint or not isinstance(hint, str):
         return ""
     h = hint.strip().replace("\\", "/")
-    if not is_safe_relative_path(h):
+    if not is_safe_manifest_path(h):
         return ""
     # If hint already has a valid file extension (e.g. "src/app.py", "README.md")
     if "." in h and not h.endswith("."):
@@ -509,7 +595,7 @@ def _fences_to_ops(text: str, hint: str) -> list[dict]:
                     raw, lang, hint, preceding_path=preceding_path
                 )
                 if not _is_placeholder_content(body_content):
-                    if not is_safe_relative_path(path):
+                    if not is_safe_manifest_path(path):
                         path = "output.txt"
                     return [{"action": "write", "path": path, "content": body_content}]
         return []
@@ -529,7 +615,7 @@ def _fences_to_ops(text: str, hint: str) -> list[dict]:
         if _is_placeholder_content(body_content):
             continue
         path = _unique_path(path, used)
-        if not is_safe_relative_path(path):
+        if not is_safe_manifest_path(path):
             path = "output.txt"
         ops.append({"action": "write", "path": path, "content": body_content})
     return ops

@@ -29,8 +29,11 @@ from __future__ import annotations
 
 import json
 import re
-import structlog
+import threading
+import time
 from typing import Any
+
+import structlog
 
 from pydantic import ValidationError
 
@@ -67,15 +70,18 @@ _ANALYSIS_SYSTEM_PROMPT = (
     "CRITICAL RULES:\n"
     "1. You are an orchestrator and router, NOT a worker. NEVER solve the task directly or generate file contents here.\n"
     "2. Distinguish between ANSWERING ABOUT SOMETHING vs DOING/CREATING SOMETHING:\n"
-    "   - 'Explain photosynthesis in simple terms' / 'Explain HTML' -> direct answer, artifact_required=false, files_needed=false, workspace_needed=false, required_capabilities=['conversation', 'reasoning'], recommended_model_role='gemma3:4b'\n"
-    "   - 'Show me an HTML example' -> direct answer, artifact_required=false\n"
-    "   - 'Generate/Create/Build me an HTML/CSS landing page' -> artifact_generation, artifact_required=true, files_needed=true, coding_needed=true, execution_mode=artifact_generation\n"
-    "   - 'Create a landing page in my project/workspace' -> workspace_agent, artifact_required=true, workspace_needed=true, files_needed=true, coding_needed=true\n"
-    "   - Math problems / logic puzzles / standalone queries -> direct_answer, workspace_needed=false, files_needed=false, tools_needed=false\n"
-    "3. WORKSPACE OPT-IN: Do NOT set workspace_needed=true unless the request specifically asks to inspect, modify, or operate on existing workspace/project files.\n"
-    "4. ARTIFACT INDEPENDENCE: A request can require creating files/artifacts (artifact_required=true, files_needed=true) even if existing workspace inspection is not needed.\n"
-    "5. DIFFICULTY EVALUATION: Evaluate reasoning_complexity ('trivial', 'easy', 'medium', 'hard', 'very_hard'). Simple arithmetic is trivial/easy; mathematical proofs or complex logical puzzles (e.g. chessboard dominoes) are hard.\n"
-    "6. Output ONLY valid JSON matching the MasterAnalysis schema."
+    "   - 'Explain photosynthesis in simple terms' / 'Explain HTML' -> direct answer, artifact_required=false, files_needed=false, workspace_needed=false, web_needed=false, required_capabilities=['conversation', 'reasoning'], recommended_model_role='gemma3:4b'\n"
+    "   - 'Show me an HTML example' -> direct answer, artifact_required=false, web_needed=false\n"
+    "   - 'Generate/Create/Build me an HTML/CSS landing page' -> artifact_generation, artifact_required=true, files_needed=true, coding_needed=true, web_needed=false, execution_mode=artifact_generation\n"
+    "   - 'Create a landing page in my project/workspace' -> workspace_agent, artifact_required=true, workspace_needed=true, files_needed=true, coding_needed=true, web_needed=false\n"
+    "   - 'Add ... to the FastAPI code' / 'Edit existing file' / 'Modify main.py' -> coding, workspace_needed=true, files_needed=true, coding_needed=true, artifact_required=true, web_needed=false, execution_mode=edit_existing\n"
+    "   - 'What is the latest version of FastAPI?' / 'Recent news about AI' -> question_answering, web_needed=true, tools_needed=true, workspace_needed=false, files_needed=false\n"
+    "   - Math problems / logic puzzles / standalone queries -> direct_answer, workspace_needed=false, files_needed=false, tools_needed=false, web_needed=false\n"
+    "3. WEB ACCESS (web_needed): Set web_needed=true ONLY if the request clearly requires current, live, or real-time web information (e.g. latest version/release, recent news, live prices, current weather, recent documentation). Pure coding, offline logic, workspace file editing, math, and general conversation MUST have web_needed=false.\n"
+    "4. WORKSPACE OPT-IN: Do NOT set workspace_needed=true unless the request specifically asks to inspect, modify, or operate on existing workspace/project files.\n"
+    "5. ARTIFACT INDEPENDENCE: A request can require creating files/artifacts (artifact_required=true, files_needed=true) even if existing workspace inspection is not needed.\n"
+    "6. DIFFICULTY EVALUATION: Evaluate reasoning_complexity ('trivial', 'easy', 'medium', 'hard', 'very_hard'). Simple arithmetic is trivial/easy; mathematical proofs or complex logical puzzles (e.g. chessboard dominoes) are hard.\n"
+    "7. Output ONLY valid JSON matching the MasterAnalysis schema."
 )
 
 #: system instruction — the Master AI is an orchestrator/router, never a worker.
@@ -190,6 +196,44 @@ def validate_plan_dag(plan: TaskDecompositionPlan) -> None:
     dag.topological_order()
 
 
+class AnalysisCache:
+    """Thread-safe LRU + TTL cache for MasterAnalysis results."""
+
+    def __init__(self, max_size: int = 128, ttl_seconds: float = 120.0) -> None:
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._cache: dict[str, tuple[float, MasterAnalysis]] = {}
+        self._lock = threading.Lock()
+
+    def _normalize_key(self, prompt: str, conversation_id: str | None = None) -> str:
+        cleaned = " ".join(prompt.strip().lower().split())
+        return f"{conversation_id or 'global'}::{cleaned}"
+
+    def get(self, prompt: str, conversation_id: str | None = None) -> MasterAnalysis | None:
+        key = self._normalize_key(prompt, conversation_id)
+        now = time.time()
+        with self._lock:
+            if key in self._cache:
+                timestamp, analysis = self._cache[key]
+                if now - timestamp <= self._ttl:
+                    return analysis.model_copy(deep=True)
+                del self._cache[key]
+        return None
+
+    def set(self, prompt: str, analysis: MasterAnalysis, conversation_id: str | None = None) -> None:
+        key = self._normalize_key(prompt, conversation_id)
+        now = time.time()
+        with self._lock:
+            if len(self._cache) >= self._max_size:
+                oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][0])
+                del self._cache[oldest_key]
+            self._cache[key] = (now, analysis.model_copy(deep=True))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+
 class MasterModelSelection:
     """Which provider/model serves the Master AI role for one request."""
 
@@ -236,6 +280,7 @@ class AIMasterOrchestrator(TaskPlanner):
         self._max_retries = max(0, int(max_retries))
         self._max_tasks = max(1, int(max_tasks))
         self._events = events
+        self._analysis_cache = AnalysisCache(max_size=128, ttl_seconds=120.0)
 
         # observability for the last plan() call.
         self.last_tier: HardwareTier | None = None
@@ -245,16 +290,24 @@ class AIMasterOrchestrator(TaskPlanner):
 
     # -- Master Analysis (runs first before any workspace / files / tools) --
 
-    def analyze(self, prompt: str) -> MasterAnalysis:
+    def analyze(self, prompt: str, conversation_id: str | None = None) -> MasterAnalysis:
         """Analyze the user request using the Master Model before loading workspace or tools."""
+        cached = self._analysis_cache.get(prompt, conversation_id)
+        if cached is not None:
+            log.info("ai_master_analysis_cache_hit", prompt=prompt[:60])
+            self.last_analysis = cached
+            return cached
+
         if not self._enabled:
             analysis = self._fallback_analysis(prompt, "master ai disabled")
+            self._analysis_cache.set(prompt, analysis, conversation_id)
             self.last_analysis = analysis
             return analysis
 
         selection = self._select_master_model()
         if selection is None:
             analysis = self._fallback_analysis(prompt, "no master model available")
+            self._analysis_cache.set(prompt, analysis, conversation_id)
             self.last_analysis = analysis
             return analysis
 
@@ -266,6 +319,7 @@ class AIMasterOrchestrator(TaskPlanner):
             try:
                 raw = self._call_master_analysis(selection, prompt)
                 analysis = self._to_analysis(raw, prompt)
+                self._analysis_cache.set(prompt, analysis, conversation_id)
                 self.last_analysis = analysis
                 log.info(
                     "ai_master_analysis_ok",
@@ -273,6 +327,7 @@ class AIMasterOrchestrator(TaskPlanner):
                     domain=analysis.domain,
                     workspace_needed=analysis.workspace_needed,
                     artifact_required=analysis.artifact_required,
+                    web_needed=analysis.web_needed,
                     complexity=analysis.reasoning_complexity.value,
                     model=selection.model_id,
                 )
@@ -290,6 +345,7 @@ class AIMasterOrchestrator(TaskPlanner):
         analysis = self._fallback_analysis(
             prompt, f"master ai analysis failed: {failures[-1] if failures else 'unknown'}"
         )
+        self._analysis_cache.set(prompt, analysis, conversation_id)
         self.last_analysis = analysis
         return analysis
 
@@ -329,6 +385,7 @@ class AIMasterOrchestrator(TaskPlanner):
             "- workspace_needed (boolean): true ONLY if existing workspace files must be inspected\n"
             "- files_needed (boolean): true if files must be created or edited on disk\n"
             "- coding_needed (boolean): true if code must be written/generated\n"
+            "- web_needed (boolean): true ONLY if request requires live/current web information (latest versions, news, live prices)\n"
             "- artifact_required (boolean): true if an artifact (files, web page, project) must be produced\n"
             "- reasoning_complexity: trivial, easy, medium, hard, very_hard\n"
             "- required_capabilities: list of required capability strings (e.g. ['html', 'css', 'code_generation', 'file_creation'])\n"
@@ -346,7 +403,7 @@ class AIMasterOrchestrator(TaskPlanner):
                 ChatMessage(role="user", content=user_content),
             ],
             temperature=self._temperature,
-            max_tokens=768,
+            max_tokens=512,
             model=selection.model_id,
             format=MasterAnalysis.model_json_schema(),
         )
@@ -434,7 +491,83 @@ class AIMasterOrchestrator(TaskPlanner):
                 confidence=0.95,
             )
 
-        # 2. Explanations (without create/build intent)
+        # 2. Chat Memory & Conversation Summaries
+        is_chat_memory = any(
+            hint in lowered
+            for hint in (
+                "what is this chat about",
+                "what is our chat about",
+                "what is this conversation about",
+                "summarize this chat",
+                "summarize this conversation",
+                "summarize our conversation",
+                "what have we done so far",
+                "what did we do so far",
+                "what have we accomplished",
+                "what did we discuss",
+                "chat summary",
+                "conversation summary",
+                "what are we working on in this chat",
+                "what have we been doing",
+            )
+        )
+        if is_chat_memory:
+            return MasterAnalysis(
+                intent="question_answering",
+                domain="chat_memory",
+                goal="Summarize current chat conversation history and accomplishments",
+                workspace_needed=False,
+                workspace_reason="Chat memory query relies on injected conversation history",
+                files_needed=False,
+                memory_needed=True,
+                tools_needed=False,
+                coding_needed=False,
+                vision_needed=False,
+                document_processing_needed=False,
+                web_needed=False,
+                artifact_required=False,
+                reasoning_complexity=ReasoningComplexity.EASY,
+                required_capabilities=["chat", "writing", "conversation"],
+                recommended_model_role="General Chat",
+                execution_mode=ExecutionMode.DIRECT_ANSWER,
+                confidence=0.99,
+            )
+
+        # 3. Web search & live information queries
+        is_web_query = any(
+            kw in lowered
+            for kw in (
+                "latest version", "current version", "latest release", "newest version",
+                "what is the latest", "who is the current", "latest news", "current price",
+                "stock price", "current weather", "weather in", "latest documentation",
+                "recent updates", "recent news", "today's news", "who won", "score of",
+                "latest stable", "latest fastapi", "latest python", "latest react",
+                "release date of", "current exchange rate"
+            )
+        )
+        if is_web_query:
+            return MasterAnalysis(
+                intent="question_answering",
+                domain="web_research",
+                goal=f"Retrieve fresh/current web information for: {text[:80]}",
+                workspace_needed=False,
+                workspace_reason="Web query does not require workspace inspection",
+                files_needed=False,
+                memory_needed=False,
+                tools_needed=True,
+                coding_needed=False,
+                vision_needed=False,
+                document_processing_needed=False,
+                web_needed=True,
+                artifact_required=False,
+                reasoning_complexity=ReasoningComplexity.EASY,
+                required_capabilities=["web_search", "chat"],
+                recommended_model_role="Research & Search Specialist",
+                execution_mode=ExecutionMode.TOOL_EXECUTION,
+                confidence=0.95,
+            )
+
+        # 4. Explanations (without create/build intent)
         is_explanation = (
             lowered.startswith(("explain", "what is", "how do", "why does", "tell me about", "describe", "summarize", "summarise", "overview"))
             and not any(verb in lowered for verb in ("generate", "create", "build", "make", "implement", "scaffold", "write a", "write me", "write the", "write to"))
@@ -461,23 +594,79 @@ class AIMasterOrchestrator(TaskPlanner):
                 confidence=0.95,
             )
 
-        # 3. Artifact generation / file creation
+        # 3. Edit existing file / modify code in workspace
+        is_edit = (
+            any(
+                v in lowered
+                for v in (
+                    "edit", "modify", "update", "change the", "refactor", "patch",
+                    "add to", "add a", "in the index.html", "in the file", "in index.html",
+                    "add to the", "add a route to", "add an endpoint to", "in the fastapi",
+                    "in the existing", "in existing file", "to the fastapi code",
+                    "to the code", "in the code", "add if successful", "print successful",
+                    "add a button", "add a learn more", "button"
+                )
+            )
+            or ("in " in lowered and (".html" in lowered or ".py" in lowered or ".js" in lowered or ".css" in lowered))
+        )
+        if is_edit:
+            return MasterAnalysis(
+                intent="coding",
+                domain="software_development",
+                goal=f"Edit existing file in workspace: {text[:80]}",
+                workspace_needed=True,
+                workspace_reason="Modifying existing workspace file",
+                files_needed=True,
+                memory_needed=True,
+                tools_needed=True,
+                coding_needed=True,
+                vision_needed=False,
+                document_processing_needed=False,
+                web_needed=False,
+                artifact_required=True,
+                reasoning_complexity=ReasoningComplexity.EASY,
+                required_capabilities=["coding", "file_creation", "file_editing"],
+                recommended_model_role="Coding Specialist",
+                execution_mode=ExecutionMode.EDIT_EXISTING,
+                confidence=0.95,
+            )
+
+        # 4. Artifact generation / rich document creation
         is_create = any(
             v in lowered
-            for v in ("create", "generate", "build", "make", "implement", "scaffold", "develop", "write a", "write me", "write the", "write to", "save to", "dump to")
+            for v in ("create", "generate", "build", "make", "implement", "scaffold", "develop", "write a", "write me", "write the", "write to", "save to", "dump to", "save it as", "produce")
         )
         is_web = any(
             w in lowered
-            for w in ("html", "css", "landing page", "website", "web page", "frontend", "web app", "site")
+            for w in ("html", "css", "landing page", "website", "web page", "frontend", "web app", "site", "javascript", "js")
+        )
+        is_doc = any(
+            w in lowered
+            for w in (
+                ".pdf", "pdf", ".docx", "docx", "word doc", "word document",
+                ".pptx", "pptx", "powerpoint", "presentation", "slides",
+                ".xlsx", "xlsx", "excel", "spreadsheet", ".csv", "csv",
+                "report", "slideshow"
+            )
         )
         is_explicit_workspace = any(
             w in lowered
             for w in ("in my project", "in my workspace", "in this repository", "in existing project", "project overview")
         )
 
-        if is_create and (is_web or "file" in lowered or "script" in lowered or "app" in lowered or "output." in lowered or "readme" in lowered or "doc" in lowered or "test" in lowered):
-            domain = "web_development" if is_web else "software_development"
-            caps = ["html", "css", "code_generation", "file_creation"] if is_web else ["coding", "file_creation"]
+        if (is_create and (is_web or is_doc or "file" in lowered or "script" in lowered or "app" in lowered or "output." in lowered or "readme" in lowered or "doc" in lowered or "test" in lowered or "index.html" in lowered or ".py" in lowered or ".js" in lowered or ".css" in lowered)) or (is_doc and any(v in lowered for v in ("create", "generate", "build", "make", "write", "produce", "save"))):
+            if is_doc:
+                domain = "document_generation"
+                caps = ["document_generation", "coding", "file_creation"]
+                role = "Document & Artifact Specialist"
+            elif is_web:
+                domain = "web_development"
+                caps = ["coding", "html", "css", "code_generation", "file_creation"]
+                role = "Coding Specialist"
+            else:
+                domain = "software_development"
+                caps = ["coding", "file_creation"]
+                role = "Coding Specialist"
             mode = ExecutionMode.WORKSPACE_AGENT if (is_explicit_workspace or has_workspace_cues) else ExecutionMode.ARTIFACT_GENERATION
             return MasterAnalysis(
                 intent="artifact_generation",
@@ -490,12 +679,12 @@ class AIMasterOrchestrator(TaskPlanner):
                 tools_needed=True,
                 coding_needed=True,
                 vision_needed=False,
-                document_processing_needed=False,
+                document_processing_needed=is_doc,
                 web_needed=False,
                 artifact_required=True,
                 reasoning_complexity=ReasoningComplexity.EASY,
                 required_capabilities=caps,
-                recommended_model_role="Coding Specialist",
+                recommended_model_role=role,
                 execution_mode=mode,
                 confidence=0.95,
             )

@@ -129,10 +129,24 @@ class HeuristicSelfCorrector(SelfCorrector):
         if file_flags:
             spans = {f.span for f in file_flags}
             for span in spans:
-                corrected = corrected.replace(span, f"`{span}` (not found in workspace)")
-                corrected = corrected.replace(
-                    f"``{span}``", f"`{span}` (not found in workspace)"
-                )
+                if not span or not span.strip():
+                    continue
+                clean_span = span.strip()
+                if (
+                    f"created {clean_span}" in corrected
+                    or f"modified {clean_span}" in corrected
+                    or f"write {clean_span}" in corrected
+                    or f"renamed {clean_span}" in corrected
+                    or f"deleted {clean_span}" in corrected
+                    or f"- created {clean_span}" in corrected
+                    or f"- modified {clean_span}" in corrected
+                    or f"- write {clean_span}" in corrected
+                ):
+                    continue
+                corrected = corrected.replace(f"``{span}``", f"`{span}` (not found in workspace)")
+                corrected = corrected.replace(f"`{span}`", f"`{span}` (not found in workspace)")
+                if f"`{span}` (not found in workspace)" not in corrected:
+                    corrected = corrected.replace(span, f"`{span}` (not found in workspace)")
 
         if citation_flags:
             corrected = re.sub(

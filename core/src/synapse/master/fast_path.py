@@ -49,26 +49,37 @@ _GREETINGS = {
     "hi", "hello", "hey", "good morning", "good afternoon",
     "good evening", "howdy", "greetings", "sup", "yo",
     "hi there", "hello there", "hey there", "hola",
+    "hey synapse", "hello synapse", "hi synapse", "good day",
+    "morning", "evening", "afternoon", "hi there synapse",
+    "hello there synapse", "hey there synapse", "whats up", "what's up",
 }
 
 #: Polite gratitude & farewells
 _THANKS = {
     "thanks", "thank you", "thanks a lot", "thank you very much",
     "thanks so much", "thank you so much", "thx", "ty",
+    "great thanks", "thanks a bunch", "much appreciated",
+    "thank u", "tyvm", "thank you kindly", "thx so much", "thx a lot",
 }
 
 _FAREWELLS = {
     "bye", "goodbye", "see you", "see ya", "cya",
     "have a nice day", "have a good day", "good night",
+    "bye bye", "take care", "see ya later", "goodbye synapse",
+    "see you later", "catch you later", "talk to you later", "gn",
 }
 
 #: Identity questions
 _IDENTITY = {
     "who are you", "what are you", "what is your name",
     "what's your name", "who created you", "who made you",
+    "what can you do", "who created synapse", "what is synapse",
+    "what is synapse one", "tell me who you are", "introduce yourself",
+    "help", "what are your capabilities", "capabilities", "features",
+    "what is your purpose",
 }
 
-_PING = {"ping", "test ping", "status check"}
+_PING = {"ping", "test ping", "status check", "are you alive", "health ping", "pong"}
 
 #: Instant zero-LLM workspace inspection patterns
 _WORKSPACE_QUERIES = {
@@ -78,6 +89,8 @@ _WORKSPACE_QUERIES = {
     "what files are in this project", "tree", "workspace tree",
     "project files", "list project files", "show workspace files",
     "show files in workspace", "show files in project", "files in project",
+    "show directory structure", "dir", "ls", "workspace files",
+    "list workspace files",
 }
 
 #: Instant zero-LLM loaded models & status queries
@@ -86,12 +99,21 @@ _LOADED_MODELS_QUERIES = {
     "list loaded models", "model status", "models loaded",
     "which models are loaded", "active models", "which models are running",
     "show loaded models", "show active models", "running models",
+    "models", "model list", "active model", "running model", "show models",
 }
 
 _SYSTEM_STATUS_QUERIES = {
     "system status", "health check", "hardware status",
     "system health", "overall status", "is system healthy",
-    "check system health", "check health",
+    "check system health", "check health", "status", "sys status",
+    "health", "system specs", "specs", "hardware info", "hardware specs",
+}
+
+#: Quick conversational acknowledgements & affirmations
+_AFFIRMATIONS = {
+    "ok", "okay", "sure", "cool", "nice", "awesome", "great",
+    "got it", "understood", "yes", "no", "yep", "nope",
+    "sounds good", "alright", "all right", "perfect",
 }
 
 
@@ -346,10 +368,20 @@ def check_fast_path(prompt: str, has_files: bool = False) -> FastPathResult:
             complexity=1,
         )
 
-    # 8. Fast Chat Bypass (for trivial small prompts that don't need pre-flight analysis)
-    # e.g. "Tell me a joke", "How are you", "Give me a quote"
+    # 8. Affirmations & Acknowledgements ("ok", "sure", "cool", "nice", etc.)
+    if lowered_raw in _AFFIRMATIONS or normalized in _AFFIRMATIONS:
+        return FastPathResult(
+            is_fast_path=True,
+            path_type=FastPathType.FAST_CHAT,
+            direct_response=None,
+            intent=IntentType.CONVERSATION,
+            complexity=1,
+        )
+
+    # 9. Fast Chat Bypass (for trivial small prompts that don't need pre-flight analysis)
+    # e.g. "Tell me a joke", "How are you", "Give me a quote", "What is the capital of..."
     is_simple_conversational = (
-        len(text.split()) <= 6
+        len(text.split()) <= 8
         and not any(
             w in lowered_raw
             for w in (
@@ -360,7 +392,9 @@ def check_fast_path(prompt: str, has_files: bool = False) -> FastPathResult:
             )
         )
     )
-    if is_simple_conversational and lowered_raw.startswith(("tell me a", "how are you", "give me a", "say something")):
+    if is_simple_conversational and lowered_raw.startswith(
+        ("tell me a", "how are you", "give me a", "say something", "what is the capital of", "who is the president of")
+    ):
         return FastPathResult(
             is_fast_path=True,
             path_type=FastPathType.FAST_CHAT,

@@ -158,13 +158,31 @@ _OP_STOPWORDS = frozenset({
     "can", "could", "should", "will", "would", "please", "then", "over",
     "under", "from", "into", "them", "they", "we", "you", "me", "us",
 })
+
+_GENERIC_WORKSPACE_WORDS = frozenset({
+    "my project", "the project", "this project", "our project", "project",
+    "my workspace", "the workspace", "this workspace", "workspace",
+    "my repo", "the repo", "this repo", "repo", "repository",
+    "my files", "the files", "this files", "files",
+    "my folder", "the folder", "this folder", "current folder", "folder",
+    "my directory", "the directory", "this directory", "directory",
+    "root", "here", "current", ".", "/", "\\",
+})
+
 _OP_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
-    ("list", re.compile(r"\b(list|show|display|print)\s+(the\s+)?(files|file\s*tree|tree|structure|folders|contents|workspace)\b", re.IGNORECASE)),
+    (
+        "list",
+        re.compile(
+            r"\b(?:list|show|display|print)\s+(?:the\s+)?(?:files|file\s*tree|tree|structure|folders|contents|workspace)(?:\s+(?:in|of|inside)\s+(?:(?:the|this|my|our)\s+)?(?:folder\s+|directory\s+)?([A-Za-z0-9_.\-/]+(?:\s+[A-Za-z0-9_.\-/]+)?))?\b"
+            r"|\b(?:open|show|list)\s+(?:the\s+)?(?:folder|directory|subfolder)\s+([A-Za-z0-9_.\-/]+)\b",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "search",
         re.compile(
-            r"\b(?:search|find|grep|locate)\s+(?:for\s+)?[\"']([^\"']+)[\"']"
-            r"|\b(?:search|find|grep|locate)\s+(?:for\s+)?([A-Za-z0-9_.*/?]+)",
+            r"\b(?:search|find|grep|locate)\s+(?:for\s+)?[\"']([^\"']+)[\"'](?:\s+(?:in|inside|of)\s+(?:(?:the|this|my|our)\s+)?(?:folder\s+|directory\s+)?([A-Za-z0-9_.\-/]+))?"
+            r"|\b(?:search|find|grep|locate)\s+(?:for\s+)?([A-Za-z0-9_.*/?]+)(?:\s+(?:in|inside|of)\s+(?:(?:the|this|my|our)\s+)?(?:folder\s+|directory\s+)?([A-Za-z0-9_.\-/]+))?",
             re.IGNORECASE,
         ),
     ),
@@ -173,11 +191,17 @@ _OP_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     (
         "delete",
         re.compile(
-            r"\b(?:delete|remove|erase)\s+(?:[\"']([^\"']+)[\"']|([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]+))",
+            r"\b(?:delete|remove|erase)\s+(?:(?:folder|directory|subfolder|file)\s+)?(?:[\"']([^\"']+)[\"']|([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]+)|(?:folder|directory|subfolder)\s+([A-Za-z0-9_.\-/]+))",
             re.IGNORECASE,
         ),
     ),
-    ("create_folder", re.compile(r"\bcreate\s+(?:a\s+|an\s+)?(?:folder|directory|subfolder)s?\s+(?:called|named)?\s*([A-Za-z0-9_.\-/]+)\b", re.IGNORECASE)),
+    (
+        "create_folder",
+        re.compile(
+            r"\bcreate\s+(?:a\s+|an\s+)?(?:folder|directory|subfolder)s?\s+(?:called\s+|named\s+)?([A-Za-z0-9_.\-/]+)(?:\s+(?:in|inside)\s+(?:the\s+)?(?:folder\s+|directory\s+)?([A-Za-z0-9_.\-/]+))?\b",
+            re.IGNORECASE,
+        ),
+    ),
 ]
 
 
@@ -193,19 +217,42 @@ def extract_workspace_ops(prompt: str) -> list[dict]:
     for action, pattern in _OP_EXTRACTORS:
         for match in pattern.finditer(text):
             if action == "list":
-                ops.append({"action": "list"})
+                folder = (match.group(1) or match.group(2) or "").strip().strip("'\"").rstrip("/\\")
+                for suffix in (" folder", " directory", " subfolder", " folders", " directories", " files"):
+                    if folder.lower().endswith(suffix):
+                        folder = folder[:-len(suffix)].strip()
+                for prefix in ("the ", "my ", "this ", "our ", "a ", "an ", "folder ", "directory ", "subfolder "):
+                    if folder.lower().startswith(prefix):
+                        folder = folder[len(prefix):].strip()
+                if folder.lower() in _GENERIC_WORKSPACE_WORDS or folder.lower() in _OP_STOPWORDS or folder in (".", "/", "\\"):
+                    folder = ""
+                ops.append({"action": "list", **({"path": folder} if folder else {})})
             elif action == "search":
-                term = match.group(1) or match.group(2)
-                if term.lower() not in _OP_STOPWORDS:
-                    ops.append({"action": "search", "pattern": term})
+                term = (match.group(1) or match.group(3) or "").strip()
+                target_folder = (match.group(2) or match.group(4) or "").strip().strip("'\"").rstrip("/\\")
+                for suffix in (" folder", " directory", " subfolder", " folders", " directories", " files", " file"):
+                    if target_folder.lower().endswith(suffix):
+                        target_folder = target_folder[:-len(suffix)].strip()
+                for prefix in ("the ", "my ", "this ", "our ", "a ", "an ", "folder ", "directory ", "subfolder "):
+                    if target_folder.lower().startswith(prefix):
+                        target_folder = target_folder[len(prefix):].strip()
+                if target_folder.lower() in _GENERIC_WORKSPACE_WORDS or target_folder.lower() in _OP_STOPWORDS or target_folder in (".", "/", "\\"):
+                    target_folder = ""
+                if term and term.lower() not in _OP_STOPWORDS:
+                    ops.append({"action": "search", "pattern": term, **({"path": target_folder} if target_folder else {})})
             elif action == "read":
                 ops.append({"action": "read", "path": match.group(1)})
             elif action == "rename":
                 ops.append({"action": "rename", "path": match.group(1), "to": match.group(2)})
             elif action == "delete":
-                ops.append({"action": "delete", "path": match.group(1) or match.group(2), "confirmed": True})
+                target = match.group(1) or match.group(2) or match.group(3)
+                if target:
+                    ops.append({"action": "delete", "path": target, "confirmed": True})
             elif action == "create_folder":
-                ops.append({"action": "create_folder", "path": match.group(1)})
+                name = match.group(1)
+                parent = match.group(2)
+                full_folder = f"{parent.rstrip('/')}/{name.lstrip('/')}" if parent else name
+                ops.append({"action": "create_folder", "path": full_folder})
     seen: set[tuple] = set()
     deduped: list[dict] = []
     for op in ops:

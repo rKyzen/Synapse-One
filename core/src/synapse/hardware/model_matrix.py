@@ -107,7 +107,9 @@ def capability_to_role(cap: Capability | str, *, is_deep_reasoning: bool = False
 
     if cap_val in (
         ModelRole.CODING, "coding", "code_analysis", "file_creation",
-        "file_editing", "testing", "debugging", "terminal", "json", "project_creation"
+        "file_editing", "testing", "debugging", "terminal", "json", "project_creation",
+        "html", "css", "javascript", "js", "web_development", "frontend", "backend",
+        "fastapi", "code_generation", "artifact_generation"
     ):
         return ModelRole.CODING
     if cap_val in (

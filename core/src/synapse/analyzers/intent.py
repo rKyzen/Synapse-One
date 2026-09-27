@@ -17,13 +17,13 @@ from synapse.domain import IntentResult, IntentType
 #: (intent, base_weight, keywords) — matched on lowercase prompt text with word boundaries.
 _INTENT_TABLE: list[tuple[IntentType, int, tuple[str, ...]]] = [
     (IntentType.PLANNING, 12, ("plan", "planning", "roadmap", "schedule", "timeline", "organize", "steps to", "outline to")),
-    (IntentType.CODING, 15, ("code", "coding", "program", "programming", "debug", "debugging", "bug", "bugs", "fix", "fixes", "api", "function", "functions", "script", "scripts", "website", "web app", "flutter", "python", "javascript", "repository", "git", "refactor", "algorithm", "build", "develop", "implement", "platform", "quicksort", "software")),
+    (IntentType.CODING, 15, ("code", "coding", "program", "programming", "debug", "debugging", "bug", "bugs", "fix", "fixes", "api", "function", "functions", "script", "scripts", "website", "web app", "landing page", "html", "css", "javascript", "js", "frontend", "backend", "fastapi", "python code", "flutter", "python", "repository", "git", "refactor", "algorithm", "build", "develop", "implement", "platform", "quicksort", "software", "create file", "edit file", "modify file", "update file", "index.html", "style.css", "script.js", "endpoint", "route")),
     (IntentType.RESEARCH, 14, ("research", "study", "analyze", "investigate", "survey", "paper", "citation", "literature", "sources", "evidence", "findings")),
     (IntentType.WRITING, 13, ("write", "writing", "essay", "email", "letter", "story", "poem", "grammar", "rewrite", "draft", "summarize", "translate", "proofread")),
     (IntentType.BUSINESS, 12, ("business", "revenue", "profit", "client", "contract", "pitch", "strategy", "sales", "startup", "invoice", "market")),
     (IntentType.CREATIVE, 11, ("creative", "brainstorm", "design", "imagine", "moodboard", "illustration", "artwork", "logo")),
     (IntentType.EDUCATION, 10, ("teach", "learn", "student", "homework", "explain", "explaining", "explanation", "lesson", "tutorial", "quiz")),
-    (IntentType.CONVERSATION, 8, ("hi", "hello", "hey", "how are you", "thanks", "thank you", "who are you", "bye", "good morning")),
+    (IntentType.CONVERSATION, 14, ("hi", "hello", "hey", "how are you", "thanks", "thank you", "who are you", "bye", "good morning", "what is this chat about", "what is this conversation about", "summarize this chat", "summarize this conversation", "what did we do", "what have we done", "what have we accomplished", "chat summary", "conversation summary", "what is our chat about")),
 ]
 
 _COMPILED_INTENT_TABLE: list[tuple[IntentType, int, list[re.Pattern]]] = [

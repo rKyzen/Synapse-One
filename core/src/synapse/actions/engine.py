@@ -20,13 +20,14 @@ answers directly and no model is consulted.
 
 from __future__ import annotations
 
+from pathlib import Path
 import re
 from typing import Callable
 
 from synapse.domain.enums import RequestKind
 from synapse.domain.fileops import FileAction, ValidationResult
 from synapse.logging import get_logger
-from synapse.workspace.operator import WorkspaceSafetyError
+from synapse.workspace.operator import WorkspaceSafetyError, is_safe_relative_path, normalize_workspace_rel
 from synapse.workspace.review import summarize as summarize_validations
 from synapse.workspace.review import validate_file
 
@@ -58,22 +59,36 @@ class ActionEngine:
         return self._op.write(rel, data)
 
     def edit(self, rel: str, old: str, new: str) -> dict:
-        """Targeted in-place edit; fails cleanly when ``old`` is absent."""
+        """Targeted in-place edit; if old snippet match fails, falls back to full-content replace."""
         content = self._op.read(rel)
         if content is None:
             return {"ok": False, "error": f"file not found: {rel}"}
         target_old = old
-        if not target_old or target_old not in content:
-            if target_old and target_old.strip() and target_old.strip() in content:
-                target_old = target_old.strip()
+        if target_old and target_old in content:
+            updated = content.replace(target_old, new, 1) if content.count(target_old) == 1 else content.replace(target_old, new)
+        elif target_old and target_old.strip() and target_old.strip() in content:
+            updated = content.replace(target_old.strip(), new, 1)
+        elif target_old and target_old.replace("\r\n", "\n") in content.replace("\r\n", "\n"):
+            normalized_content = content.replace("\r\n", "\n")
+            updated = normalized_content.replace(target_old.replace("\r\n", "\n"), new, 1)
+        else:
+            is_full_code = bool(
+                new and (
+                    "\n" in new
+                    or len(new) > 40
+                    or any(k in new for k in ("def ", "class ", "import ", "<html", "function", "var ", "let ", "const ", "{", "};"))
+                )
+            )
+            if is_full_code:
+                updated = new
             else:
                 return {"ok": False, "error": "old text not found in file"}
-        updated = content.replace(target_old, new, 1) if content.count(target_old) == 1 else content.replace(target_old, new)
+
         self._op.write(rel, updated)
         post_content = self._op.read(rel)
-        if post_content is None or (new and new not in post_content):
+        if post_content is None or (new and new not in post_content and post_content != updated):
             return {"ok": False, "error": "edit not reflected on disk (verification failed)"}
-        return {"ok": True, "bytes": len(updated.encode())}
+        return {"ok": True, "bytes": len(post_content.encode())}
 
     def move(self, src: str, dst: str) -> dict:
         return self._op.rename(src, dst)
@@ -86,14 +101,14 @@ class ActionEngine:
             )
         return self._op.delete(rel)
 
-    def search(self, pattern: str, *, max_results: int = 50) -> list[dict]:
+    def search(self, pattern: str, *, rel: str = "", max_results: int = 50) -> list[dict]:
         """Regex search across workspace files. Returns [{path, line, text}]."""
         try:
             rx = re.compile(pattern, re.IGNORECASE)
         except re.error:
             rx = re.compile(re.escape(pattern), re.IGNORECASE)
         hits: list[dict] = []
-        for entry in self._op.list_tree():
+        for entry in self._op.list_tree(rel):
             content = self._op.read(entry["path"]) or ""
             for lineno, line in enumerate(content.splitlines(), 1):
                 if rx.search(line):
@@ -145,8 +160,6 @@ class ActionEngine:
             return False
         if new and new not in content:
             return False
-        if old and old not in new and old in content:
-            return False
         return True
 
     def _content_matches(self, path: str, expected: str | bytes) -> bool:
@@ -158,7 +171,9 @@ class ActionEngine:
             except OSError:
                 return False
         content = self._op.read(path)
-        return content == expected
+        if content is None:
+            return False
+        return content == expected or content.replace("\r\n", "\n") == str(expected).replace("\r\n", "\n")
 
     def apply(
         self,
@@ -179,8 +194,11 @@ class ActionEngine:
         validations: list[ValidationResult] = []
         for op in ops:
             action = op.get("action", "write")
-            path = op.get("path", "")
-            if op.get("error"):
+            raw_path = op.get("path", "")
+            path = normalize_workspace_rel(raw_path, self._op.root) or raw_path
+            raw_to = op.get("to", "")
+            to_path = normalize_workspace_rel(raw_to, self._op.root) or raw_to
+            if op.get("error") and not is_safe_relative_path(path):
                 entry = FileAction(path=path, action=action, status="failed", error=op["error"])
                 actions.append(entry)
                 self._log_result(entry)
@@ -190,7 +208,7 @@ class ActionEngine:
                 step["kind"] = "create_folder"
             elif action in ("rename", "move"):
                 step["kind"] = "rename"
-                step["to"] = op.get("to", "")
+                step["to"] = to_path
             elif action in ("delete", "remove"):
                 step["kind"] = "delete"
             elif action in ("edit", "patch", "replace"):
@@ -211,15 +229,15 @@ class ActionEngine:
                     entry = FileAction(path=path, action="created_folder", status="ok")
                 elif action in ("rename", "move"):
                     self._verified(
-                        lambda: self._op.rename(path, op["to"]),
-                        lambda: self._op.exists(op["to"]) and not self._op.exists(path),
+                        lambda: self._op.rename(path, to_path),
+                        lambda: self._op.exists(to_path) and not self._op.exists(path),
                         "rename not applied (verification failed)",
                     )
-                    content = self._op.read(op["to"]) or ""
-                    check = validate_file(op["to"], content)
+                    content = self._op.read(to_path) or ""
+                    check = validate_file(to_path, content)
                     validations.append(check)
                     entry = FileAction(
-                        path=op["to"], action="renamed", bytes=len(content.encode()),
+                        path=to_path, action="renamed", bytes=len(content.encode()),
                         validated=check.ok, validation=check.error or " · ".join(check.checks),
                     )
                 elif action in ("delete", "remove"):
@@ -323,10 +341,14 @@ class ActionEngine:
         actions: list[FileAction] = []
         for op in ops:
             action = op.get("action")
+            raw_path = op.get("path", "")
+            path = normalize_workspace_rel(raw_path, self._op.root) if raw_path else ""
+            raw_to = op.get("to", "")
+            to_path = normalize_workspace_rel(raw_to, self._op.root) if raw_to else ""
             if on_step:
-                step = {"action": action, "path": op.get("path", "") or op.get("pattern", "")}
+                step = {"action": action, "path": path or op.get("pattern", "")}
                 if action in ("rename", "move"):
-                    step["to"] = op.get("to", "")
+                    step["to"] = to_path
                 if action == "list":
                     step["kind"] = "list"
                 elif action == "search":
@@ -338,16 +360,17 @@ class ActionEngine:
                 on_step(step)
             try:
                 if action == "list":
-                    entries = self._op.list_tree()
+                    entries = self._op.list_tree(path)
                     paths = [e["path"] for e in entries]
-                    actions.append(FileAction(path=".", action="listed", status="ok"))
-                    lines.append(f"Files in workspace ({len(paths)}):")
+                    folder_desc = f" in {path}" if path else " in workspace"
+                    actions.append(FileAction(path=path or ".", action="listed", status="ok"))
+                    lines.append(f"Files{folder_desc} ({len(paths)}):")
                     if paths:
                         lines.extend(f"- {p}" for p in paths)
                     else:
                         lines.append("- (empty)")
                 elif action == "search":
-                    hits = self.search(op.get("pattern", ""))
+                    hits = self.search(op.get("pattern", ""), rel=path)
                     pattern = op.get("pattern", "")
                     actions.append(FileAction(path=pattern, action="searched", status="ok", error="" if hits else "no matches"))
                     lines.append(f"Search '{pattern}' ({len(hits)} match(es)):")
@@ -356,7 +379,6 @@ class ActionEngine:
                     else:
                         lines.append("- no matches")
                 elif action == "read":
-                    path = op.get("path", "")
                     content = self._op.read(path)
                     if content is None:
                         actions.append(FileAction(path=path, action="read", status="failed", error="not found"))
@@ -372,37 +394,37 @@ class ActionEngine:
                         lines.append(snippet)
                 elif action in ("rename", "move"):
                     self._verified(
-                        lambda: self._op.rename(op["path"], op["to"]),
-                        lambda: self._op.exists(op["to"]) and not self._op.exists(op["path"]),
+                        lambda: self._op.rename(path, to_path),
+                        lambda: self._op.exists(to_path) and not self._op.exists(path),
                         "rename not applied (verification failed)",
                     )
-                    actions.append(FileAction(path=op["path"], action="renamed", status="ok"))
-                    lines.append(f"Renamed {op['path']} -> {op['to']}")
+                    actions.append(FileAction(path=path, action="renamed", status="ok"))
+                    lines.append(f"Renamed {path} -> {to_path}")
                 elif action in ("delete", "remove"):
-                    ok = self._op.delete(op["path"])
+                    ok = self._op.delete(path)
                     if ok:
                         self._verified(
-                            lambda: self._op.delete(op["path"]),
-                            lambda: not self._op.exists(op["path"]),
+                            lambda: self._op.delete(path),
+                            lambda: not self._op.exists(path),
                             "file still exists after delete (verification failed)",
                         )
                     actions.append(
-                        FileAction(path=op["path"], action="deleted", status="ok" if ok else "failed", error="" if ok else "not found")
+                        FileAction(path=path, action="deleted", status="ok" if ok else "failed", error="" if ok else "not found")
                     )
-                    lines.append(f"Deleted {op['path']}" if ok else f"{op['path']}: not found")
+                    lines.append(f"Deleted {path}" if ok else f"{path}: not found")
                 elif action in ("create_folder", "mkdir"):
                     self._verified(
-                        lambda: self.create_folder(op["path"]),
-                        lambda: self._op.path_for(op["path"]).is_dir(),
+                        lambda: self.create_folder(path),
+                        lambda: self._op.path_for(path).is_dir(),
                         "folder missing after create (verification failed)",
                     )
-                    actions.append(FileAction(path=op["path"], action="created_folder", status="ok"))
-                    lines.append(f"Created folder {op['path']}/")
+                    actions.append(FileAction(path=path, action="created_folder", status="ok"))
+                    lines.append(f"Created folder {path}/")
             except WorkspaceSafetyError as exc:
-                actions.append(FileAction(path=op.get("path", ""), action=action or "?", status="failed", error=str(exc)))
+                actions.append(FileAction(path=path, action=action or "?", status="failed", error=str(exc)))
                 lines.append(f"Failed: {exc}")
             except (OSError, ValueError) as exc:
-                actions.append(FileAction(path=op.get("path", ""), action=action or "?", status="failed", error=str(exc)))
+                actions.append(FileAction(path=path, action=action or "?", status="failed", error=str(exc)))
                 lines.append(f"Failed: {exc}")
         return lines, actions
 
@@ -414,11 +436,14 @@ class ActionEngine:
         max_files: int = 8,
         max_bytes_per_file: int = 4000,
         on_file: Callable[[str], None] | None = None,
+        prompt: str | None = None,
+        target_paths: list[str] | None = None,
     ) -> str | None:
         """Snapshot of the workspace (listing + excerpts) to feed a model.
 
         Lets the model edit or analyze real existing files instead of
         hallucinating their content. Returns None when the workspace is empty.
+        Only injects full contents for files targeted by the prompt or task.
         ``on_file`` (when given) is called with each excerpted path so a live
         UI can show per-file reads.
         """
@@ -426,16 +451,43 @@ class ActionEngine:
         if not entries:
             return None
         parts = ["Workspace files:"]
-        for entry in entries:
+        for entry in entries[:40]:
             parts.append(f"- {entry['path']} ({entry['size']} bytes)")
-        for entry in entries[:max_files]:
-            content = self._op.read(entry["path"])
-            if content is None:
-                continue
-            excerpt = content[:max_bytes_per_file]
-            parts.append(f"\n### {entry['path']}\n{excerpt}")
-            if on_file:
-                on_file(entry["path"])
+        if len(entries) > 40:
+            parts.append(f"- ... and {len(entries) - 40} more files")
+
+        # Determine which files need content injection
+        targeted_entries = []
+        lowered_prompt = (prompt or "").lower()
+        if target_paths:
+            t_set = {p.lower() for p in target_paths}
+            targeted_entries = [e for e in entries if e["path"].lower() in t_set or Path(e["path"]).name.lower() in t_set]
+        elif prompt:
+            for entry in entries:
+                rel = entry["path"].lower()
+                name = Path(entry["path"]).name.lower()
+                if (rel in lowered_prompt or name in lowered_prompt) and len(name) > 3:
+                    targeted_entries.append(entry)
+
+        if targeted_entries:
+            for entry in targeted_entries[:max_files]:
+                content = self._op.read(entry["path"])
+                if content is None:
+                    continue
+                excerpt = content[:max_bytes_per_file]
+                parts.append(f"\n### {entry['path']}\n{excerpt}")
+                if on_file:
+                    on_file(entry["path"])
+        else:
+            for entry in entries[:min(max_files, 2)]:
+                content = self._op.read(entry["path"])
+                if content is None:
+                    continue
+                excerpt = content[:max_bytes_per_file]
+                parts.append(f"\n### {entry['path']}\n{excerpt}")
+                if on_file:
+                    on_file(entry["path"])
+
         return "\n".join(parts)
 
     # -- summary ---------------------------------------------------------------------

@@ -35,6 +35,9 @@ from synapse.domain import (
 from synapse.domain.models import ModelMetadata
 from synapse.hardware.model_matrix import get_exact_model, matches_model_id
 from synapse.hardware.tier_resolver import TierResolver
+from synapse.logging import get_logger
+
+log = get_logger("synapse.router")
 
 #: Weight of each REQUIRED capability in the score.
 _REQUIRED_WEIGHTS: dict[Capability, float] = {
@@ -197,6 +200,17 @@ class Router(Router):
             for score, m in scored
         ]
         best_score, best = scored[0]
+
+        log.info(
+            "router_decision",
+            tier=tier.value,
+            primary_cap=primary_cap.value if primary_cap else None,
+            required_caps=[c.value for c in decision.required_capabilities],
+            matrix_locked_model=locked_model,
+            selected_model=best.id,
+            selected_provider=best.provider_id,
+            best_score=round(best_score, 3),
+        )
 
         if best_score <= 0:
             return RoutingDecision(

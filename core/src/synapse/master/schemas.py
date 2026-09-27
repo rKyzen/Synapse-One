@@ -37,6 +37,7 @@ class ExecutionMode(str, Enum):
 
     DIRECT_ANSWER = "direct_answer"
     WORKSPACE_AGENT = "workspace_agent"
+    EDIT_EXISTING = "edit_existing"
     TOOL_EXECUTION = "tool_execution"
     ARTIFACT_GENERATION = "artifact_generation"
     MULTI_STEP_AGENT = "multi_step_agent"

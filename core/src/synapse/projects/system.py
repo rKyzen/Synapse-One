@@ -661,7 +661,68 @@ class WorkspaceSystem:
         )
         if message:
             self._save_session(project_id, chat_id)
+            try:
+                mem = self.memory_for(project_id)
+                from synapse.domain.enums import MemoryScope
+                mem.save(
+                    MemoryScope.CONVERSATION,
+                    f"{role}: {content[:300]}",
+                    source=f"chat:{chat_id}",
+                    conversation=chat_id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self._update_conversation_scope(project_id, chat_id)
         return message
+
+    def _update_conversation_scope(self, project_id: str, chat_id: str) -> None:
+        """Atomically persist short conversation_scope summary under memory/<project_id>/conversation_scope.json."""
+        try:
+            chat_info = self.chat_store(project_id).get(chat_id)
+            messages = self.chat_store(project_id).messages(chat_id)
+            if not messages:
+                return
+            summary = f"Discussion in '{chat_info.title if chat_info else chat_id}' with {len(messages)} messages."
+            recent_user = [m.content for m in messages if m.role == "user"]
+            if recent_user:
+                cleaned_user = " ".join(recent_user[-1].split())
+                summary += f" Recent topics: {cleaned_user[:120]}."
+
+            data = {
+                "chat_id": chat_id,
+                "project_id": project_id,
+                "title": chat_info.title if chat_info else "Chat",
+                "summary": summary,
+                "message_count": len(messages),
+                "updated_at": _now_iso(),
+            }
+            scope_path = self._paths.memory_dir / project_id / "conversation_scope.json"
+            scope_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = scope_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(scope_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def conversation_scope_summary(self, project_id: str, chat_id: str | None = None) -> str:
+        """Read the conversation scope summary for the active or given chat."""
+        cid = chat_id or self._active_chat_id
+        scope_path = self._paths.memory_dir / project_id / "conversation_scope.json"
+        if scope_path.is_file():
+            try:
+                data = json.loads(scope_path.read_text(encoding="utf-8"))
+                if not cid or data.get("chat_id") == cid:
+                    return str(data.get("summary", "")).strip()
+            except Exception:  # noqa: BLE001
+                pass
+        if cid:
+            chat = self.chat_store(project_id).get(cid)
+            msgs = self.chat_store(project_id).messages(cid)
+            if msgs:
+                user_msgs = [m.content for m in msgs if m.role == "user"]
+                last_topic = f" covering {user_msgs[-1][:80]}" if user_msgs else ""
+                return f"Active chat: {chat.title if chat else cid}{last_topic} ({len(msgs)} messages)."
+        return f"Project workspace session for {project_id}."
 
     # -- cleanup (Phase 7: no orphaned temp/empty folders) ---------------------
 

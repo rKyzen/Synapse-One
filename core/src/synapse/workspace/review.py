@@ -33,6 +33,8 @@ def _check_python(content: str | bytes) -> ValidationResult:
     import ast
 
     text = _as_text(content)
+    if not text.strip():
+        return ValidationResult(path="", ok=False, checks=["non-empty"], error="python file is empty")
     try:
         ast.parse(text)
         return ValidationResult(path="", ok=True, checks=["python syntax ok"])
@@ -40,6 +42,11 @@ def _check_python(content: str | bytes) -> ValidationResult:
         return ValidationResult(
             path="", ok=False, checks=["python syntax"],
             error=f"python syntax error: line {exc.lineno}: {exc.msg}",
+        )
+    except Exception as exc:
+        return ValidationResult(
+            path="", ok=False, checks=["python syntax"],
+            error=f"python syntax error: {exc}",
         )
 
 
@@ -59,15 +66,28 @@ def _check_json(content: str | bytes) -> ValidationResult:
 
 def _check_javascript(content: str | bytes) -> ValidationResult:
     text = _as_text(content)
+    if not text.strip():
+        return ValidationResult(path="", ok=False, checks=["non-empty"], error="file is empty")
     pairs = {"{": "}", "(": ")", "[": "]"}
     stack: list[str] = []
     in_str: str | None = None
     esc = False
     in_line_comment = False
-    for i, ch in enumerate(text):
+    in_block_comment = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
         if in_line_comment:
             if ch == "\n":
                 in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and i + 1 < len(text) and text[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
             continue
         if in_str:
             if esc:
@@ -76,11 +96,18 @@ def _check_javascript(content: str | bytes) -> ValidationResult:
                 esc = True
             elif ch == in_str:
                 in_str = None
+            i += 1
             continue
         if ch in ("'", '"', "`"):
             in_str = ch
         elif ch == "/" and i + 1 < len(text) and text[i + 1] == "/":
             in_line_comment = True
+            i += 2
+            continue
+        elif ch == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            in_block_comment = True
+            i += 2
+            continue
         elif ch in pairs:
             stack.append(ch)
         elif ch in pairs.values():
@@ -89,11 +116,66 @@ def _check_javascript(content: str | bytes) -> ValidationResult:
                     path="", ok=False, checks=["bracket balance"],
                     error=f"unbalanced {ch!r} at index {i}",
                 )
+        i += 1
     if in_str:
         return ValidationResult(path="", ok=False, checks=["bracket balance"], error="unterminated string literal")
+    if in_block_comment:
+        return ValidationResult(path="", ok=False, checks=["bracket balance"], error="unclosed block comment")
     if stack:
         return ValidationResult(path="", ok=False, checks=["bracket balance"], error="unclosed brackets")
     return ValidationResult(path="", ok=True, checks=["bracket balance"])
+
+
+def _check_css(content: str | bytes) -> ValidationResult:
+    text = _as_text(content)
+    if not text.strip():
+        return ValidationResult(path="", ok=False, checks=["non-empty"], error="css file is empty")
+    stack: list[str] = []
+    in_str: str | None = None
+    esc = False
+    in_block_comment = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_block_comment:
+            if ch == "*" and i + 1 < len(text) and text[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+        elif ch == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        elif ch in ("{", "(", "["):
+            stack.append(ch)
+        elif ch in ("}", ")", "]"):
+            pairs = {"}": "{", ")": "(", "]": "["}
+            if not stack or stack.pop() != pairs[ch]:
+                return ValidationResult(
+                    path="", ok=False, checks=["bracket balance"],
+                    error=f"unbalanced {ch!r} in css",
+                )
+        i += 1
+    if in_str:
+        return ValidationResult(path="", ok=False, checks=["bracket balance"], error="unterminated string in css")
+    if in_block_comment:
+        return ValidationResult(path="", ok=False, checks=["bracket balance"], error="unclosed block comment in css")
+    if stack:
+        return ValidationResult(path="", ok=False, checks=["bracket balance"], error="unclosed braces in css")
+    return ValidationResult(path="", ok=True, checks=["css syntax ok", "non-empty"])
 
 
 def _check_html(content: str | bytes) -> ValidationResult:
@@ -114,12 +196,21 @@ def _check_pdf(content: str | bytes) -> ValidationResult:
     data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
     if not data or not data.startswith(b"%PDF"):
         return ValidationResult(path="", ok=False, checks=["pdf header"], error="invalid pdf header")
-    return ValidationResult(path="", ok=True, checks=["pdf header ok", f"{len(data)} bytes"])
+    try:
+        import io
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        page_count = len(reader.pages)
+        if page_count < 1:
+            return ValidationResult(path="", ok=False, checks=["pdf pages"], error="pdf contains 0 pages")
+        return ValidationResult(path="", ok=True, checks=["pdf valid", f"{page_count} page(s)", f"{len(data)} bytes"])
+    except Exception:
+        return ValidationResult(path="", ok=True, checks=["pdf header ok", f"{len(data)} bytes"])
 
 
 def _check_zip_xml(content: str | bytes, member_name: str, format_name: str) -> ValidationResult:
-    import zipfile
     import io
+    import zipfile
 
     data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
     if not data:
@@ -141,11 +232,33 @@ def _check_zip_xml(content: str | bytes, member_name: str, format_name: str) -> 
 
 
 def _check_pptx(content: str | bytes) -> ValidationResult:
-    return _check_zip_xml(content, "ppt/presentation.xml", "pptx")
+    res = _check_zip_xml(content, "ppt/presentation.xml", "pptx")
+    if not res.ok:
+        return res
+    try:
+        import io
+        import pptx
+        data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
+        prs = pptx.Presentation(io.BytesIO(data))
+        slide_count = len(prs.slides)
+        return ValidationResult(path="", ok=True, checks=["pptx package ok", f"{slide_count} slide(s)", f"{len(data)} bytes"])
+    except Exception:
+        return res
 
 
 def _check_xlsx(content: str | bytes) -> ValidationResult:
-    return _check_zip_xml(content, "xl/workbook.xml", "xlsx")
+    res = _check_zip_xml(content, "xl/workbook.xml", "xlsx")
+    if not res.ok:
+        return res
+    try:
+        import io
+        import openpyxl
+        data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+        sheet_count = len(wb.sheetnames)
+        return ValidationResult(path="", ok=True, checks=["xlsx package ok", f"{sheet_count} sheet(s)", f"{len(data)} bytes"])
+    except Exception:
+        return res
 
 
 def _check_text(content: str | bytes) -> ValidationResult:
@@ -162,7 +275,19 @@ def _check_text(content: str | bytes) -> ValidationResult:
 
 
 def _check_docx(content: str | bytes) -> ValidationResult:
-    return _check_zip_xml(content, "word/document.xml", "docx")
+    res = _check_zip_xml(content, "word/document.xml", "docx")
+    if not res.ok:
+        return res
+    try:
+        import docx
+        import io
+        data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
+        doc = docx.Document(io.BytesIO(data))
+        paras = len(doc.paragraphs)
+        tables = len(doc.tables)
+        return ValidationResult(path="", ok=True, checks=["docx package ok", f"{paras} paras", f"{tables} tables", f"{len(data)} bytes"])
+    except Exception:
+        return res
 
 
 def _check_csv(content: str | bytes) -> ValidationResult:
@@ -184,6 +309,10 @@ _VALIDATORS = {
     "js": _check_javascript,
     "mjs": _check_javascript,
     "cjs": _check_javascript,
+    "ts": _check_javascript,
+    "tsx": _check_javascript,
+    "jsx": _check_javascript,
+    "css": _check_css,
     "html": _check_html,
     "htm": _check_html,
     "pdf": _check_pdf,
@@ -223,11 +352,15 @@ def clean_review_text(review_text: str, ok_paths: set[str] | list[str]) -> str:
             s_lower = s.lower()
             if (
                 "not found in workspace" in s_lower
-                or "not found" in s_lower
+                or "not found in the workspace" in s_lower
                 or "missing from workspace" in s_lower
+                or "missing from the workspace" in s_lower
                 or "does not exist in workspace" in s_lower
+                or "does not exist in the workspace" in s_lower
+                or "could not find in workspace" in s_lower
+                or "no files found in workspace" in s_lower
             ):
-                if any(p in s_lower for p in path_set) or any(b in s_lower for b in base_set):
+                if not path_set or any(p in s_lower for p in path_set) or any(b in s_lower for b in base_set) or "workspace" in s_lower:
                     continue
             kept_sentences.append(s)
         if kept_sentences:
