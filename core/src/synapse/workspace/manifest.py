@@ -62,6 +62,7 @@ Preferred formats:
 Rules:
 - Paths relative to project root only
 - Prefer full-content overwrite — it is far more reliable
+- For documents (.pdf, .docx, .pptx, .xlsx, .csv), generate complete, readable text with detailed paragraphs/tables/slides; never emit empty or title-only placeholders
 - If no files change, reply with normal prose only (no JSON)"""
 
 WORKSPACE_TOOL_INSTRUCTION = MANIFEST_INSTRUCTION

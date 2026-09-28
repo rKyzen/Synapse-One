@@ -588,8 +588,6 @@ def _generate_pptx_library(title: str, slides_content: list[tuple[str, list[str]
     prs.slide_height = Inches(7.5)
 
     slides = _normalize_slides(title, slides_content)
-    if not slides:
-        slides = [(title or "Presentation", ["Overview", "Key Points", "Summary"])]
 
     # Title slide
     title_slide_layout = prs.slide_layouts[0]
@@ -620,7 +618,7 @@ def _generate_pptx_library(title: str, slides_content: list[tuple[str, list[str]
 def _generate_pptx_pure(title: str, slides_content: list[tuple[str, list[str]]] | list[dict] | str) -> bytes:
     slides = _normalize_slides(title, slides_content)
     if not slides:
-        slides = [(title, ["Overview of the topic", "Key takeaways", "Next steps"])]
+        slides = [(title or "Presentation", [])]
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:

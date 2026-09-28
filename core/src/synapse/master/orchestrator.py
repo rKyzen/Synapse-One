@@ -97,7 +97,8 @@ _DIVIDER_SYSTEM_PROMPT = (
     "4. Different subtasks can and should route to different specialist models (e.g. coding to Qwen Coder, "
     "math/chat to Gemma, vision to vision model, file creation to filesystem_tool).\n"
     "5. Do NOT use heavy models like 32B unless the subtask genuinely requires deep reasoning on high-end hardware.\n"
-    "6. Output strictly valid JSON matching the TaskDecompositionPlan schema.\n\n"
+    "6. Output strictly valid JSON matching the TaskDecompositionPlan schema.\n"
+    "7. For rich document artifact subtasks (.pdf, .docx, .pptx, .xlsx, .csv), sub_prompt MUST specify producing complete and comprehensive readable content (detailed paragraphs, multi-point bullet lists, filled tables, full slide text), never empty skeletons.\n\n"
     "FEW-SHOT EXAMPLES OF VALID TASK DECOMPOSITION PLANS:\n\n"
     "Example 1: Compound Coding Project with Tests and Docs\n"
     "User: 'Create a CLI expense tracker in Python with tests and documentation'\n"
@@ -140,6 +141,14 @@ _DIVIDER_SYSTEM_PROMPT = (
     '  "execution_strategy": "SEQUENTIAL",\n'
     '  "tasks": [\n'
     '    {"task_id": 1, "intent": "CONVERSATION", "sub_prompt": "Explain photosynthesis in simple terms", "assigned_model": "gemma3:4b", "capability": "conversation", "reasoning": "educational text explanation", "dependencies": []}\n'
+    "  ]\n"
+    "}\n\n"
+    "Example 6: Rich Document Generation (PDF/DOCX/PPTX/XLSX)\n"
+    "User: 'Create a 1-page PDF report on the benefits of local AI in docs/local_ai.pdf'\n"
+    "{\n"
+    '  "execution_strategy": "SEQUENTIAL",\n'
+    '  "tasks": [\n'
+    '    {"task_id": 1, "intent": "DOCUMENT_GENERATION", "sub_prompt": "Generate full, comprehensive readable content with detailed paragraphs and benefits for docs/local_ai.pdf", "assigned_model": "qwen2.5-coder:7b", "capability": "document_generation", "reasoning": "document generation specialist", "dependencies": []}\n'
     "  ]\n"
     "}"
 )

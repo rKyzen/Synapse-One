@@ -556,3 +556,112 @@ def test_validate_file_fails_on_corrupt_xlsx():
     corrupt_xlsx = b"NOT A ZIP OR XLSX"
     res = validate_file("data/bad.xlsx", corrupt_xlsx)
     assert res.ok is False
+
+
+# ===========================================================================
+# 10. Content Completeness & Empty Artifact Rejection Tests
+# ===========================================================================
+
+def test_validate_file_fails_on_empty_pdf():
+    # PDF with no real body text
+    empty_pdf = generate_pdf("", "")
+    res = validate_file("docs/empty.pdf", empty_pdf)
+    assert res.ok is False
+    assert "insufficient" in str(res.error).lower() or "pdf content length" in res.checks
+
+
+def test_validate_file_fails_on_placeholder_pdf():
+    placeholder_pdf = generate_pdf("Document", "...")
+    res = validate_file("docs/empty.pdf", placeholder_pdf)
+    assert res.ok is False
+
+
+def test_validate_file_fails_on_empty_docx():
+    empty_docx = generate_docx("", "")
+    res = validate_file("docs/empty.docx", empty_docx)
+    assert res.ok is False
+    assert "insufficient" in str(res.error).lower() or "docx content length" in res.checks
+
+
+def test_validate_file_fails_on_empty_pptx():
+    empty_pptx = generate_pptx("", [])
+    res = validate_file("slides/empty.pptx", empty_pptx)
+    assert res.ok is False
+    assert "insufficient" in str(res.error).lower() or "pptx slide content" in res.checks
+
+
+def test_validate_file_fails_on_empty_xlsx():
+    empty_xlsx = generate_xlsx("Empty", [], [])
+    res = validate_file("data/empty.xlsx", empty_xlsx)
+    assert res.ok is False
+    assert "insufficient" in str(res.error).lower() or "xlsx cell data" in res.checks
+
+
+def test_validate_file_fails_on_empty_csv():
+    res = validate_file("data/empty.csv", "")
+    assert res.ok is False
+    assert "empty" in str(res.error).lower() or "insufficient" in str(res.error).lower()
+
+
+def test_rich_pdf_content_validation_passes():
+    title = "Benefits of Local AI"
+    content = """# Overview of Local AI
+Local AI models provide complete data privacy, zero recurring cloud API subscription costs, and ultra-low latency inference directly on user hardware.
+
+## Key Advantages
+- Complete privacy and confidential data processing
+- Sub-50ms deterministic fast-path response times
+- Offline reliability without internet dependencies
+- Freedom from third-party vendor lock-in and rate limits
+"""
+    pdf_bytes = generate_pdf(title, content)
+    res = validate_file("docs/local_ai.pdf", pdf_bytes)
+    assert res.ok is True
+
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+    extracted = " ".join(page.extract_text() for page in reader.pages)
+    assert "Benefits of Local AI" in extracted or "Overview of Local AI" in extracted
+    assert "Complete privacy" in extracted or "offline reliability" in extracted.lower()
+
+
+def test_rich_docx_content_validation_passes():
+    title = "Benefits of Local AI"
+    content = """# Executive Summary
+Deploying AI locally empowers enterprises with unmatched security, reduced operational expenses, and resilient edge compute capabilities.
+
+## Architecture Benefits
+- Full project context stored in local workspace
+- Zero telemetry or private code leakage
+- High-throughput local model execution
+"""
+    docx_bytes = generate_docx(title, content)
+    res = validate_file("docs/local_ai.docx", docx_bytes)
+    assert res.ok is True
+
+    doc = docx.Document(io.BytesIO(docx_bytes))
+    all_text = " ".join(p.text for p in doc.paragraphs)
+    assert "Deploying AI locally" in all_text
+
+
+def test_rich_pptx_content_validation_passes():
+    title = "Local AI Architecture"
+    slides = [
+        ("Why Local AI?", ["Zero cloud subscription costs", "Guaranteed offline availability", "Complete source code confidentiality"]),
+        ("Performance Metrics", ["Sub-50ms response latency", "Optimized memory footprint", "Dynamic multi-tier hardware allocation"]),
+    ]
+    pptx_bytes = generate_pptx(title, slides)
+    res = validate_file("slides/local_ai.pptx", pptx_bytes)
+    assert res.ok is True
+
+
+def test_rich_xlsx_content_validation_passes():
+    sheet_name = "Benchmark"
+    headers = ["Model", "Hardware Tier", "Latency (ms)", "Status"]
+    rows = [
+        ["Qwen 2.5 Coder 7B", "Tier 2 (RTX 4060)", 42.5, "Pass"],
+        ["Gemma 3 4B", "Tier 1 (Integrated)", 68.0, "Pass"],
+    ]
+    xlsx_bytes = generate_xlsx(sheet_name, headers, rows)
+    res = validate_file("data/benchmarks.xlsx", xlsx_bytes)
+    assert res.ok is True
+

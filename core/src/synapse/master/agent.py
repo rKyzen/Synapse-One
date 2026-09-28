@@ -1455,24 +1455,30 @@ class MasterAgent:
                                 log.warning("post_creation_verification_failed_retrying", failing_count=len(failing_items), files=[p for p, _ in failing_items])
                                 errors_desc = []
                                 for file_path, err_msg in failing_items:
-                                    curr_content = file_operator.read(file_path) or ""
+                                    is_binary = any(file_path.endswith(ext) for ext in (".pdf", ".docx", ".pptx", ".xlsx"))
+                                    curr_content = file_operator.read(file_path) if not is_binary else None
+                                    if curr_content:
+                                        body_display = f"Current Content on Disk:\n```\n{curr_content[:1500]}\n```"
+                                    else:
+                                        file_size = file_operator.path_for(file_path).stat().st_size if file_operator.exists(file_path) else 0
+                                        body_display = f"Current File Status: on disk ({file_size} bytes, empty or content-less)"
+
                                     errors_desc.append(
                                         f"File: {file_path}\n"
                                         f"Verification Error: {err_msg}\n"
-                                        f"Current Content on Disk:\n"
-                                        f"```\n{curr_content}\n```"
+                                        f"{body_display}"
                                     )
 
                                 retry_prompt = (
                                     f"{effective_prompt}\n\n"
                                     f"AUTOMATIC POST-CREATION VERIFICATION FAILED:\n"
-                                    f"The following file(s) generated failed syntax/structure verification checks:\n\n"
+                                    f"The following file(s) generated failed syntax, structure, or content completeness verification checks:\n\n"
                                     + "\n\n".join(errors_desc) + "\n\n"
                                     f"REPAIR INSTRUCTIONS:\n"
-                                    f"1. Fix the syntax and structural errors identified above.\n"
-                                    f"2. Return the complete, fully working corrected file content (do not omit anything or use placeholders).\n"
+                                    f"1. Fix the errors identified above. If the file was empty or contained little/no real text, generate substantial, rich, readable content (full paragraphs, detailed bullets, filled tables, full slide text).\n"
+                                    f"2. Return the complete, fully working corrected file content (do not omit anything, do not emit skeleton-only or placeholder text).\n"
                                     f"3. Return the corrected files in JSON format:\n"
-                                    f'{{\n  "files": [\n    {{"path": "<path>", "content": "<complete corrected code>"}}\n  ]\n}}'
+                                    f'{{\n  "files": [\n    {{"path": "<path>", "content": "<complete corrected content or markdown>"}}\n  ]\n}}'
                                 )
                                 try:
                                     fix_resp = self._execute_with_lifecycle(routing, retry_prompt, temperature=0.1, max_tokens=task_max_tokens)

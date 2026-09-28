@@ -354,11 +354,18 @@ def build_specialist_prompt(
 
     rules_block = ""
     if include_file_rules and not is_chat:
+        is_doc_task = any(ext in task_description.lower() for ext in (".pdf", ".docx", ".pptx", ".xlsx", ".csv", "pdf", "word", "powerpoint", "presentation", "spreadsheet", "excel", "report", "slides"))
+        doc_rule = ""
+        if is_doc_task:
+            doc_rule = (
+                f"- DOCUMENT CONTENT REQUIREMENT: For all documents (.pdf, .docx, .pptx, .xlsx, .csv), you MUST provide complete, detailed, readable text (full paragraphs, multi-point bullet lists, filled data tables, complete slide text). NEVER emit empty skeletons, title-only documents, or placeholder text. Verification strictly enforces content completeness.\n"
+            )
         rules_block = (
             f"\n\nRules:\n"
             f"- OUTPUT FORMAT — If you create or change any file, end your response with exactly one JSON object and nothing after it.\n"
             f"- Preferred format (full overwrite – most reliable):\n"
             f'  {{"folders": ["optional"], "files": [{{"path": "relative/path", "content": "complete file body"}}]}}\n'
+            f"{doc_rule}"
             f"- Only use edit/rename/delete actions when the change is tiny and you have the exact current snippet.\n"
             f"- Do not invent files that are not in the live list.\n"
             f"- Keep any normal text reply short. The files are the deliverable."
