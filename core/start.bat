@@ -14,34 +14,46 @@ set "VENV_PY=%ROOT%\.venv\Scripts\python.exe"
 call bootstrap.bat
 if errorlevel 1 exit /b 1
 
-REM --- Adaptive model installation (onboarding gate) -----------------------
-REM First launch (and every launch with missing models): detect, prompt,
-REM run SetupModels.bat, then continue startup. Skip with
-REM SYNAPSE_SKIP_MODEL_SETUP=1.
-if "%SYNAPSE_SKIP_MODEL_SETUP%"=="1" goto :start_server
-if exist "%~dp0..\SetupModels.bat" (
-    echo Checking AI models ...
-    call "%~dp0..\SetupModels.bat" --check
-    set "MODEL_STATUS=!errorlevel!"
-    if not "!MODEL_STATUS!"=="0" (
-        echo.
-        echo Synapse needs to install AI models before first use.
-        if "!MODEL_STATUS!"=="2" (
-            echo   Ollama is not installed. SetupModels.bat will install it from the bundled OllamaSetup.exe ^(or download it^).
-        ) else (
-            echo   Models for this machine's hardware tier are missing and will be downloaded.
-        )
-        set /p CHOICE="Proceed with model installation? [Y/n] "
-        if /i not "!CHOICE!"=="n" (
-            call "%~dp0..\SetupModels.bat" --yes
-            if errorlevel 1 (
-                echo [WARN] Model installation did not fully complete - starting anyway, some features may be limited.
-            )
-        ) else (
-            echo [WARN] Skipping model installation - starting anyway, AI features may be limited.
-        )
-    )
+REM =========================================================================
+REM  Pre-Release Phase: Interactive Hardware Tier Selection
+REM =========================================================================
+echo.
+echo =====================================================================
+echo  Synapse One [Pre-Release] - Select Hardware Tier
+echo =====================================================================
+echo   1) Tier 1 (Lightweight : Gemma 3 1B / Qwen 2.5 1.5B / Qwen 3 1.7B)
+echo   2) Tier 2 (Mid-Range   : Gemma 3 4B / Qwen 2.5 Coder 7B / DeepSeek 7B)
+echo   3) Tier 3 (High-End    : Gemma 3 12B / Qwen 2.5 Coder 14B / DeepSeek 14B)
+echo   4) Tier 3+ (Workstation: Qwen 2.5 Coder 32B / DeepSeek 32B)
+echo   5) Auto-Detect (Detect hardware profile automatically)
+echo =====================================================================
+set "TIER_CHOICE="
+set /p TIER_CHOICE="Select Tier to work on [1-5, Default=5]: "
+
+if "%TIER_CHOICE%"=="1" (
+    set "SYNAPSE_HARDWARE_TIER=tier1"
+    set "SYNAPSE_TIER=tier1"
+    echo   [OK] Selected: Tier 1 ^(Lightweight^)
+) else if "%TIER_CHOICE%"=="2" (
+    set "SYNAPSE_HARDWARE_TIER=tier2"
+    set "SYNAPSE_TIER=tier2"
+    echo   [OK] Selected: Tier 2 ^(Mid-Range^)
+) else if "%TIER_CHOICE%"=="3" (
+    set "SYNAPSE_HARDWARE_TIER=tier3"
+    set "SYNAPSE_TIER=tier3"
+    echo   [OK] Selected: Tier 3 ^(High-End^)
+) else if "%TIER_CHOICE%"=="4" (
+    set "SYNAPSE_HARDWARE_TIER=tier3_plus"
+    set "SYNAPSE_TIER=tier3_plus"
+    echo   [OK] Selected: Tier 3+ ^(Workstation^)
+) else (
+    set "SYNAPSE_HARDWARE_TIER="
+    set "SYNAPSE_TIER="
+    echo   [OK] Selected: Auto-Detect
 )
+
+REM --- Skip automatic model installation in pre-release mode ----------------
+set "SYNAPSE_SKIP_MODEL_SETUP=1"
 
 :start_server
 echo.

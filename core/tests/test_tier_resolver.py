@@ -107,3 +107,25 @@ def test_explicit_constructor_overrides():
     assert resolver.resolve(_profile(10.0)).tier is HardwareTier.TIER2
     resolver = TierResolver(candidates={HardwareTier.TIER1: ["custom:1b"]})
     assert resolver.resolve(_profile(4.0)).candidate_models == ["custom:1b"]
+
+
+def test_environment_variable_tier_override(monkeypatch):
+    profile_low = _profile(4.0)  # normally Tier 1
+
+    # Force Tier 2 via SYNAPSE_HARDWARE_TIER
+    monkeypatch.setenv("SYNAPSE_HARDWARE_TIER", "tier2")
+    assignment2 = TierResolver().resolve(profile_low)
+    assert assignment2.tier is HardwareTier.TIER2
+    assert "manually selected" in assignment2.reason
+
+    # Force Tier 3 via SYNAPSE_TIER
+    monkeypatch.delenv("SYNAPSE_HARDWARE_TIER", raising=False)
+    monkeypatch.setenv("SYNAPSE_TIER", "3")
+    assignment3 = TierResolver().resolve(profile_low)
+    assert assignment3.tier is HardwareTier.TIER3
+
+    # Force Tier 3+ via SYNAPSE_FORCE_TIER
+    monkeypatch.delenv("SYNAPSE_TIER", raising=False)
+    monkeypatch.setenv("SYNAPSE_FORCE_TIER", "3+")
+    assignment3plus = TierResolver().resolve(profile_low)
+    assert assignment3plus.tier is HardwareTier.TIER3_PLUS

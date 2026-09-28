@@ -109,6 +109,29 @@ class TierResolver:
 
     def resolve(self, hardware: HardwareProfile) -> TierAssignment:
         """Map a hardware profile to a tier + ordered candidate models."""
+        import os
+        env_tier = os.environ.get("SYNAPSE_HARDWARE_TIER") or os.environ.get("SYNAPSE_TIER") or os.environ.get("SYNAPSE_FORCE_TIER")
+        if env_tier:
+            clean_env = str(env_tier).strip().lower()
+            tier_override: HardwareTier | None = None
+            if clean_env in ("1", "tier1", "tier_1", "lightweight"):
+                tier_override = HardwareTier.TIER1
+            elif clean_env in ("2", "tier2", "tier_2", "mid", "midrange"):
+                tier_override = HardwareTier.TIER2
+            elif clean_env in ("3", "tier3", "tier_3", "highend", "high"):
+                tier_override = HardwareTier.TIER3
+            elif clean_env in ("3+", "3_plus", "3plus", "tier3_plus", "tier3+", "workstation"):
+                tier_override = HardwareTier.TIER3_PLUS
+            elif clean_env in ("cloud", "cloud_fallback"):
+                tier_override = HardwareTier.CLOUD_FALLBACK
+
+            if tier_override is not None:
+                return TierAssignment(
+                    tier=tier_override,
+                    reason=f"Hardware tier manually selected via environment ({env_tier}) [Pre-Release Mode]",
+                    candidate_models=list(self._candidates[tier_override]),
+                )
+
         available_gb = float(hardware.memory.available_gb or 0.0)
         vram_gb = float(hardware.gpu.vram_gb) if hardware.gpu and hardware.gpu.vram_gb else 0.0
         t = self._thresholds
