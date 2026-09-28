@@ -665,3 +665,124 @@ def test_rich_xlsx_content_validation_passes():
     res = validate_file("data/benchmarks.xlsx", xlsx_bytes)
     assert res.ok is True
 
+
+# ===========================================================================
+# 11. Architect Directive: Force Substantial Task-Specific Content Tests
+# ===========================================================================
+
+def test_question_paper_meta_description_fails_validation():
+    """Verify that a question paper request with only a meta-description fails validation."""
+    meta_content = (
+        "This document contains a comprehensive question paper on Reproduction for class 12 CBSE board, "
+        "ensuring a thorough understanding of the concepts covered in the syllabus. "
+        "The following sections provide questions for students."
+    )
+    pdf_bytes = generate_pdf("Question Paper on Reproduction", meta_content)
+    res = validate_file("docs/question_paper_reproduction.pdf", pdf_bytes)
+    assert res.ok is False
+    assert "insufficient questions" in str(res.error).lower() or "meta-description" in str(res.error).lower()
+
+
+def test_question_paper_with_real_numbered_questions_passes():
+    """Verify that a question paper request with actual numbered questions passes validation."""
+    real_content = """# Class 12 Biology Examination - Reproduction
+**Time: 3 Hours | Total Marks: 70**
+
+## Section A: Multiple Choice Questions
+1. Which of the following organisms reproduces by multiple fission?
+   (a) Amoeba  (b) Plasmodium  (c) Yeast  (d) Hydra
+2. The structural and functional unit between developing embryo and maternal body is called:
+   (a) Placenta  (b) Umbilical cord  (c) Amnion  (d) Chorion
+3. Transfer of pollen grains from anther to stigma of another flower of same plant is:
+   (a) Autogamy  (b) Geitonogamy  (c) Xenogamy  (d) Cleistogamy
+
+## Section B: Short Answer Questions
+4. Differentiate between spermatogenesis and oogenesis with three distinct physiological differences.
+5. Explain the nutritive function of tapetum and protective role of endothecium in microsporangium.
+6. Describe the morphological structure of human sperm with labeled parts (acrosome, middle piece, tail).
+"""
+    pdf_bytes = generate_pdf("Question Paper on Reproduction", real_content)
+    res = validate_file("docs/question_paper_reproduction.pdf", pdf_bytes)
+    assert res.ok is True
+    assert "pdf valid" in res.checks
+
+
+def test_short_report_meta_description_fails_validation():
+    """Verify that a report containing only generic meta-description fails validation."""
+    meta_content = (
+        "This report provides a comprehensive overview of the Q3 performance. "
+        "The following sections outline the key findings and financial highlights for the quarter."
+    )
+    docx_bytes = generate_docx("Quarterly Performance Report", meta_content)
+    res = validate_file("docs/quarterly_report.docx", docx_bytes)
+    assert res.ok is False
+    assert "meta-description" in str(res.error).lower() or "report" in str(res.error).lower()
+
+
+def test_short_report_with_substantive_content_passes():
+    """Verify that a report with real analytical sections and data passes validation."""
+    real_report = """# Q3 System Architecture & Performance Report
+
+## 1. Executive Summary
+During Q3, Synapse One achieved sub-50ms deterministic routing latency and 100% offline verification across all workspace operations. Hardware-adaptive resource scheduling reduced VRAM pressure by 34%.
+
+## 2. Key Metrics & Benchmarks
+- **Fast-Path Latency:** 42ms average response time for direct-answer intents.
+- **Verification Pass Rate:** 100% across 1,050+ automated regression suites.
+- **Memory Footprint:** Peak working set capped under 8.2GB on Tier 2 GPUs.
+
+## 3. Next Steps & Q4 Roadmap
+Phase 9 will introduce multi-agent concurrent DAG planning and zero-copy IPC buffers for high-bandwidth model execution.
+"""
+    docx_bytes = generate_docx("Quarterly Performance Report", real_report)
+    res = validate_file("docs/quarterly_report.docx", docx_bytes)
+    assert res.ok is True
+    assert "docx package ok" in res.checks
+
+
+def test_presentation_meta_description_fails_validation():
+    """Verify that a PPTX with only meta-description filler fails validation."""
+    meta_slides = [
+        ("Overview", ["This presentation provides a comprehensive overview of AI safety.", "The following slides outline the topics."])
+    ]
+    pptx_bytes = generate_pptx("AI Safety Overview", meta_slides)
+    res = validate_file("slides/ai_safety_presentation.pptx", pptx_bytes)
+    assert res.ok is False
+    assert "meta-description" in str(res.error).lower() or "insufficient" in str(res.error).lower()
+
+
+def test_3_slide_presentation_with_substantive_bullets_passes():
+    """Verify that a 3-slide presentation with real task-specific bullets passes validation."""
+    slides = [
+        ("AI Alignment Fundamentals", ["Reinforcement Learning from Human Feedback (RLHF)", "Direct Preference Optimization (DPO)", "Mechanistic Interpretability & Circuit Analysis"]),
+        ("Robustness & Safety Guardrails", ["Adversarial prompt injection defense mechanisms", "Sandboxed workspace file execution with rollback", "Deterministic output verification & auto-repair"]),
+        ("Deployment & Operational Security", ["Hardware-aware local model resource quotas", "Air-gapped execution with zero cloud telemetry", "Real-time action logging & audit trails"]),
+    ]
+    pptx_bytes = generate_pptx("AI Safety & Alignment", slides)
+    res = validate_file("slides/ai_safety_presentation.pptx", pptx_bytes)
+    assert res.ok is True
+    assert "3 slide(s)" in " ".join(res.checks) or "4 slide(s)" in " ".join(res.checks)
+
+
+def test_structured_intermediate_question_paper_dispatch():
+    """Verify that specialist structured JSON questions format produces valid PDF with questions."""
+    structured_data = {
+        "title": "Class 12 Biology Test - Reproduction",
+        "instructions": "Answer all questions. Each question carries marks as indicated.",
+        "questions": [
+            {"question": "What is vegetative propagation? Give two examples.", "marks": 2},
+            {"question": "Explain the stages of microsporogenesis in angiosperms.", "marks": 5},
+            {"question": "Differentiate between menarche and menopause.", "marks": 2},
+            {"question": "Describe the structure and function of the corpus luteum.", "marks": 3},
+            {"question": "What is amniocentesis? State its statutory ban rationale.", "marks": 3},
+        ]
+    }
+    pdf_bytes, is_bin = build_artifact_content("docs/biology_test.pdf", structured_data)
+    assert is_bin is True
+    assert isinstance(pdf_bytes, bytes)
+    assert pdf_bytes.startswith(b"%PDF")
+
+    res = validate_file("docs/biology_test.pdf", pdf_bytes)
+    assert res.ok is True
+
+

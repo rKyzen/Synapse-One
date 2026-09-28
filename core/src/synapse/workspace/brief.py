@@ -354,11 +354,17 @@ def build_specialist_prompt(
 
     rules_block = ""
     if include_file_rules and not is_chat:
-        is_doc_task = any(ext in task_description.lower() for ext in (".pdf", ".docx", ".pptx", ".xlsx", ".csv", "pdf", "word", "powerpoint", "presentation", "spreadsheet", "excel", "report", "slides"))
+        is_doc_task = any(ext in task_description.lower() for ext in (".pdf", ".docx", ".pptx", ".xlsx", ".csv", "pdf", "word", "powerpoint", "presentation", "spreadsheet", "excel", "report", "slides", "paper", "quiz", "exam", "worksheet", "document"))
         doc_rule = ""
         if is_doc_task:
             doc_rule = (
-                f"- DOCUMENT CONTENT REQUIREMENT: For all documents (.pdf, .docx, .pptx, .xlsx, .csv), you MUST provide complete, detailed, readable text (full paragraphs, multi-point bullet lists, filled data tables, complete slide text). NEVER emit empty skeletons, title-only documents, or placeholder text. Verification strictly enforces content completeness.\n"
+                f"- DOCUMENT CONTENT REQUIREMENT (STRICT):\n"
+                f"  * Produce the ACTUAL FULL CONTENT the user requested. Do NOT write a description or summary of what the document will contain (NEVER say 'this document contains...', 'this report covers...', 'the following questions will test...').\n"
+                f"  * Write the real questions, body paragraphs, slides, and table data directly.\n"
+                f"  * For Question Papers / Exams / Quizzes: Write the actual numbered questions (e.g. at least 5–8 distinct questions with full question text, options/sub-questions, and clear sections like Multiple Choice, Short Answer, Long Answer), NOT a description of a paper.\n"
+                f"  * For Reports: Write substantive sections with complete analytical paragraphs, not just section headers.\n"
+                f"  * For Presentations (PPTX): Write real slide titles and substantive bullet points on all slides.\n"
+                f"  * For Spreadsheets (XLSX/CSV): Include real data rows with numbers/values, not just headers.\n"
             )
         rules_block = (
             f"\n\nRules:\n"

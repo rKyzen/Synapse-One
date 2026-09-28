@@ -1470,15 +1470,18 @@ class MasterAgent:
                                     )
 
                                 retry_prompt = (
-                                    f"{effective_prompt}\n\n"
+                                    f"ORIGINAL USER REQUEST:\n{prompt}\n\n"
                                     f"AUTOMATIC POST-CREATION VERIFICATION FAILED:\n"
-                                    f"The following file(s) generated failed syntax, structure, or content completeness verification checks:\n\n"
+                                    f"The previous version failed verification because it only contained generic placeholder/meta-description text, summaries, or lacked the complete requested content.\n\n"
                                     + "\n\n".join(errors_desc) + "\n\n"
-                                    f"REPAIR INSTRUCTIONS:\n"
-                                    f"1. Fix the errors identified above. If the file was empty or contained little/no real text, generate substantial, rich, readable content (full paragraphs, detailed bullets, filled tables, full slide text).\n"
-                                    f"2. Return the complete, fully working corrected file content (do not omit anything, do not emit skeleton-only or placeholder text).\n"
-                                    f"3. Return the corrected files in JSON format:\n"
-                                    f'{{\n  "files": [\n    {{"path": "<path>", "content": "<complete corrected content or markdown>"}}\n  ]\n}}'
+                                    f"REPAIR DIRECTIVE (MANDATORY COMPLETE OVERWRITE):\n"
+                                    f"Generate the complete, real content now. Emit a full overwrite. Do not produce another meta-description or summary.\n"
+                                    f"1. For Question Papers / Exams: Write the actual full numbered questions (at least 5–8 complete questions with choices, sub-parts, and marks), NOT a syllabus summary or description of a test.\n"
+                                    f"2. For Reports / Documents: Write substantive analytical body paragraphs with concrete details, NOT just an outline.\n"
+                                    f"3. For Presentations (PPTX): Write real slide titles and substantive bullet points.\n"
+                                    f"4. For Spreadsheets: Write real data rows with actual numbers and values.\n"
+                                    f"5. Return the complete corrected files in JSON format with full overwrite:\n"
+                                    f'{{\n  "files": [\n    {{"path": "<path>", "content": "<complete corrected real content or markdown>"}}\n  ]\n}}'
                                 )
                                 try:
                                     fix_resp = self._execute_with_lifecycle(routing, retry_prompt, temperature=0.1, max_tokens=task_max_tokens)

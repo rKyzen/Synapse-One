@@ -1027,6 +1027,35 @@ def build_artifact_content(rel_path: str, raw_content: str | bytes | dict | list
     except Exception:
         pass
 
+    def _format_structured_body(data_obj: dict, default_body: str, default_title: str) -> str:
+        if "questions" in data_obj and isinstance(data_obj["questions"], list):
+            q_lines = [f"# {data_obj.get('title') or default_title}", ""]
+            if "instructions" in data_obj:
+                q_lines.append(f"**Instructions:** {data_obj['instructions']}\n")
+            for idx, q in enumerate(data_obj["questions"], 1):
+                if isinstance(q, dict):
+                    q_text = q.get("question") or q.get("text") or q.get("prompt") or ""
+                    marks = f" [{q.get('marks')} Marks]" if "marks" in q else ""
+                    q_lines.append(f"**Question {idx}:** {q_text}{marks}")
+                    if "options" in q and isinstance(q["options"], list):
+                        for opt in q["options"]:
+                            q_lines.append(f"- {opt}")
+                    q_lines.append("")
+                else:
+                    q_lines.append(f"**Question {idx}:** {q}\n")
+            return "\n".join(q_lines)
+        if "sections" in data_obj and isinstance(data_obj["sections"], list):
+            s_lines = [f"# {data_obj.get('title') or default_title}", ""]
+            for s in data_obj["sections"]:
+                if isinstance(s, dict):
+                    s_title = s.get("title") or s.get("heading") or "Section"
+                    s_content = s.get("content") or s.get("body") or s.get("text") or ""
+                    s_lines.append(f"## {s_title}\n{s_content}\n")
+                else:
+                    s_lines.append(f"{s}\n")
+            return "\n".join(s_lines)
+        return data_obj.get("content") or data_obj.get("text") or data_obj.get("body") or default_body
+
     if ext == ".pdf":
         title = Path(rel_path).stem.replace("_", " ").title()
         author = "Synapse One"
@@ -1034,7 +1063,7 @@ def build_artifact_content(rel_path: str, raw_content: str | bytes | dict | list
         if json_obj and isinstance(json_obj, dict):
             title = json_obj.get("title") or title
             author = json_obj.get("author") or author
-            body_text = json_obj.get("content") or json_obj.get("text") or json_obj.get("body") or text_content
+            body_text = _format_structured_body(json_obj, text_content, title)
         return generate_pdf(title, body_text, author=author), True
 
     if ext in (".docx", ".doc"):
@@ -1044,7 +1073,7 @@ def build_artifact_content(rel_path: str, raw_content: str | bytes | dict | list
         if json_obj and isinstance(json_obj, dict):
             title = json_obj.get("title") or title
             author = json_obj.get("author") or author
-            body_text = json_obj.get("content") or json_obj.get("text") or json_obj.get("body") or text_content
+            body_text = _format_structured_body(json_obj, text_content, title)
         return generate_docx(title, body_text, author=author), True
 
     if ext in (".pptx", ".ppt"):

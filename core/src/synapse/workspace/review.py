@@ -192,17 +192,97 @@ def _check_html(content: str | bytes) -> ValidationResult:
     return ValidationResult(path="", ok=True, checks=[*checks, "document root present"])
 
 
-def _check_pdf(content: str | bytes) -> ValidationResult:
+_PLACEHOLDER_SUBSTRINGS = (
+    "placeholder for",
+    "insert text here",
+    "insert content here",
+    "sample text",
+    "lorem ipsum",
+    "to be added",
+    "todo:",
+    "...",
+)
+
+_META_DESCRIPTION_PATTERNS = [
+    r"\bthis document contains\b",
+    r"\bthis paper is structured\b",
+    r"\bcomprehensive overview\b",
+    r"\bensuring a thorough understanding\b",
+    r"\bthis report covers\b",
+    r"\bthis report provides\b",
+    r"\bthe following sections provide\b",
+    r"\bthe following sections outline\b",
+    r"\bin this question paper we will\b",
+    r"\bthis question paper covers\b",
+    r"\bthis question paper is designed to\b",
+    r"\bthis document provides an overview\b",
+    r"\bthe purpose of this document is\b",
+    r"\bthis presentation covers\b",
+    r"\bthis slide deck outlines\b",
+    r"\bthis presentation provides an overview\b",
+    r"\bthe following questions will test\b",
+    r"\bthis paper presents an overview\b",
+    r"\bthis document serves as\b",
+    r"\bthis worksheet covers\b",
+    r"\bthis paper will cover\b",
+]
+
+
+def _detect_meta_description_or_filler(text: str, path: str = "") -> str | None:
+    import re
+    lowered = text.lower()
+    path_lowered = path.lower()
+
+    # 1. Direct placeholders
+    for ph in _PLACEHOLDER_SUBSTRINGS:
+        if ph in lowered:
+            return f"document contains placeholder / template text ({ph!r})"
+
+    # 2. Check for question paper / exam / test requirements
+    is_question_paper = any(k in path_lowered for k in ("question", "exam", "test", "quiz", "worksheet", "assessment")) or any(k in lowered[:120] for k in ("question paper", "class 12", "class 10", "exam paper", "biology test", "physics test", "chemistry test", "math test", "examination"))
+    if is_question_paper:
+        numbered = re.findall(r"(?:^|\n|\s)(?:Q\s*\.?\s*\d+|Question\s*\d+|\b\d+[\.\)]|\(\d+\))\s+", text, re.IGNORECASE)
+        qmarks = text.count("?")
+        q_starters = len(re.findall(r"(?:^|\n|\s)(?:What|Explain|Describe|Define|Differentiate|Compare|Calculate|State|Discuss|Name|Which|List|Why|How)\b", text, re.IGNORECASE))
+        question_signals = max(len(numbered), qmarks, q_starters)
+        if question_signals < 4:
+            matched_meta = [p for p in _META_DESCRIPTION_PATTERNS if re.search(p, lowered)]
+            if matched_meta or question_signals <= 1 or len(text) < 400:
+                return (
+                    f"question paper artifact contains insufficient questions ({question_signals} question marker(s) found, minimum 4 required). "
+                    "Actual numbered questions with full question text are required; meta-descriptions and summaries are rejected."
+                )
+
+    # 3. Check for report requirements
+    is_report = "report" in path_lowered or "report" in lowered[:60]
+    if is_report:
+        matched_meta = [p for p in _META_DESCRIPTION_PATTERNS if re.search(p, lowered)]
+        if matched_meta and len(text) < 250:
+            return (
+                "report artifact contains generic meta-description/summary instead of substantive report content and analysis."
+            )
+
+    # 4. Check for short documents dominated by meta phrases
+    matched_meta = [p for p in _META_DESCRIPTION_PATTERNS if re.search(p, lowered)]
+    if matched_meta and len(text) < 300:
+        return (
+            f"document contains generic meta-description/summary rather than substantive requested content ({matched_meta[0]!r})"
+        )
+
+    return None
+
+
+def _check_pdf(content: str | bytes, path: str = "") -> ValidationResult:
     data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
     if not data or len(data) < 150 or not data.startswith(b"%PDF"):
-        return ValidationResult(path="", ok=False, checks=["pdf header"], error="invalid or empty pdf file")
+        return ValidationResult(path=path, ok=False, checks=["pdf header"], error="invalid or empty pdf file")
     try:
         import io
         import pypdf
         reader = pypdf.PdfReader(io.BytesIO(data))
         page_count = len(reader.pages)
         if page_count < 1:
-            return ValidationResult(path="", ok=False, checks=["pdf pages"], error="pdf contains 0 pages")
+            return ValidationResult(path=path, ok=False, checks=["pdf pages"], error="pdf contains 0 pages")
         extracted_text = " ".join((page.extract_text() or "") for page in reader.pages)
         clean_text = " ".join(extracted_text.split())
         meaningful_text = clean_text
@@ -211,16 +291,26 @@ def _check_pdf(content: str | bytes) -> ValidationResult:
 
         if len(meaningful_text) < 25 or meaningful_text in ("...", "TODO", "content", "sample text"):
             return ValidationResult(
-                path="",
+                path=path,
                 ok=False,
                 checks=["pdf content length"],
                 error=f"pdf contains insufficient text content ({len(meaningful_text)} meaningful chars, minimum 25 chars required)",
             )
-        return ValidationResult(path="", ok=True, checks=["pdf valid", f"{page_count} page(s)", f"{len(clean_text)} chars", f"{len(data)} bytes"])
+
+        meta_err = _detect_meta_description_or_filler(meaningful_text, path=path)
+        if meta_err:
+            return ValidationResult(
+                path=path,
+                ok=False,
+                checks=["pdf content quality"],
+                error=meta_err,
+            )
+
+        return ValidationResult(path=path, ok=True, checks=["pdf valid", f"{page_count} page(s)", f"{len(clean_text)} chars", f"{len(data)} bytes"])
     except Exception as exc:
         if not data.startswith(b"%PDF"):
-            return ValidationResult(path="", ok=False, checks=["pdf header"], error=f"invalid pdf: {exc}")
-        return ValidationResult(path="", ok=True, checks=["pdf header ok", f"{len(data)} bytes"])
+            return ValidationResult(path=path, ok=False, checks=["pdf header"], error=f"invalid pdf: {exc}")
+        return ValidationResult(path=path, ok=True, checks=["pdf header ok", f"{len(data)} bytes"])
 
 
 def _check_zip_xml(content: str | bytes, member_name: str, format_name: str) -> ValidationResult:
@@ -246,20 +336,20 @@ def _check_zip_xml(content: str | bytes, member_name: str, format_name: str) -> 
         )
 
 
-def _check_pptx(content: str | bytes) -> ValidationResult:
+def _check_pptx(content: str | bytes, path: str = "") -> ValidationResult:
     res = _check_zip_xml(content, "ppt/presentation.xml", "pptx")
     if not res.ok:
         return res
     data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
     if len(data) < 300:
-        return ValidationResult(path="", ok=False, checks=["pptx size"], error="pptx file too small (less than 300 bytes)")
+        return ValidationResult(path=path, ok=False, checks=["pptx size"], error="pptx file too small (less than 300 bytes)")
     try:
         import io
         import pptx
         prs = pptx.Presentation(io.BytesIO(data))
         slide_count = len(prs.slides)
         if slide_count < 1:
-            return ValidationResult(path="", ok=False, checks=["pptx slides"], error="pptx contains 0 slides")
+            return ValidationResult(path=path, ok=False, checks=["pptx slides"], error="pptx contains 0 slides")
 
         all_texts: list[str] = []
         for slide in prs.slides:
@@ -280,72 +370,96 @@ def _check_pptx(content: str | bytes) -> ValidationResult:
 
         if len(meaningful_text) < 20 or meaningful_text in ("...", "TODO", "content", "sample text"):
             return ValidationResult(
-                path="",
+                path=path,
                 ok=False,
                 checks=["pptx slide content"],
                 error=f"pptx presentation contains insufficient slide text ({len(meaningful_text)} meaningful chars, minimum 20 chars required)",
             )
-        return ValidationResult(path="", ok=True, checks=["pptx package ok", f"{slide_count} slide(s)", f"{len(full_text)} chars", f"{len(data)} bytes"])
+
+        meta_err = _detect_meta_description_or_filler(meaningful_text, path=path)
+        if meta_err:
+            return ValidationResult(
+                path=path,
+                ok=False,
+                checks=["pptx content quality"],
+                error=meta_err,
+            )
+
+        return ValidationResult(path=path, ok=True, checks=["pptx package ok", f"{slide_count} slide(s)", f"{len(full_text)} chars", f"{len(data)} bytes"])
     except Exception:
         return res
 
 
-def _check_xlsx(content: str | bytes) -> ValidationResult:
+def _check_xlsx(content: str | bytes, path: str = "") -> ValidationResult:
     res = _check_zip_xml(content, "xl/workbook.xml", "xlsx")
     if not res.ok:
         return res
     data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
     if len(data) < 300:
-        return ValidationResult(path="", ok=False, checks=["xlsx size"], error="xlsx file too small (less than 300 bytes)")
+        return ValidationResult(path=path, ok=False, checks=["xlsx size"], error="xlsx file too small (less than 300 bytes)")
     try:
         import io
         import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
         sheet_count = len(wb.sheetnames)
         if sheet_count < 1:
-            return ValidationResult(path="", ok=False, checks=["xlsx sheets"], error="xlsx contains 0 sheets")
+            return ValidationResult(path=path, ok=False, checks=["xlsx sheets"], error="xlsx contains 0 sheets")
 
         non_empty_cells = 0
         total_cell_chars = 0
+        non_empty_rows = 0
         for ws in wb.worksheets:
             for row in ws.iter_rows(values_only=True):
+                row_has_data = False
                 for val in row:
                     if val is not None and str(val).strip():
                         non_empty_cells += 1
                         total_cell_chars += len(str(val).strip())
+                        row_has_data = True
+                if row_has_data:
+                    non_empty_rows += 1
 
         if non_empty_cells < 2 or total_cell_chars < 4:
             return ValidationResult(
-                path="",
+                path=path,
                 ok=False,
                 checks=["xlsx cell data"],
                 error=f"xlsx spreadsheet contains insufficient data ({non_empty_cells} non-empty cell(s), minimum 2 required)",
             )
-        return ValidationResult(path="", ok=True, checks=["xlsx package ok", f"{sheet_count} sheet(s)", f"{non_empty_cells} cell(s)", f"{len(data)} bytes"])
+
+        if non_empty_rows < 2 and non_empty_cells <= 4:
+            return ValidationResult(
+                path=path,
+                ok=False,
+                checks=["xlsx row data"],
+                error="xlsx spreadsheet contains only headers and no data rows",
+            )
+
+        return ValidationResult(path=path, ok=True, checks=["xlsx package ok", f"{sheet_count} sheet(s)", f"{non_empty_cells} cell(s)", f"{len(data)} bytes"])
     except Exception:
         return res
 
 
-def _check_text(content: str | bytes) -> ValidationResult:
+def _check_text(content: str | bytes, path: str = "") -> ValidationResult:
     if isinstance(content, bytes):
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError:
-            return ValidationResult(path="", ok=False, checks=["valid utf-8"], error="invalid utf-8 text")
+            return ValidationResult(path=path, ok=False, checks=["valid utf-8"], error="invalid utf-8 text")
     else:
         text = str(content)
     if not text.strip():
-        return ValidationResult(path="", ok=False, checks=["non-empty"], error="file is empty")
-    return ValidationResult(path="", ok=True, checks=["non-empty", "valid utf-8"])
+        return ValidationResult(path=path, ok=False, checks=["non-empty"], error="file is empty")
+    return ValidationResult(path=path, ok=True, checks=["non-empty", "valid utf-8"])
 
 
-def _check_docx(content: str | bytes) -> ValidationResult:
+def _check_docx(content: str | bytes, path: str = "") -> ValidationResult:
     res = _check_zip_xml(content, "word/document.xml", "docx")
     if not res.ok:
         return res
     data = content.encode("latin-1", "ignore") if isinstance(content, str) else content
     if len(data) < 300:
-        return ValidationResult(path="", ok=False, checks=["docx size"], error="docx file too small (less than 300 bytes)")
+        return ValidationResult(path=path, ok=False, checks=["docx size"], error="docx file too small (less than 300 bytes)")
     try:
         import docx
         import io
@@ -363,35 +477,53 @@ def _check_docx(content: str | bytes) -> ValidationResult:
 
         if len(meaningful_text) < 25 or meaningful_text in ("...", "TODO", "content", "sample text"):
             return ValidationResult(
-                path="",
+                path=path,
                 ok=False,
                 checks=["docx content length"],
                 error=f"docx document contains insufficient text content ({len(meaningful_text)} meaningful chars, minimum 25 chars required)",
             )
-        return ValidationResult(path="", ok=True, checks=["docx package ok", f"{paras} paras", f"{tables} tables", f"{len(full_text)} chars", f"{len(data)} bytes"])
+
+        meta_err = _detect_meta_description_or_filler(meaningful_text, path=path)
+        if meta_err:
+            return ValidationResult(
+                path=path,
+                ok=False,
+                checks=["docx content quality"],
+                error=meta_err,
+            )
+
+        return ValidationResult(path=path, ok=True, checks=["docx package ok", f"{paras} paras", f"{tables} tables", f"{len(full_text)} chars", f"{len(data)} bytes"])
     except Exception:
         return res
 
 
-def _check_csv(content: str | bytes) -> ValidationResult:
+def _check_csv(content: str | bytes, path: str = "") -> ValidationResult:
     import csv
 
     text = content.decode("utf-8", "ignore") if isinstance(content, bytes) else str(content)
     if not text.strip():
-        return ValidationResult(path="", ok=False, checks=["non-empty"], error="csv file is empty")
+        return ValidationResult(path=path, ok=False, checks=["non-empty"], error="csv file is empty")
     try:
         rows = list(csv.reader(text.splitlines()))
+        non_empty_rows = [r for r in rows if any(c.strip() for c in r)]
         non_empty_cells = [c.strip() for r in rows for c in r if c and c.strip()]
         if len(non_empty_cells) < 2 or sum(len(c) for c in non_empty_cells) < 4:
             return ValidationResult(
-                path="",
+                path=path,
                 ok=False,
                 checks=["csv cell data"],
                 error="csv file contains insufficient data (fewer than 2 non-empty values)",
             )
-        return ValidationResult(path="", ok=True, checks=["csv format ok", f"{len(rows)} rows", f"{len(non_empty_cells)} cell(s)"])
+        if len(non_empty_rows) < 2 and len(non_empty_cells) <= 4:
+            return ValidationResult(
+                path=path,
+                ok=False,
+                checks=["csv row data"],
+                error="csv file contains only headers and no data rows",
+            )
+        return ValidationResult(path=path, ok=True, checks=["csv format ok", f"{len(rows)} rows", f"{len(non_empty_cells)} cell(s)"])
     except Exception as exc:
-        return ValidationResult(path="", ok=False, checks=["csv parses"], error=f"csv error: {exc}")
+        return ValidationResult(path=path, ok=False, checks=["csv parses"], error=f"csv error: {exc}")
 
 
 _VALIDATORS = {
@@ -422,7 +554,12 @@ def validate_file(path: str, content: str | bytes) -> ValidationResult:
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     checker = _VALIDATORS.get(ext, _check_text)
     try:
-        result = checker(content)
+        import inspect
+        sig = inspect.signature(checker)
+        if "path" in sig.parameters:
+            result = checker(content, path=path)
+        else:
+            result = checker(content)
     except Exception as exc:
         result = ValidationResult(path=path, ok=False, checks=["validation error"], error=str(exc))
     return result.model_copy(update={"path": path})
